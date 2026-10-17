@@ -174,6 +174,10 @@ HRESULT activate_client(IMMDevice* dev, ComPtr<IAudioClient>* c) {
 
 // ---- free functions ----
 
+bool capture_timed_out(uint64_t last_packet_ms, uint64_t now_ms) {
+  return now_ms >= last_packet_ms && now_ms - last_packet_ms >= kCaptureSilenceTimeoutMs;
+}
+
 std::vector<DeviceInfo> list_capture_devices() {
   std::vector<DeviceInfo> out;
   try {
@@ -780,6 +784,7 @@ void WasapiImpl::capture_main(uint64_t gen) {
   // WASAPI flags the first packet after every Start() as a discontinuity; nothing was lost
   // (a device-loss gap is recorded separately), so only later packets are reported.
   bool first_packet = true;
+  uint64_t last_packet = GetTickCount64();  // a stream that goes silent without an error is lost
 
   while (run_.load(std::memory_order_acquire) && !failed) {
     const DWORD w = WaitForMultipleObjects(2, handles, FALSE, kWaitMs);
@@ -801,6 +806,7 @@ void WasapiImpl::capture_main(uint64_t gen) {
         failed = true;
         break;
       }
+      last_packet = GetTickCount64();
       CaptureCallbacks* cb = cb_.load(std::memory_order_acquire);
       bool disc = (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0 && !first_packet;
       first_packet = false;
@@ -834,6 +840,7 @@ void WasapiImpl::capture_main(uint64_t gen) {
       cap->ReleaseBuffer(n);
       if (!run_.load(std::memory_order_acquire)) break;
     }
+    if (capture_timed_out(last_packet, GetTickCount64())) failed = true;  // the worker reopens it
   }
   if (failed && run_.load()) {
     fail_gen_.store(gen + 1);

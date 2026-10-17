@@ -37,6 +37,17 @@ TEST(wasapi_list_devices_does_not_throw) {
   for (const auto& i : d) CHECK(!i.id.empty());
 }
 
+// A running stream that delivers no packet for 5 s (silent without an error) counts as
+// device loss: the worker closes it, reports the loss and reopens it.
+TEST(wasapi_capture_silence_timeout) {
+  CHECK_EQ(sl::kCaptureSilenceTimeoutMs, uint64_t(5000));
+  CHECK(!sl::capture_timed_out(1000, 1000));
+  CHECK(!sl::capture_timed_out(1000, 5999));
+  CHECK(sl::capture_timed_out(1000, 6000));
+  CHECK(sl::capture_timed_out(1000, 60000));
+  CHECK(!sl::capture_timed_out(1000, 500));  // never on a clock that reads earlier
+}
+
 TEST(wasapi_open_unknown_device_fails_cleanly) {
   WasapiSource src;
   CaptureConfig cfg;
