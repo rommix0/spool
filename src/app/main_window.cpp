@@ -22,6 +22,7 @@ constexpr wchar_t kCantStart[] = L"Can't start recording";
 constexpr wchar_t kAppLog[] = L"app";  // app.log: events outside a session
 constexpr UINT kLaunchMsg = WM_APP + 1;
 constexpr COLORREF kBannerBack = RGB(255, 233, 168);  // the destination panel's amber
+constexpr COLORREF kBannerLost = RGB(255, 204, 204);  // ... and its red
 constexpr COLORREF kBannerText = RGB(28, 28, 28);
 constexpr UINT_PTR kTimerId = 1;
 constexpr UINT kTimerMs = 33;
@@ -77,6 +78,7 @@ MainWindow::~MainWindow() {
   for (HFONT f : {font_, bold_, clock_font_})
     if (f) DeleteObject(f);
   if (amber_) DeleteObject(amber_);
+  if (red_) DeleteObject(red_);
 }
 
 bool MainWindow::create(HINSTANCE inst, int show) {
@@ -144,7 +146,7 @@ LRESULT MainWindow::handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PAINT: {
       PAINTSTRUCT ps;
       HDC dc = BeginPaint(hwnd_, &ps);
-      if (banner_mode_ != Banner::None) FillRect(dc, &banner_rect_, amber_);
+      if (shown_ != Banner::None) FillRect(dc, &banner_rect_, shown_ == Banner::InputLost ? red_ : amber_);
       EndPaint(hwnd_, &ps);
       return 0;
     }
@@ -152,9 +154,10 @@ LRESULT MainWindow::handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CTLCOLORBTN: {
       HDC dc = reinterpret_cast<HDC>(wp);
       if (reinterpret_cast<HWND>(lp) == banner_ || reinterpret_cast<HWND>(lp) == banner_ack_) {
-        SetBkColor(dc, kBannerBack);
+        const bool lost = shown_ == Banner::InputLost;
+        SetBkColor(dc, lost ? kBannerLost : kBannerBack);
         SetTextColor(dc, kBannerText);
-        return reinterpret_cast<LRESULT>(amber_);
+        return reinterpret_cast<LRESULT>(lost ? red_ : amber_);
       }
       SetBkColor(dc, GetSysColor(COLOR_WINDOW));
       SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
@@ -226,6 +229,7 @@ void MainWindow::on_create() {
   ack_ = child(hwnd_, inst_, WC_BUTTONW, L"Acknowledge", kButton, IDC_ACK);
   ShowWindow(ack_, SW_HIDE);
   amber_ = CreateSolidBrush(kBannerBack);
+  red_ = CreateSolidBrush(kBannerLost);
   banner_ = child(hwnd_, inst_, WC_STATICW, L"", kLabel, IDC_BANNER);
   banner_ack_ = child(hwnd_, inst_, WC_BUTTONW, L"Acknowledge", kButton, IDC_BANNER_ACK);
   ShowWindow(banner_, SW_HIDE);
@@ -280,8 +284,8 @@ void MainWindow::on_command(int id) {
     case IDC_ACK:
       if (recording()) ctx_.mgr.acknowledge();
       break;
-    case IDC_BANNER_ACK:
-      if (banner_mode_ != Banner::Waiting) show_banner(Banner::None);
+    case IDC_BANNER_ACK:  // a notice, not a status (Waiting, InputLost)
+      if (shown_ == banner_mode_ && banner_mode_ != Banner::Waiting) show_banner(Banner::None);
       break;
   }
 }
@@ -493,8 +497,15 @@ void MainWindow::use_log(const std::wstring& name) { ctx_.log.set_file(log_file(
 void MainWindow::show_banner(Banner mode) {
   if (mode == banner_mode_) return;
   banner_mode_ = mode;
-  // Waiting is a status; the others are notices to acknowledge.
-  const bool ack = mode != Banner::None && mode != Banner::Waiting;
+  update_banner();
+}
+
+void MainWindow::update_banner() {
+  const Banner mode = input_lost_ ? Banner::InputLost : banner_mode_;
+  if (mode == shown_) return;
+  shown_ = mode;
+  // Waiting and InputLost are statuses; the others are notices to acknowledge.
+  const bool ack = mode != Banner::None && mode != Banner::Waiting && mode != Banner::InputLost;
   if (!ack && GetFocus() == banner_ack_) SetFocus(IsWindowEnabled(stop_) ? stop_ : record_);
   const wchar_t* text = L"";
   switch (mode) {
@@ -505,6 +516,7 @@ void MainWindow::show_banner(Banner mode) {
     case Banner::NotResumedNewRecording:
       text = L"The crashed session couldn't be resumed. A new recording started.";
       break;
+    case Banner::InputLost: text = L"Input lost. Waiting for the device to come back."; break;
   }
   SetWindowTextW(banner_, text);
   ShowWindow(banner_, mode != Banner::None ? SW_SHOWNA : SW_HIDE);
@@ -643,6 +655,10 @@ void MainWindow::refresh_slow() {
   last_slow_ms_ = GetTickCount64();
   const SessionStats st = ctx_.mgr.stats();
   const bool rec = st.state != SessionState::Idle;
+  if ((st.state == SessionState::InputLost) != input_lost_) {  // §5.3: red until the input returns
+    input_lost_ = !input_lost_;
+    update_banner();
+  }
   if (rec != awake_) {  // §5.2: no system sleep while recording (display sleep is fine)
     awake_ = rec;
     SetThreadExecutionState(rec ? ES_CONTINUOUS | ES_SYSTEM_REQUIRED : ES_CONTINUOUS);
@@ -780,8 +796,8 @@ void MainWindow::layout() {
   place(device_, x, m + (bar - line) / 2, r - px(12) - x, line);
   int y = m + bar + px(12);
 
-  // The crash-recovery banner, until acknowledged.
-  if (banner_mode_ != Banner::None) {
+  // The crash-recovery banner (until acknowledged) or the input-lost banner.
+  if (shown_ != Banner::None) {
     const int bnh = bh + px(12);
     const RECT old = banner_rect_;
     banner_rect_ = RECT{m, y, c.right - m, y + bnh};

@@ -4,7 +4,8 @@
 // updates the meters; stats, destinations and events refresh at 4 Hz. Nothing a single
 // stray click or key does stops a recording: Stop has no shortcut and always asks.
 // At launch it resumes a crashed session (amber banner until acknowledged) or, with
-// start_on_launch, starts recording. While recording the system is kept from sleeping.
+// start_on_launch, starts recording. While the input is lost a red banner shows over any
+// other. While recording the system is kept from sleeping.
 // Event log files: app.log outside sessions, <session_id>.log while one runs.
 #include <windows.h>
 
@@ -74,8 +75,9 @@ class MainWindow {
   void after_start();                   // warnings about the started session; refresh
   void use_log(const std::wstring& name);  // log_file(name)
   int box(const std::wstring& text, const wchar_t* title, UINT flags);  // MessageBox, counted in modal_
-  enum class Banner { None, Waiting, Recovered, NotResumed, NotResumedNewRecording };
-  void show_banner(Banner);
+  enum class Banner { None, Waiting, Recovered, NotResumed, NotResumedNewRecording, InputLost };
+  void show_banner(Banner);  // the notice (not InputLost); shown unless the input is lost
+  void update_banner();      // shows InputLost while input_lost_, else the notice
 
   void record();
   void confirm_stop();
@@ -107,15 +109,17 @@ class MainWindow {
   HACCEL accel_ = nullptr;
   bool hotkey_ = false;
   bool awake_ = false;   // SetThreadExecutionState keeps the system awake (while recording)
-  Banner banner_mode_ = Banner::None;
+  Banner banner_mode_ = Banner::None;  // the notice; InputLost covers it while input_lost_
+  Banner shown_ = Banner::None;        // what the banner row shows
+  bool input_lost_ = false;            // stats().state == InputLost at the last refresh
   int modal_ = 0;              // message boxes and Settings open (their loops still run tick())
   bool reopen_input_ = false;  // an input change was saved during a session: reopen at the next start
   // A crashed session found at launch that waits for its input device (R18).
   std::optional<RecordingState> pending_;
   uint64_t pending_since_ = 0, pending_try_ = 0;  // GetTickCount64
   std::wstring pending_err_;                      // why the input didn't open at the last try
-  RECT banner_rect_{};   // the amber banner row (painted by WM_PAINT)
-  HBRUSH amber_ = nullptr;  // owned
+  RECT banner_rect_{};   // the banner row (painted by WM_PAINT)
+  HBRUSH amber_ = nullptr, red_ = nullptr;  // owned
   bool show_config_ = false;  // idle panel shows the configured destinations (settings changed)
   HWND focus_ = nullptr;      // the focused child when the window was last deactivated
 
