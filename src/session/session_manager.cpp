@@ -56,6 +56,7 @@ struct SessionManager::Session {
   StreamFormat fmt;
   uint64_t seq = 0;
   std::vector<DestResumeSeed> seeds;  // per destination (crash state before its first file)
+  SampleIndex first = 0;              // the ring's first sample (> start_sample after a resume)
   // Destroyed in reverse order: destinations and meter before the ring they read.
   std::unique_ptr<SampleRing> ring;
   std::unique_ptr<MeterReader> meter;
@@ -146,7 +147,10 @@ bool SessionManager::start(const SessionConfig& cfg, const ResumeInfo* resume, s
     *err = L"Cannot start the input";
     return false;
   }
-  if (resume) post_all(*s, CmdGapEnd{ring_start, "crash"});  // queued ahead of everything else
+  // Queued ahead of everything else, and only where the crashed session wrote a gap_start.
+  if (resume)
+    for (size_t i = 0; i < s->dests.size(); ++i)
+      if (!s->seeds[i].prev_manifest.empty()) s->dests[i]->post(CmdGapEnd{ring_start, "crash"});
   for (auto& d : s->dests) d->start(ring_start);
   state_.store(SessionState::Recording);
   recovered_.store(resume != nullptr);
@@ -172,7 +176,7 @@ void SessionManager::stop() {
     stop_all(s->dests, s->ring->write_index(), "stop");
     log(Severity::Info, L"Session " + s->params.session_id + L" stopped");
   }
-  if (store_) store_->clear();
+  clear_state();
   state_.store(SessionState::Idle);
   std::vector<std::shared_ptr<Session>> old;
   {
@@ -205,7 +209,8 @@ void SessionManager::marker(uint32_t seconds_ago) {
   const auto s = current();
   if (!s || !thread_.joinable()) return;
   const SampleIndex back = SampleIndex(seconds_ago) * SampleIndex(s->fmt.sample_rate);
-  const SampleIndex at = std::max(s->params.start_sample, s->ring->write_index() - back);  // Review Focus 5
+  // Review Focus 5; after a resume never inside the crash gap.
+  const SampleIndex at = std::max(s->first, s->ring->write_index() - back);
   push(UiCommand{UiCommand::Kind::Marker, s->seq, at, 0, L"Marker " + std::to_wstring(++marker_n_)});
 }
 
@@ -302,6 +307,7 @@ std::shared_ptr<SessionManager::Session> SessionManager::make_session(const Sess
   s->params = p;
   s->fmt = fmt;
   s->seq = next_seq_++;
+  s->first = ring_start;
   seeds.resize(cfg_.dests.size());
   s->seeds = std::move(seeds);
   const size_t frames = size_t(std::max<uint32_t>(cfg_.ring_seconds, 1)) * fmt.sample_rate;
@@ -357,10 +363,10 @@ void SessionManager::run() {
     if (now - last_watchdog >= kWatchdogMs) {
       last_watchdog = now;
       watchdog(s);
-      save_state(s, now);
-    } else if (saved_seq_ != s.seq) {
-      save_state(s, now);  // a new session: at once
     }
+    // Every tick, so a new file or manifest (rotation, failover) reaches the crash state
+    // within one tick even while steady time stands still.
+    save_state(s, now);
     if (now - last_pair >= kClockPairMs) {
       last_pair = now;
       post_all(s, CmdClockPair{s.ring->write_index(), clock_.now()});
@@ -474,7 +480,7 @@ void SessionManager::link_new_session(StreamFormat fmt, uint64_t steady_ms, Wall
   if (!s) {
     cap_ring_.store(nullptr);
     state_.store(SessionState::Idle);
-    if (store_) store_->clear();  // nothing to resume: the session has ended
+    clear_state();  // nothing to resume: the session has ended
     log(Severity::Error, L"Cannot start the linked session: " + (err.empty() ? L"the input has no format" : err));
     return;
   }
@@ -535,10 +541,19 @@ void SessionManager::save_state(Session& s, uint64_t steady_ms) {
   if (!due) return;
   r.last_sample = s.ring->write_index();
   r.last_utc_ms = clock_.now().utc_ms;
-  store_->save(r);
+  if (saved_seq_ != s.seq) save_warned_ = false;  // once per session
+  if (!store_->save(r) && !save_warned_) {
+    save_warned_ = true;
+    log(Severity::Warning, L"Cannot save the recording state: the session cannot be resumed after a crash");
+  }
   saved_seq_ = s.seq;
   saved_steady_ = steady_ms;
   saved_dests_ = std::move(now_dests);
+}
+
+void SessionManager::clear_state() {
+  if (store_ && !store_->clear())
+    log(Severity::Error, L"Cannot clear the recording state: the next launch checks the manifests before resuming");
 }
 
 // ---- silence filler ----

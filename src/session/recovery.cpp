@@ -29,17 +29,19 @@ std::wstring dest_section(size_t i) { return L"Dest" + std::to_wstring(i); }
 std::wstring quoted(const std::wstring& v) { return L"\"" + v + L"\""; }
 
 // WritePrivateProfileString writes ANSI unless the file already starts with a UTF-16LE BOM.
-void ensure_unicode_file(const std::wstring& path) {
+// False if the file neither exists nor can be created.
+bool ensure_unicode_file(const std::wstring& path) {
   const HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (h == INVALID_HANDLE_VALUE) return;  // exists already (or cannot be created: the writes fail too)
+  if (h == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_EXISTS;
   const uint8_t bom[2] = {0xFF, 0xFE};
   DWORD done = 0;
-  WriteFile(h, bom, 2, &done, nullptr);
+  const bool ok = WriteFile(h, bom, 2, &done, nullptr) && done == 2;
   CloseHandle(h);
+  return ok;
 }
 
 // One whole section, replacing what was there.
-void write_section(const std::wstring& path, const std::wstring& section,
+bool write_section(const std::wstring& path, const std::wstring& section,
                    const std::vector<std::pair<std::wstring, std::wstring>>& kv) {
   std::wstring block;
   for (const auto& [k, v] : kv) {
@@ -47,7 +49,7 @@ void write_section(const std::wstring& path, const std::wstring& section,
     block.push_back(L'\0');
   }
   block.push_back(L'\0');
-  WritePrivateProfileSectionW(section.c_str(), block.c_str(), path.c_str());
+  return WritePrivateProfileSectionW(section.c_str(), block.c_str(), path.c_str()) != 0;
 }
 
 std::optional<std::wstring> get(const std::wstring& path, const std::wstring& section, const wchar_t* key) {
@@ -67,8 +69,11 @@ size_t saved_dest_count(const std::wstring& path) {
   return size_t(std::clamp<int64_t>(get_i64(path, L"State", L"dests"), 0, 1024));
 }
 
-void delete_dests(const std::wstring& path, size_t from, size_t to) {
-  for (size_t i = from; i < to; ++i) WritePrivateProfileStringW(dest_section(i).c_str(), nullptr, nullptr, path.c_str());
+bool delete_dests(const std::wstring& path, size_t from, size_t to) {
+  bool ok = true;
+  for (size_t i = from; i < to; ++i)
+    ok = WritePrivateProfileStringW(dest_section(i).c_str(), nullptr, nullptr, path.c_str()) && ok;
+  return ok;
 }
 
 // ---- repair helpers ----
@@ -134,7 +139,28 @@ struct OpenFile {
   size_t manifest;  // index into the chain
 };
 
-void repair_dest(IFileSystem& fs, const RecordingState& st, const DestResume& d, RepairReport& rep) {
+// True if the session's last session_start in these records is followed by session_end: it
+// was stopped cleanly and only the crash state was left behind.
+bool ended_cleanly(const std::vector<ManifestRecord>& recs, const std::wstring& session_id) {
+  bool ended = false, started = false;
+  for (const auto& r : recs) {
+    const std::string ev = field(r, "ev");
+    if (ev == "session_start" && (session_id.empty() || wide(field(r, "session_id")) == session_id)) {
+      started = true;
+      ended = false;
+    } else if (ev == "session_end" && started) {
+      ended = true;
+    }
+  }
+  return ended;
+}
+
+enum class HeadState { Unreadable, Live, Ended };
+
+// Repairs one destination; returns the state of its current manifest. *audio_end is raised
+// to where its repaired audio ends.
+HeadState repair_dest(IFileSystem& fs, const RecordingState& st, const DestResume& d, RepairReport& rep,
+                      SampleIndex* audio_end) {
   const auto wall = [&](SampleIndex s) {
     const int64_t utc = st.rate ? st.start_utc_ms + (s - st.start_sample) * 1000 / int64_t(st.rate) : st.last_utc_ms;
     return WallTime{utc, st.local_offset_min};
@@ -218,32 +244,37 @@ void repair_dest(IFileSystem& fs, const RecordingState& st, const DestResume& d,
   for (size_t i = chain.size(); i-- > 1;)
     if (!chain[i].add.empty() && !append_lines(fs, chain[i].path, chain[i].add))
       spill.insert(spill.end(), chain[i].add.begin(), chain[i].add.end());
-  if (!head_ok) return;  // already reported
+  *audio_end = std::max(*audio_end, gap_at);
+  if (!head_ok) return HeadState::Unreadable;  // already reported
   std::vector<JsonLine> head = chain[0].add;
   head.insert(head.end(), spill.begin(), spill.end());
-  // A scan that runs again (a crash during the last one) does not repeat the gap.
+  // No gap after a clean stop (a stale state), nor twice (a crash during the last scan).
+  const bool ended = ended_cleanly(chain[0].recs, st.session_id);
   bool have_gap = false;
   for (const auto& r : chain[0].recs)
     have_gap |= field(r, "ev") == "gap_start" && field(r, "reason") == "crash" && number(r, "sample") >= st.last_sample;
-  if (!have_gap) head.push_back(JsonLine("gap_start", gap_at, wall(gap_at)).str("reason", L"crash"));
+  if (!have_gap && !ended) head.push_back(JsonLine("gap_start", gap_at, wall(gap_at)).str("reason", L"crash"));
   if (!head.empty() && !append_lines(fs, chain[0].path, head)) rep.failed.push_back(chain[0].path);
+  return ended ? HeadState::Ended : HeadState::Live;
 }
 
 }  // namespace
 
 StateStore::StateStore(std::wstring ini_path) : path_(std::move(ini_path)) {}
 
-void StateStore::save(const RecordingState& s) {
-  ensure_unicode_file(path_);
+bool StateStore::save(const RecordingState& s) {
+  if (!ensure_unicode_file(path_)) return false;
   const size_t old = saved_dest_count(path_);
+  bool ok = true;
   for (size_t i = 0; i < s.dests.size(); ++i) {
     const DestResume& d = s.dests[i];
-    write_section(path_, dest_section(i),
-                  {{L"name", quoted(d.name)}, {L"manifest_path", quoted(d.manifest_path)},
-                   {L"next_n", std::to_wstring(d.next_n)}});
+    ok = write_section(path_, dest_section(i),
+                       {{L"name", quoted(d.name)}, {L"manifest_path", quoted(d.manifest_path)},
+                        {L"next_n", std::to_wstring(d.next_n)}}) &&
+         ok;
   }
-  delete_dests(path_, s.dests.size(), old);
-  write_section(path_, L"State",
+  ok = delete_dests(path_, s.dests.size(), old) && ok;
+  return write_section(path_, L"State",
                 {{L"recording", s.recording ? L"1" : L"0"},
                  {L"session_id", quoted(s.session_id)},
                  {L"session_name", quoted(s.session_name)},
@@ -254,7 +285,8 @@ void StateStore::save(const RecordingState& s) {
                  {L"local_offset_min", std::to_wstring(s.local_offset_min)},
                  {L"rate", std::to_wstring(s.rate)},
                  {L"channels", std::to_wstring(s.channels)},
-                 {L"dests", std::to_wstring(s.dests.size())}});
+                 {L"dests", std::to_wstring(s.dests.size())}}) &&
+         ok;
 }
 
 std::optional<RecordingState> StateStore::load() const {
@@ -280,28 +312,33 @@ std::optional<RecordingState> StateStore::load() const {
   return s;
 }
 
-void StateStore::clear() {
-  ensure_unicode_file(path_);
-  delete_dests(path_, 0, saved_dest_count(path_));
-  write_section(path_, L"State", {{L"recording", L"0"}});
+bool StateStore::clear() {
+  if (!ensure_unicode_file(path_)) return false;
+  const bool ok = delete_dests(path_, 0, saved_dest_count(path_));
+  return write_section(path_, L"State", {{L"recording", L"0"}}) && ok;
 }
 
 RepairReport repair_open_files(IFileSystem& fs, const RecordingState& st) {
   RepairReport rep;
+  rep.audio_end = st.last_sample;
+  size_t readable = 0, ended = 0;
   for (const auto& d : st.dests) {
     if (d.manifest_path.empty()) continue;  // never opened a manifest
     try {
-      repair_dest(fs, st, d, rep);
+      const HeadState h = repair_dest(fs, st, d, rep, &rep.audio_end);
+      readable += h != HeadState::Unreadable;
+      ended += h == HeadState::Ended;
     } catch (...) {  // out of memory on a huge manifest: report it, go on with the others
       rep.failed.push_back(d.manifest_path);
     }
   }
+  rep.session_ended = readable > 0 && ended == readable;
   return rep;
 }
 
-ResumeInfo make_resume(const RecordingState& st, WallTime now) {
+ResumeInfo make_resume(const RecordingState& st, WallTime now, SampleIndex audio_end) {
   const int64_t down_ms = std::max<int64_t>(0, now.utc_ms - st.last_utc_ms);
-  return ResumeInfo{st, st.last_sample + down_ms * int64_t(st.rate) / 1000};
+  return ResumeInfo{st, std::max(st.last_sample + down_ms * int64_t(st.rate) / 1000, audio_end)};
 }
 
 }  // namespace sl

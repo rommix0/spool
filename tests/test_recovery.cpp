@@ -56,12 +56,12 @@ struct TempDir {
 
 // Manual ramp source at 8 kHz mono, 32-bit float WAV into D:\p, crash state in a temp INI.
 struct RecRig {
-  RecRig()
+  explicit RecRig(const std::wstring& ini = L"state.ini")
       : clock(r_wall(), 1000),
         log(fs, L"C:\\logs\\s.log"),
         src({uint32_t(kRate), 1}, SyntheticSource::Pattern::Ramp, true),
         mgr(src, fs, clock, log),
-        store(dir.path + L"\\state.ini") {
+        store(dir.path + L"\\" + ini) {
     std::wstring err;
     fs.ensure_dir(L"C:\\logs", &err);
     cfg.params.session_name = L"gig";
@@ -279,20 +279,28 @@ TEST(recovery_resume_continues_session) {
   rig.clock.set(WallTime{st->last_utc_ms + 60000, r_wall().local_offset_min});
   const RepairReport r = repair_open_files(rig.fs, *st);
   CHECK_EQ(r.repaired.size(), size_t(1));
-  const ResumeInfo ri = make_resume(*st, rig.clock.now());
+  CHECK(!r.session_ended);
+  CHECK_EQ(r.audio_end, SampleIndex(10.5 * kRate));
+  const ResumeInfo ri = make_resume(*st, rig.clock.now(), r.audio_end);
   CHECK_EQ(ri.resume_sample, st->last_sample + 60 * kRate);
 
+  // A destination added since the crash starts fresh: no gap_end there.
+  DestinationConfig extra = rig.cfg.dests[0];
+  extra.name = L"extra";
+  extra.folders = {kS};
+  rig.cfg.dests.push_back(extra);
   CHECK(rig.start(&ri));
   const SessionStats s = rig.mgr.stats();
   CHECK(s.session_id == id);
   CHECK(s.recovered_from_crash);
   CHECK_EQ(s.position, ri.resume_sample);
-  CHECK(poll([&] {
-    const auto d = rig.mgr.dest_status();
-    return d.size() == 1 && d[0].state == DestState::Writing && d[0].n == st->dests[0].next_n;
-  }));
-  const uint32_t n = rig.mgr.dest_status()[0].n;
-  CHECK_EQ(n, 2u);  // the previous file was n = 1
+  const auto ds = rig.mgr.dest_status();
+  CHECK_EQ(ds.size(), size_t(2));
+  if (ds.size() != 2) return;
+  CHECK_EQ(ds[0].n, st->dests[0].next_n);
+  CHECK_EQ(ds[0].n, 2u);  // the previous file was n = 1
+  CHECK_EQ(ds[1].n, 1u);
+  rig.mgr.marker(3600);  // an hour back: clamped to the resume point, not into the gap
   CHECK(rig.pump(3));
   CHECK(poll([&] { return rig.store.load()->dests[0].next_n == 3u; }));
   rig.mgr.stop();
@@ -329,6 +337,13 @@ TEST(recovery_resume_continues_session) {
     CHECK_EQ(num_of(closes[1], "end"), int64_t(ri.resume_sample + 3 * kRate));
   }
   CHECK(!recs.empty() && str(recs.back(), "ev") == "session_end");
+  const auto markers = events(recs, "marker");
+  CHECK_EQ(markers.size(), size_t(1));
+  if (markers.size() == 1) CHECK_EQ(num_of(markers[0], "sample"), int64_t(ri.resume_sample));
+  const auto xrecs = rig.only_manifest(kS);
+  CHECK(!xrecs.empty());
+  CHECK_EQ(events(xrecs, "gap_end").size(), size_t(0));
+  CHECK_EQ(events(xrecs, "gap_start").size(), size_t(0));
   const auto wavs = rig.fs.list(kP, L".wav");
   CHECK_EQ(wavs.size(), size_t(2));
   if (wavs.size() == 2) CHECK_EQ(wav_samples(rig.fs, wavs[1]).size(), size_t(3 * kRate));
@@ -466,4 +481,154 @@ TEST(recovery_make_resume_advances_by_downtime) {
   st.last_utc_ms = 5000;
   CHECK_EQ(make_resume(st, WallTime{5000 + 90000, 0}).resume_sample, SampleIndex(1000 + 90 * 48000));
   CHECK_EQ(make_resume(st, WallTime{4000, 0}).resume_sample, SampleIndex(1000));  // clock went back
+}
+
+// An INI that cannot be written must not silently turn crash recovery off.
+TEST(state_store_write_failure_is_reported) {
+  TempDir dir;
+  StateStore bad(dir.path + L"\\no_such_dir\\state.ini");
+  RecordingState s;
+  s.recording = true;
+  s.dests = {{L"main", L"D:\\p\\gig_main.jsonl", 2}};
+  CHECK(!bad.save(s));
+  CHECK(!bad.clear());
+  CHECK(!bad.load().has_value());
+
+  RecRig rig(L"no_such_dir\\state.ini");
+  CHECK(rig.start());
+  CHECK(rig.pump(5));  // several saves, all failing
+  rig.mgr.stop();
+  size_t warnings = 0, errors = 0;
+  for (const auto& e : rig.log.recent(1000)) {
+    warnings += e.sev == Severity::Warning && e.text.find(L"Cannot save the recording state") != std::wstring::npos;
+    errors += e.sev == Severity::Error && e.text.find(L"Cannot clear the recording state") != std::wstring::npos;
+  }
+  CHECK_EQ(warnings, size_t(1));  // once per session
+  CHECK_EQ(errors, size_t(1));    // the clear at stop
+}
+
+// A clean stop whose state was not cleared: the manifest already ends the session, so the
+// scan writes no gap and reports that there is nothing to resume.
+TEST(recovery_no_gap_after_session_end) {
+  FaultFileSystem fs;
+  std::wstring err;
+  fs.ensure_dir(kP, &err);
+  const std::wstring man = kP + L"\\gig_main.jsonl", wav = kP + L"\\gig_001.wav";
+  const WallTime w = r_wall();
+  put_line(fs, man, JsonLine("session_start", 0, w).str("session_id", L"x").str("dest", L"main"));
+  put_line(fs, man, JsonLine("file_open", 0, w).str("path", wav).num("n", 1).num("seg", 0));
+  put_line(fs, man, JsonLine("file_close", 500, w).str("path", wav).num("start", 0).num("end", 500).num("bytes", 0));
+  put_line(fs, man, JsonLine("session_end", 500, w).str("reason", L"stop"));
+  RecordingState st;
+  st.recording = true;
+  st.session_id = L"x";
+  st.rate = uint32_t(kRate);
+  st.channels = 1;
+  st.last_sample = 400;
+  st.dests = {{L"main", man, 2}};
+  const RepairReport r = repair_open_files(fs, st);
+  CHECK(r.session_ended);
+  CHECK_EQ(r.repaired.size(), size_t(0));
+  CHECK_EQ(r.failed.size(), size_t(0));
+  CHECK_EQ(events(read_manifest(fs, man), "gap_start").size(), size_t(0));
+
+  // The session resumed in the same manifest (a later session_start) is live again.
+  put_line(fs, man, JsonLine("session_start", 8000, w).str("session_id", L"x").str("dest", L"main"));
+  const RepairReport r2 = repair_open_files(fs, st);
+  CHECK(!r2.session_ended);
+  CHECK_EQ(events(read_manifest(fs, man), "gap_start").size(), size_t(1));
+}
+
+// The wall clock went back across the crash: the resumed samples start where the repaired
+// audio ends instead of overlapping it.
+TEST(recovery_resume_after_clock_went_back) {
+  RecRig rig;
+  CHECK(rig.start());
+  CHECK(rig.pump(10.5));
+  CHECK(rig.state_has_manifest());
+  rig.mgr.abandon_for_test();
+  const auto st = rig.store.load();
+  CHECK(st.has_value());
+  if (!st) return;
+  rig.clock.set(WallTime{st->last_utc_ms - 30000, r_wall().local_offset_min});
+  const RepairReport r = repair_open_files(rig.fs, *st);
+  CHECK_EQ(r.audio_end, SampleIndex(10.5 * kRate));
+  const ResumeInfo ri = make_resume(*st, rig.clock.now(), r.audio_end);
+  CHECK_EQ(ri.resume_sample, SampleIndex(10.5 * kRate));
+  CHECK(rig.start(&ri));
+  CHECK_EQ(rig.mgr.stats().position, ri.resume_sample);
+  CHECK(rig.pump(1));
+  rig.mgr.stop();
+
+  const auto recs = rig.only_manifest(kP);
+  const auto opens = events(recs, "file_open"), closes = events(recs, "file_close");
+  CHECK_EQ(opens.size(), size_t(2));
+  CHECK_EQ(closes.size(), size_t(2));
+  if (opens.size() == 2 && closes.size() == 2) {
+    CHECK_EQ(num_of(closes[0], "end"), int64_t(10.5 * kRate));
+    CHECK_EQ(num_of(opens[1], "sample"), int64_t(10.5 * kRate));  // no overlap
+  }
+  const auto gs = events(recs, "gap_start"), ge = events(recs, "gap_end");
+  CHECK(gs.size() == 1 && ge.size() == 1);
+  if (gs.size() == 1 && ge.size() == 1) CHECK_EQ(num_of(gs[0], "sample"), num_of(ge[0], "sample"));
+}
+
+// The failed-over file starts after a rotation (its start is not 0, so an absolute/relative
+// mixup in the cap would show), and the process dies right after the failover, before any
+// periodic flush in E:. The new manifest (prev_manifest, failover, file_open) was flushed at
+// once, so the whole chain is repairable.
+TEST(recovery_crash_right_after_failover_of_rotated_file) {
+  RecRig rig;
+  rig.cfg.ring_seconds = 8;  // the stall fires 4 s behind the hung cursor; the takeover starts ~2 s before that
+  rig.cfg.dests[0].folders = {kP, kS};
+  CHECK(rig.start());
+  CHECK(rig.pump(2.5));
+  rig.mgr.split();
+  CHECK(poll([&] { return rig.mgr.dest_status()[0].n == 2u; }));
+  CHECK(rig.pump(3));  // file 2 is confirmed past its start by a periodic flush
+  rig.fs.add_rule({kP + L"\\", Kind::HangWrite, 8000});  // ~0.25 s more lands: before the next flush (>= 6 s)
+  bool over = false;
+  for (int i = 0; i < 60 && !over; ++i) {
+    CHECK(rig.pump(0.1, false));
+    const auto d = rig.mgr.dest_status();
+    over = d[0].state == DestState::Writing && d[0].folders[1].health == FolderHealth::Active;
+  }
+  CHECK(over);
+  CHECK(rig.caught_up());  // the takeover has written what the ring held
+  CHECK(poll([&] {
+    const auto st = rig.store.load();
+    return st && !st->dests.empty() && st->dests[0].manifest_path.rfind(kS, 0) == 0;
+  }));
+  const SampleIndex end = rig.mgr.stats().position;
+  rig.mgr.abandon_for_test();  // no periodic flush in E: has happened
+  rig.fs.clear_rules();
+  rig.fs.release_hangs();
+
+  const auto st = rig.store.load();
+  CHECK(st.has_value());
+  if (!st) return;
+  const auto prec = rig.only_manifest(kP), srec = rig.only_manifest(kS);
+  const auto opens = events(prec, "file_open");
+  const auto fo = events(srec, "failover");
+  CHECK_EQ(opens.size(), size_t(2));
+  CHECK_EQ(fo.size(), size_t(1));
+  CHECK_EQ(events(srec, "file_open").size(), size_t(1));
+  if (opens.size() != 2 || fo.size() != 1) return;
+  const SampleIndex f2 = num_of(opens[1], "sample"), confirmed = num_of(fo[0], "confirmed");
+  CHECK(f2 > 0);
+  CHECK(confirmed > f2);
+  const auto a = rig.fs.list(kP, L".wav"), b = rig.fs.list(kS, L".wav");
+  CHECK_EQ(a.size(), size_t(2));
+  CHECK_EQ(b.size(), size_t(1));
+  if (a.size() != 2 || b.size() != 1) return;
+  CHECK(physical_frames(rig.fs, a[1]) > uint64_t(confirmed - f2));  // samples past confirmed reached D:
+
+  const RepairReport r = repair_open_files(rig.fs, *st);
+  CHECK_EQ(r.repaired.size(), size_t(2));  // file 2 (capped) and its _b continuation
+  CHECK_EQ(r.failed.size(), size_t(0));
+  const auto v1 = wav_samples(rig.fs, a[0]), v2 = wav_samples(rig.fs, a[1]), vb = wav_samples(rig.fs, b[0]);
+  CHECK_EQ(SampleIndex(v1.size()), f2);
+  CHECK_EQ(SampleIndex(v2.size()), confirmed - f2);
+  CHECK_EQ(SampleIndex(v1.size() + v2.size() + vb.size()), end);
+  CHECK_EQ(ramp_errors(v1, 0) + ramp_errors(v2, f2) + ramp_errors(vb, confirmed), size_t(0));
 }

@@ -238,7 +238,8 @@ TEST(dest_flush_confirms_every_interval) {
   // Opened at 14:29:58 local -> file 1 spans [0, 16000) and was confirmed by its finalize;
   // steady time has not moved, so file 2 has not been flushed yet.
   CHECK_EQ(d.status().confirmed, SampleIndex(2 * 8000));
-  CHECK(rig.fs.contents(kManifest).empty());
+  // Each file_open is flushed at once (crash repair finds files through it); the rest waits.
+  CHECK_EQ(events(read_manifest(rig.fs, kManifest), "file_open").size(), size_t(2));
   rig.clock.advance_ms(2100);
   CHECK(poll([&] { return d.status().confirmed > 2 * 8000; }));
   const DestStatus st = d.status();

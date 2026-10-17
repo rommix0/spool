@@ -662,7 +662,9 @@ class Destination::Writer {
       for (const auto& l : lead(dir)) man_->append(l);
     for (const auto& l : c_.backlog) man_->append(l);
     c_.backlog.clear();
-    return commit([&](DestStatus& st) { st.manifest_path = path; });
+    if (!commit([&](DestStatus& st) { st.manifest_path = path; })) return false;
+    flush_manifest();  // the chain (prev_manifest, failover) must survive a crash right now
+    return !gone();
   }
 
   // Opens file {n}{seg} in folders[folder] whose first sample is `at`.
@@ -720,8 +722,17 @@ class Destination::Writer {
           k_.busy_folder = folder;
         }))
       return false;
+    flush_manifest();  // crash repair finds the file only through its file_open
+    if (gone()) return false;
     log(Severity::Info, L"Recording to " + path);
     return true;
+  }
+
+  // Best effort: a failure shows up again at the next periodic flush, which fails over.
+  void flush_manifest() {
+    if (!man_) return;
+    IoScope io(*this, man_folder_);
+    man_->flush();
   }
 
   BextInfo bext_for(WallTime first) const {

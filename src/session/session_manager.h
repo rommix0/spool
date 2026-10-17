@@ -75,7 +75,9 @@ class SessionManager : CaptureCallbacks {
   // Test hook (crash simulation): stops every thread without finalizing, flushing or
   // clearing anything; encoders and manifests are leaked unclosed.
   void abandon_for_test();
-  void marker(uint32_t seconds_ago);  // at max(start_sample, write_index - s*rate), named "Marker N"
+  // At max(first sample, write_index - s*rate), named "Marker N". The first sample is
+  // start_sample, or resume_sample after a resume (never inside the crash gap).
+  void marker(uint32_t seconds_ago);
   void split();                       // at write_index
   void append_folder(size_t dest, std::wstring path);  // also kept for a linked session
   void acknowledge();
@@ -119,7 +121,8 @@ class SessionManager : CaptureCallbacks {
   void link_new_session(StreamFormat fmt, uint64_t steady_ms, WallTime wall);
   void restart_capture(Session&, uint64_t steady_ms);
   void watchdog(Session&);
-  void save_state(Session&, uint64_t steady_ms);  // if due or changed
+  void save_state(Session&, uint64_t steady_ms);  // if due or changed; warns once per session on failure
+  void clear_state();                             // logs an error on failure
   void post_all(Session&, const DestCommand&);
   // Silence filler (§5.3): the ring's only producer while the input is lost.
   void start_filler(Session&);
@@ -162,6 +165,7 @@ class SessionManager : CaptureCallbacks {
   StateStore* store_ = nullptr;
   uint64_t saved_seq_ = 0, saved_steady_ = 0;
   std::vector<std::pair<uint32_t, std::wstring>> saved_dests_;  // next n and manifest at the last save
+  bool save_warned_ = false;
   std::atomic<bool> recovered_{false};
 
   SpscQueue<UiCommand, 256> ui_q_;

@@ -29,13 +29,14 @@ struct RecordingState {
 
 // Get/WritePrivateProfileStringW on a UTF-16 INI file: section [State] and one section
 // [Dest0], [Dest1], ... per destination. Each save rewrites every section it owns.
+// save() and clear() return false if the file could not be written (its folder must exist).
 class StateStore {
  public:
   explicit StateStore(std::wstring ini_path);
-  void save(const RecordingState&);
+  bool save(const RecordingState&);
   // nullopt if nothing was ever saved; recording false after clear().
   std::optional<RecordingState> load() const;
-  void clear();
+  bool clear();
 
  private:
   std::wstring path_;
@@ -44,6 +45,10 @@ class StateStore {
 struct RepairReport {
   std::vector<std::wstring> repaired;  // files whose manifest entry was closed (WAV headers fixed)
   std::vector<std::wstring> failed;    // manifests or files that could not be read or repaired
+  SampleIndex audio_end = 0;           // where the recorded audio ends (>= last_sample): for make_resume
+  // Every readable current manifest already ends the session with session_end (a clean stop
+  // whose crash state could not be cleared): nothing to resume, and no gap was written.
+  bool session_ended = false;
 };
 
 // For each destination, follows its manifest's prev_manifest chain. Every file_open
@@ -53,6 +58,8 @@ struct RepairReport {
 // manifest then gets gap_start(crash) at last_sample, or where the repaired audio ends if
 // that is later (the state is saved every flush_ms, so up to that much may follow it).
 // Never throws; a missing drive or file is reported in `failed` and the scan goes on.
+// A manifest whose last session_start for this session is followed by session_end gets no
+// gap_start (see RepairReport::session_ended).
 RepairReport repair_open_files(IFileSystem&, const RecordingState&);
 
 struct ResumeInfo {
@@ -60,8 +67,9 @@ struct ResumeInfo {
   SampleIndex resume_sample;
 };
 
-// resume_sample = last_sample + (now.utc_ms - last_utc_ms) * rate / 1000 (never before
-// last_sample if the clock went back).
-ResumeInfo make_resume(const RecordingState&, WallTime now);
+// resume_sample = last_sample + (now.utc_ms - last_utc_ms) * rate / 1000, but never before
+// audio_end (RepairReport::audio_end), so the resumed samples never overlap the repaired
+// files even if the wall clock went back.
+ResumeInfo make_resume(const RecordingState&, WallTime now, SampleIndex audio_end = 0);
 
 }  // namespace sl
