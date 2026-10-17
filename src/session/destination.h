@@ -80,14 +80,17 @@ class Destination {
   SampleIndex progress() const;
   // The stall watchdog fired (see is_stalled): the worker is abandoned where it hangs, its
   // folder is quarantined, and a new one continues from the last confirmed sample in the
-  // next healthy folder. The watchdog may call this whenever is_stalled() holds; it is a
-  // no-op unless the state is Writing or FailingOver (GapClosed and LastResort idle on
-  // purpose), and after a stall takeover it is ignored until progress() reaches the
-  // capture position recorded at the takeover (the new writer starts that far behind) or
-  // a grace deadline passes, whichever comes first. The deadline is the takeover's steady
-  // time plus the time the stall threshold spans (capacity * stall_percent / 100 / rate
-  // seconds, at least 5 s); after it a call is honored normally, so a takeover writer
-  // that hangs as well fails over to the next healthy folder.
+  // next healthy folder. The watchdog may call this whenever is_stalled() holds:
+  // - It is a no-op when Stopped or Disabled.
+  // - In Writing and FailingOver it is honored. In any other state (Idle, GapClosed,
+  //   LastResort) it is honored only while the writer is inside file I/O (a hang in the
+  //   first open, a LastResort retry or a resume reopen); a writer idle on purpose is not
+  //   stalled and keeps its folders.
+  // - After a stall takeover it is ignored until progress() reaches the capture position
+  //   recorded at the takeover (the new writer starts that far behind) or a grace deadline
+  //   passes, whichever comes first. Deadline = takeover steady time + clamp(headroom / 2,
+  //   0.5 s, 5 s), headroom = capacity * (100 - stall_percent) / 100 / rate seconds, so a
+  //   takeover writer that hangs as well is rescued while its data is still in the ring.
   void declare_stalled();
   void disable(std::wstring reason);  // state Disabled, nothing (more) written
   DestStatus status() const;

@@ -616,39 +616,53 @@ TEST(failover_stall_ignored_when_idle) {
   }
 }
 
-// R13: the grace after a takeover ends at a deadline too, so a takeover writer that hangs
-// as well is still rescued: the next declare_stalled() after the deadline fails over.
+// R13 (revised): the grace after a takeover also ends at a deadline, early enough that a
+// rescue after a second hang starts on data still in the ring. 30 s ring (262144 frames,
+// 32.8 s) at 50 %: headroom 16.4 s, deadline 5 s. A deadline of the full threshold
+// (16.4 s) would have let the capture overwrite the confirmed sample.
 TEST(failover_stall_grace_deadline_rescues_hung_takeover) {
-  FoRig rig;
-  rig.cfg.folders = {kP, kS, L"F:\f"};
+  const std::wstring kF = L"F:\\f";
+  FoRig rig{size_t(30 * kRate)};
+  rig.cfg.folders = {kP, kS, kF};
   Destination d(rig.cfg, rig.sp, rig.ring, rig.fs, rig.clock, rig.log);
   d.start(0);
   CHECK(rig.confirm_first_2s(d));
   rig.fs.add_rule({L"D:\\", Kind::HangWrite});
   rig.fs.add_rule({L"E:\\", Kind::HangWrite});
-  feed(rig.ring, 2 * kRate, size_t(kRate));
+  // The watchdog fires once the lag passes half the ring: confirmed is 16.5 s behind.
+  SampleIndex w = 2 * kRate;
+  feed(rig.ring, w, size_t(33 * kRate / 2));
+  w += 33 * kRate / 2;
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
   CHECK_EQ(d.progress(), SampleIndex(2 * kRate));
+  CHECK(is_stalled(rig.ring.write_index(), d.progress(), rig.ring.capacity(), rig.sp.stall_percent));
   d.declare_stalled();  // takes over towards E:, which hangs too (in its probe)
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
   d.declare_stalled();  // within the grace: ignored
+  // The capture goes on during the grace; the watchdog keeps firing.
+  for (int s = 0; s < 4; ++s) {
+    feed(rig.ring, w, size_t(kRate));
+    w += kRate;
+    rig.clock.advance_ms(1000);
+    d.declare_stalled();  // at most 4 s after the takeover: ignored
+  }
   CHECK_EQ(stall_log_entries(rig.log), size_t(1));
-  // Grace = 2^20 frames * 50 % / 8000 Hz = 65.536 s of steady time.
-  rig.clock.advance_ms(65000);
-  d.declare_stalled();  // still within it
-  CHECK_EQ(stall_log_entries(rig.log), size_t(1));
+  feed(rig.ring, w, size_t(kRate));
+  w += kRate;
   rig.clock.advance_ms(1000);
-  d.declare_stalled();  // past the deadline: honored
+  d.declare_stalled();  // 5 s: the deadline has passed, honored
   CHECK(poll([&] { return on_folder(d.status(), 2); }));
   CHECK_EQ(stall_log_entries(rig.log), size_t(2));
   const DestStatus st = d.status();
   CHECK(st.folders[0].health == FolderHealth::Failed);
   CHECK(st.folders[1].health == FolderHealth::Failed);
-  CHECK(rig.pump(d, 3 * kRate, 6 * kRate));
-  d.stop(6 * kRate);
+  CHECK(rig.pump(d, w, w + 5 * kRate));
+  w += 5 * kRate;
+  d.stop(w);
+  CHECK(d.status().gaps == 0);  // the rescue started on data still in the ring
   rig.fs.release_hangs();
 
-  const auto dp = rig.wavs(kP), ff = rig.wavs(L"F:\f");
+  const auto dp = rig.wavs(kP), ff = rig.wavs(kF);
   CHECK_EQ(rig.wavs(kS).size(), size_t(0));  // E: never got further than its probe
   CHECK_EQ(dp.size(), size_t(1));
   CHECK_EQ(ff.size(), size_t(1));
@@ -656,9 +670,9 @@ TEST(failover_stall_grace_deadline_rescues_hung_takeover) {
   const auto a = wav_samples(rig.fs, dp[0]);
   const auto c = wav_samples(rig.fs, ff[0]);
   CHECK_EQ(a.size(), size_t(2 * kRate));
-  CHECK_EQ(a.size() + c.size(), size_t(6 * kRate));
+  CHECK_EQ(SampleIndex(a.size() + c.size()), w);
   CHECK_EQ(ramp_errors(a, 0) + ramp_errors(c, 2 * kRate), size_t(0));
-  auto recs = rig.only_manifest(L"F:\f");
+  auto recs = rig.only_manifest(kF);
   CHECK(recs.size() >= 2);
   if (recs.size() >= 2) {
     CHECK_EQ(recs[1]["ev"], std::string("failover"));
@@ -667,4 +681,103 @@ TEST(failover_stall_grace_deadline_rescues_hung_takeover) {
     CHECK_EQ(num(recs[1], "confirmed"), int64_t(2 * kRate));
     CHECK_EQ(recs[1]["old_path"], narrow(dp[0]));  // still the file that holds the data
   }
+  CHECK(events(recs, "gap_start").empty());
+}
+
+// A drive that hangs between preflight and start: the writer is stuck in its first open
+// (state Idle). That is a stall, and recording starts in the next folder.
+TEST(failover_stall_in_first_open) {
+  FoRig rig;
+  rig.fs.add_rule({L"D:\\", Kind::HangWrite});
+  Destination d(rig.cfg, rig.sp, rig.ring, rig.fs, rig.clock, rig.log);
+  d.start(0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));  // stuck in D:'s probe
+  CHECK(d.status().state == DestState::Idle);
+  d.declare_stalled();
+  CHECK(poll([&] { return on_folder(d.status(), 1); }));
+  CHECK(rig.pump(d, 0, 3 * kRate));
+  d.stop(3 * kRate);
+  rig.fs.release_hangs();
+
+  CHECK_EQ(stall_log_entries(rig.log), size_t(1));
+  CHECK(d.status().folders[0].health == FolderHealth::Failed);
+  const auto es = rig.wavs(kS);
+  CHECK_EQ(es.size(), size_t(1));
+  if (es.size() != 1) return;
+  CHECK(ends_with(es[0], L"_001.wav"));  // the session's first file
+  const auto v = wav_samples(rig.fs, es[0]);
+  CHECK_EQ(v.size(), size_t(3 * kRate));
+  CHECK_EQ(ramp_errors(v, 0), size_t(0));
+}
+
+// LastResort: the 30 s retry hangs probing D:. That is a stall: the next generation follows
+// the capture again (still in LastResort) and a folder appended later recovers.
+TEST(failover_stall_in_last_resort_retry) {
+  FoRig rig;
+  Destination d(rig.cfg, rig.sp, rig.ring, rig.fs, rig.clock, rig.log);
+  d.start(0);
+  CHECK(rig.confirm_first_2s(d));
+  rig.fs.add_rule({L"D:\\", Kind::FailOpen});
+  rig.fs.add_rule({L"E:\\", Kind::FailOpen});
+  rig.fs.add_rule({L"D:\\", Kind::FailWrite});
+  feed(rig.ring, 2 * kRate, size_t(kRate));
+  CHECK(poll([&] { return d.status().state == DestState::LastResort; }));
+  CHECK(wait_progress(d, 3 * kRate));
+  rig.fs.clear_rules();
+  rig.fs.add_rule({L"D:\\", Kind::HangWrite});  // the retry's probe of D: hangs
+  rig.fs.add_rule({L"E:\\", Kind::FailOpen});
+  rig.clock.advance_ms(30100);
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  feed(rig.ring, 3 * kRate, size_t(kRate));
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  CHECK_EQ(d.progress(), SampleIndex(3 * kRate));  // stuck: no longer following the capture
+  d.declare_stalled();
+  CHECK(wait_progress(d, 4 * kRate));  // following again
+  CHECK(d.status().state == DestState::LastResort);
+  d.post(CmdAppendFolder{L"F:\\new"});
+  CHECK(poll([&] { return d.status().state == DestState::Writing; }));
+  CHECK(rig.pump(d, 4 * kRate, 6 * kRate));
+  d.stop(6 * kRate);
+  rig.fs.release_hangs();
+
+  CHECK_EQ(stall_log_entries(rig.log), size_t(1));
+  const auto f = rig.wavs(L"F:\\new");
+  CHECK_EQ(f.size(), size_t(1));
+  if (f.size() == 1) {
+    const auto v = wav_samples(rig.fs, f[0]);
+    CHECK_EQ(v.size(), size_t(2 * kRate));
+    CHECK_EQ(ramp_errors(v, 4 * kRate), size_t(0));
+  }
+}
+
+// GapClosed: the reopen for CmdResumeAt hangs probing D:. That is a stall; the command is
+// handled again by the next generation, in E:.
+TEST(failover_stall_in_resume_reopen) {
+  FoRig rig;
+  rig.cfg.rotation_minutes = 0;
+  Destination d(rig.cfg, rig.sp, rig.ring, rig.fs, rig.clock, rig.log);
+  d.start(0);
+  d.post(CmdCloseForGap{2 * kRate});
+  feed(rig.ring, 0, size_t(2 * kRate));
+  CHECK(poll([&] { return d.status().state == DestState::GapClosed; }));
+  rig.fs.add_rule({L"D:\\", Kind::HangWrite});
+  rig.ring.jump_to(4 * kRate);
+  d.post(CmdResumeAt{4 * kRate});
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));  // stuck in D:'s probe
+  CHECK(d.status().state == DestState::GapClosed);
+  d.declare_stalled();
+  CHECK(poll([&] { return on_folder(d.status(), 1); }));
+  CHECK(rig.pump(d, 4 * kRate, 5 * kRate));
+  d.stop(5 * kRate);
+  rig.fs.release_hangs();
+
+  CHECK_EQ(stall_log_entries(rig.log), size_t(1));
+  const auto dp = rig.wavs(kP), es = rig.wavs(kS);
+  CHECK_EQ(dp.size(), size_t(1));
+  CHECK_EQ(es.size(), size_t(1));
+  if (dp.size() != 1 || es.size() != 1) return;
+  CHECK_EQ(ramp_errors(wav_samples(rig.fs, dp[0]), 0), size_t(0));
+  const auto v = wav_samples(rig.fs, es[0]);
+  CHECK_EQ(v.size(), size_t(kRate));
+  CHECK_EQ(ramp_errors(v, 4 * kRate), size_t(0));
 }

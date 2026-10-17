@@ -36,7 +36,7 @@ constexpr uint64_t kSpaceCheckMs = 10000;  // low-water check interval (§8.2)
 constexpr uint64_t kRetryMs = 30000;       // LastResort retry interval (§4.3)
 constexpr DWORD kStopBudgetMs = 3000;
 constexpr size_t kNone = SIZE_MAX;
-constexpr uint64_t kMinStallGraceMs = 5000;
+constexpr uint64_t kMinStallGraceMs = 500, kMaxStallGraceMs = 5000;
 
 uint32_t bytes_per_sample(WavDepth d) {
   switch (d) {
@@ -50,11 +50,15 @@ uint32_t opus_bitrate(uint32_t configured, size_t channels) {
   return configured ? configured : (channels == 1 ? 64000u : 128000u);
 }
 
-// R13: how long a stall takeover may take to catch up before the watchdog may fire again:
-// the time the stall threshold (stall_percent of the ring) spans, at least 5 s.
+// R13 (revised): how long a stall takeover may take to catch up before the watchdog may
+// fire again. A takeover starts about stall_percent of the ring behind; half of the
+// remaining headroom, clamped to [0.5 s, 5 s], leaves a rescue after a second hang
+// starting on data that is still in the ring.
 uint64_t stall_grace_ms(const SessionParams& sp, size_t ring_capacity) {
-  const uint64_t frames = uint64_t(ring_capacity) * sp.stall_percent / 100;
-  return std::max(kMinStallGraceMs, sp.rate ? frames * 1000 / sp.rate : 0);
+  const uint32_t pct = std::min<uint32_t>(sp.stall_percent, 100);
+  const uint64_t headroom = uint64_t(ring_capacity) * (100 - pct) / 100;
+  const uint64_t ms = sp.rate ? headroom * 1000 / sp.rate / 2 : 0;
+  return std::clamp(ms, kMinStallGraceMs, kMaxStallGraceMs);
 }
 
 // Creates dir\stem.ext (or stem_1.ext, ...) through `open`, which must fail rather than
@@ -224,6 +228,7 @@ struct Destination::Core {
   std::string stop_reason;
   Carry carry;
   size_t busy_folder = kNone;     // folder of the writer's current file I/O
+  bool io_busy = false;           // the current writer is inside file I/O (Writer::IoScope)
   std::set<size_t> quarantined;   // a writer hung there: never probed again this session
   SampleIndex stall_grace_until = -1;  // declare_stalled() ignored until the cursor gets here
   uint64_t stall_grace_deadline_ms = 0;  // ... or until this steady time (R13)
@@ -394,6 +399,28 @@ class Destination::Writer {
     return true;
   }
 
+  // Marks the writer as inside file I/O (probe, open, manifest, encoder flush or close) for
+  // its lifetime; nestable. declare_stalled() is honored outside Writing/FailingOver only
+  // while this is set: a writer idle on purpose (GapClosed, LastResort) is not stalled,
+  // one stuck in an open or a probe is.
+  class IoScope {
+   public:
+    IoScope(Writer& w, size_t folder) : w_(w) { w_.set_io(+1, folder); }
+    ~IoScope() { w_.set_io(-1, kNone); }
+    IoScope(const IoScope&) = delete;
+    IoScope& operator=(const IoScope&) = delete;
+
+   private:
+    Writer& w_;
+  };
+  void set_io(int delta, size_t folder) {
+    io_depth_ += delta;
+    std::lock_guard<std::mutex> lk(k_.m);
+    if (stale()) return;
+    k_.io_busy = io_depth_ > 0;
+    if (delta > 0 && folder != kNone) k_.busy_folder = folder;
+  }
+
   void log(Severity s, std::wstring text) {
     live([&] { k_.log.add(s, k_.clock.now(), k_.name, std::move(text)); });
   }
@@ -495,14 +522,19 @@ class Destination::Writer {
     if (!k_.seed.prev_manifest.empty()) {
       c_.manifest_path = k_.seed.prev_manifest;  // linked from a new manifest if it cannot be reused
       std::wstring err;
-      auto m = Manifest::open_append(k_.fs, k_.seed.prev_manifest, &err);
+      const size_t folder = folder_of(k_.seed.prev_manifest);
+      std::unique_ptr<Manifest> m;
+      {
+        IoScope io(*this, folder);
+        m = Manifest::open_append(k_.fs, k_.seed.prev_manifest, &err);
+      }
       if (gone()) {
         (void)m.release();
         return;
       }
       if (m) {
         man_ = std::move(m);
-        man_folder_ = folder_of(k_.seed.prev_manifest);
+        man_folder_ = folder;
         man_->append(session_start_line(at, L""));
         if (!commit([&](DestStatus& st) { st.manifest_path = c_.manifest_path; })) return;
       } else {
@@ -522,11 +554,14 @@ class Destination::Writer {
     const std::wstring from = folder_path(stalled_);
     publish_cursor();
     if (c_.mode == Mode::LastResort) {
+      // It hung in a retry (probe, open or manifest): retry on schedule without that folder.
       follow_capture();
       return;
     }
     if (c_.mode == Mode::GapClosed) {
-      event(failover_line(cursor_, from, L"", "stall", L""));  // the last file was closed normally
+      // No file was open (the last one closed normally). If it hung reopening for a
+      // CmdResumeAt, that command is still queued and is handled again here.
+      event(failover_line(cursor_, from, L"", "stall", L""));
       commit([&](DestStatus&) { k_.set_state_locked(DestState::GapClosed); });
       return;
     }
@@ -535,7 +570,9 @@ class Destination::Writer {
     const LeadFn lead = [&](const std::wstring& to) {
       return std::vector<JsonLine>{failover_line(at, from, to, "stall", old_path)};
     };
-    if (open_at(at, c_.n, c_.seg + 1, stalled_, lead, kNone)) {
+    // No file opened yet (it hung in the first open): this is the first file, seg 0.
+    const uint32_t seg = c_.folder == kNone ? 0 : c_.seg + 1;
+    if (open_at(at, c_.n, seg, stalled_, lead, kNone)) {
       log(Severity::Warning, L"Failed over from " + from + L" to " + folder_path(c_.folder) + L" (stall)");
       return;
     }
@@ -549,6 +586,7 @@ class Destination::Writer {
   // moves along if it lives elsewhere; `lead` gives the events that follow session_start
   // in a new manifest.
   bool open_at(SampleIndex at, uint32_t n, uint32_t seg, size_t skip, const LeadFn& lead, size_t first) {
+    IoScope io(*this, kNone);
     const size_t count = folder_count();
     std::vector<size_t> order;
     if (first < count) order.push_back(first);
@@ -704,7 +742,11 @@ class Destination::Writer {
       end = cursor_;
     }
     const std::vector<Marker> ms = take_markers(end);
-    const bool ok = enc_->finalize(ms, truncate_to);
+    bool ok;
+    {
+      IoScope io(*this, c_.folder);
+      ok = enc_->finalize(ms, truncate_to);
+    }
     if (gone()) return end;
     delete enc_;
     enc_ = nullptr;
@@ -723,7 +765,11 @@ class Destination::Writer {
 
   // Flushes the open file and publishes what it confirmed; a failure fails over.
   bool confirm_all() {
-    const bool ok = enc_->flush();
+    bool ok;
+    {
+      IoScope io(*this, c_.folder);
+      ok = enc_->flush();
+    }
     if (gone()) return false;
     if (!ok) {
       failover("flush_error", L"Flush failed: " + c_.path);
@@ -935,7 +981,11 @@ class Destination::Writer {
   void flush() {
     if (enc_ && !confirm_all()) return;
     if (man_) {
-      const bool ok = man_->flush();
+      bool ok;
+      {
+        IoScope io(*this, man_folder_);
+        ok = man_->flush();
+      }
       if (gone()) return;
       if (!ok && enc_ && man_folder_ == c_.folder) {
         failover("flush_error", L"Manifest flush failed: " + c_.manifest_path);
@@ -957,7 +1007,10 @@ class Destination::Writer {
     if (enc_) end = close_file(stop_end);
     if (gone()) return true;
     event(line("session_end", end).str("reason", widen(reason)));
-    if (man_) man_->flush();
+    if (man_) {
+      IoScope io(*this, man_folder_);
+      man_->flush();
+    }
     if (!gone()) commit([&](DestStatus&) { k_.set_state_locked(DestState::Stopped); });
     return true;
   }
@@ -1037,6 +1090,7 @@ class Destination::Writer {
   Carry c_;
   SampleIndex cursor_;
   bool dead_ = false;
+  int io_depth_ = 0;  // nesting of IoScope
 
   std::unique_ptr<Manifest> man_;
   size_t man_folder_ = kNone;
@@ -1154,9 +1208,13 @@ void Destination::declare_stalled() {
     std::unique_lock<std::shared_mutex> lv(k.live);
     std::lock_guard<std::mutex> lk(k.m);
     if (!writer_ || !thread_.joinable()) return;
-    // Only a writer that is writing (or failing over) can stall; GapClosed and LastResort
-    // idle on purpose and must not cost a healthy folder.
-    if (k.st.state != DestState::Writing && k.st.state != DestState::FailingOver) return;
+    // A writer that writes (or fails over) can stall at any time. In the other states it
+    // idles on purpose (GapClosed, LastResort) unless it is inside file I/O: a hang in the
+    // first open, a LastResort retry or a resume reopen is a stall; an idle writer is not,
+    // and must not cost a healthy folder.
+    if (k.st.state == DestState::Stopped || k.st.state == DestState::Disabled) return;
+    const bool writing = k.st.state == DestState::Writing || k.st.state == DestState::FailingOver;
+    if (!writing && !k.io_busy) return;
     // A generation that took over after a stall starts at least half a ring behind: it is
     // given until it reaches the capture position recorded at the takeover, or until the
     // grace deadline if it hangs too (R13).
@@ -1177,6 +1235,7 @@ void Destination::declare_stalled() {
       k.st.current_file.clear();
     }
     k.st.needs_ack = true;
+    k.io_busy = false;  // the new generation starts outside file I/O
     k.stall_grace_until = k.ring.write_index();
     k.stall_grace_deadline_ms = k.clock.steady_ms() + stall_grace_ms(k.sp, k.ring_capacity);
     // The new generation continues from the last confirmed sample with the published carry.
