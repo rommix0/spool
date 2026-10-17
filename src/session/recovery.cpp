@@ -251,6 +251,7 @@ bool StateStore::save(const RecordingState& s) {
                  {L"local_offset_min", std::to_wstring(s.local_offset_min)},
                  {L"rate", std::to_wstring(s.rate)},
                  {L"channels", std::to_wstring(s.channels)},
+                 {L"device_id", quoted(s.device_id)},
                  {L"dests", std::to_wstring(s.dests.size())}}) &&
          ok;
 }
@@ -262,6 +263,7 @@ std::optional<RecordingState> StateStore::load() const {
   s.recording = *rec == L"1";
   s.session_id = get(path_, L"State", L"session_id").value_or(L"");
   s.session_name = get(path_, L"State", L"session_name").value_or(L"");
+  s.device_id = get(path_, L"State", L"device_id").value_or(L"");
   s.start_sample = get_i64(path_, L"State", L"start_sample");
   s.last_sample = get_i64(path_, L"State", L"last_sample");
   s.start_utc_ms = get_i64(path_, L"State", L"start_utc_ms");
@@ -294,6 +296,7 @@ RepairReport repair_open_files(IFileSystem& fs, const RecordingState& st) {
       const HeadState h = repair_dest(fs, st, d, rep, &rep.audio_end);
       readable += h != HeadState::Unreadable;
       ended += h == HeadState::Ended;
+      if (h == HeadState::Live) rep.live_heads.push_back(d.manifest_path);
     } catch (...) {  // out of memory on a huge manifest: report it, go on with the others
       rep.failed.push_back(d.manifest_path);
     }
@@ -302,16 +305,16 @@ RepairReport repair_open_files(IFileSystem& fs, const RecordingState& st) {
   return rep;
 }
 
-std::vector<std::wstring> end_crashed_session(IFileSystem& fs, const RecordingState& st, SampleIndex at,
+std::vector<std::wstring> end_crashed_session(IFileSystem& fs, const RecordingState& st, const RepairReport& rep,
                                               const std::wstring& reason) {
   std::vector<std::wstring> failed;
-  for (const auto& d : st.dests) {
-    if (d.manifest_path.empty()) continue;
+  const SampleIndex at = rep.audio_end;
+  for (const std::wstring& m : rep.live_heads) {
     try {
-      if (!append_lines(fs, d.manifest_path, {JsonLine("session_end", at, session_wall(st, at)).str("reason", reason)}))
-        failed.push_back(d.manifest_path);
+      if (!append_lines(fs, m, {JsonLine("session_end", at, session_wall(st, at)).str("reason", reason)}))
+        failed.push_back(m);
     } catch (...) {  // out of memory: report it, go on with the others
-      failed.push_back(d.manifest_path);
+      failed.push_back(m);
     }
   }
   return failed;

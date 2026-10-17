@@ -175,6 +175,7 @@ TEST(state_store_roundtrip) {
   s.local_offset_min = -240;
   s.rate = 48000;
   s.channels = 8;
+  s.device_id = L"{0.0.1.00000000}.{9a3f-\u00FC}";
   s.dests = {{L"main", L"D:\\p\\gig_main.jsonl", 3},
              {L"zweite \u00FC", L"E:\\M\u00FCsik\\\u65E5\u672C\\gig_zweite.jsonl", 7}};
   store.save(s);
@@ -191,6 +192,7 @@ TEST(state_store_roundtrip) {
   CHECK_EQ(l->local_offset_min, s.local_offset_min);
   CHECK_EQ(l->rate, s.rate);
   CHECK_EQ(l->channels, s.channels);
+  CHECK(l->device_id == s.device_id);
   CHECK_EQ(l->dests.size(), size_t(2));
   for (size_t i = 0; i < 2 && i < l->dests.size(); ++i) {
     CHECK(l->dests[i].name == s.dests[i].name);
@@ -840,4 +842,52 @@ TEST(launch_auto_start_after_recovery) {
   CHECK(auto_start_after(LaunchRecovery::GaveUp, true));
   CHECK(!auto_start_after(LaunchRecovery::EndedCleanly, false));
   CHECK(!auto_start_after(LaunchRecovery::GaveUp, false));
+}
+
+// R19: the crash state names the input device the session was recording from.
+TEST(recovery_state_keeps_device_id) {
+  RecRig rig;
+  rig.cfg.input_device_id = L"{0.0.1.00000000}.{pinned}";
+  CHECK(rig.start());
+  CHECK(rig.state_has_manifest());
+  const auto st = rig.store.load();
+  CHECK(st && st->device_id == L"{0.0.1.00000000}.{pinned}");
+}
+
+// Minor 3: session_end(resume_failed) only goes where the session was still live; a head
+// that had already ended (or could not be read) is left alone.
+TEST(recovery_end_session_only_live_heads) {
+  FaultFileSystem fs;
+  std::wstring err;
+  fs.ensure_dir(kP, &err);
+  fs.ensure_dir(kS, &err);
+  const WallTime w = r_wall();
+  const std::wstring ended = kP + L"\\gig_a.jsonl", live = kS + L"\\gig_b.jsonl", wav = kP + L"\\gig_001.wav";
+  put_line(fs, ended, JsonLine("session_start", 0, w).str("session_id", L"x").str("dest", L"a"));
+  put_line(fs, ended, JsonLine("file_open", 0, w).str("path", wav).num("n", 1).num("seg", 0));
+  put_line(fs, ended,
+           JsonLine("file_close", 500, w).str("path", wav).num("start", 0).num("end", 500).num("bytes", 0));
+  put_line(fs, ended, JsonLine("session_end", 500, w).str("reason", L"stop"));
+  put_line(fs, live, JsonLine("session_start", 0, w).str("session_id", L"x").str("dest", L"b"));
+  RecordingState st;
+  st.recording = true;
+  st.session_id = L"x";
+  st.rate = uint32_t(kRate);
+  st.channels = 1;
+  st.start_utc_ms = w.utc_ms;
+  st.last_sample = 400;
+  st.dests = {{L"a", ended, 2}, {L"b", live, 1}, {L"lost", L"Z:\\gone\\gig_lost.jsonl", 1}};
+  fs.add_rule({L"Z:\\", Kind::FailOpen});
+  const RepairReport rep = repair_open_files(fs, st);
+  CHECK(!rep.session_ended);
+  CHECK_EQ(rep.live_heads.size(), size_t(1));
+  CHECK(end_crashed_session(fs, st, rep, L"resume_failed").empty());
+  const auto a = read_manifest(fs, ended), b = read_manifest(fs, live);
+  CHECK_EQ(events(a, "session_end").size(), size_t(1));  // only the clean stop
+  CHECK(!a.empty() && str(a.back(), "reason") == "stop");
+  CHECK(!b.empty() && str(b.back(), "ev") == "session_end");
+  if (!b.empty()) {
+    CHECK_EQ(str(b.back(), "reason"), std::string("resume_failed"));
+    CHECK_EQ(num_of(b.back(), "sample"), int64_t(rep.audio_end));
+  }
 }

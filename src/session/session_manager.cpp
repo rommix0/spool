@@ -531,6 +531,7 @@ void SessionManager::save_state(Session& s, uint64_t steady_ms) {
   r.local_offset_min = s.params.start_wall.local_offset_min;
   r.rate = s.fmt.sample_rate;
   r.channels = s.fmt.channels;
+  r.device_id = cfg_.input_device_id;
   std::vector<std::pair<uint32_t, std::wstring>> now_dests;
   for (size_t i = 0; i < s.dests.size(); ++i) {
     const DestStatus ds = s.dests[i]->status();

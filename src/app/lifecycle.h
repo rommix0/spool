@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <string>
 
+#include "audio/capture_source.h"
 #include "core/clock.h"
 #include "io/file_system.h"
 #include "session/event_log.h"
@@ -64,5 +65,12 @@ LaunchRecoveryResult resume_when_input_ready(const RecordingState&, bool input_r
 
 // Whether start_on_launch applies after the crash recovery ended this way (nothing resumed).
 bool auto_start_after(LaunchRecovery, bool start_on_launch);
+
+// R19: a crashed session resumes only on the device it recorded from. The input settings
+// with the state's device id, if it has one (not for a test source, or a pre-R19 state).
+CaptureConfig resume_input(const CaptureConfig& settings_input, const RecordingState&);
+// Whether the source must be (re)opened before the resume: it is not open, or it is open
+// on another device than the pinned one.
+bool resume_needs_open(const std::wstring& open_device_id, bool open, const std::wstring& pinned_id);
 
 }  // namespace sl

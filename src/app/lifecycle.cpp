@@ -48,7 +48,7 @@ struct Recovery {
   // Nothing will resume the session: close it in its manifests (best effort).
   void end_session(const RepairReport& rep) {
     if (rep.session_ended) return;
-    for (const std::wstring& p : end_crashed_session(fs, st, rep.audio_end, L"resume_failed"))
+    for (const std::wstring& p : end_crashed_session(fs, st, rep, L"resume_failed"))
       add(Severity::Error, L"Couldn't close the crashed session in " + p);
   }
 };
@@ -87,6 +87,16 @@ LaunchRecoveryResult resume_when_input_ready(const RecordingState& st, bool inpu
   r.add(Severity::Error, L"The input device didn't return within " + std::to_wstring(kResumeWaitMs / 60000) +
                              L" min: the crashed session " + st.session_id + L" was not resumed");
   return {LaunchRecovery::GaveUp, {}};
+}
+
+CaptureConfig resume_input(const CaptureConfig& settings_input, const RecordingState& st) {
+  CaptureConfig c = settings_input;
+  if (!st.device_id.empty()) c.device_id = st.device_id;
+  return c;
+}
+
+bool resume_needs_open(const std::wstring& open_device_id, bool open, const std::wstring& pinned_id) {
+  return !open || (!pinned_id.empty() && open_device_id != pinned_id);
 }
 
 bool auto_start_after(LaunchRecovery r, bool start_on_launch) {

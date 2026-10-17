@@ -5,6 +5,8 @@
 #include "test.h"
 
 using namespace sl;
+using sl::CaptureConfig;
+using sl::CaptureMode;
 
 namespace {
 constexpr size_t kMiB = size_t(1) << 20;
@@ -27,4 +29,26 @@ TEST(lifecycle_raised_working_set_lets_ring_lock) {
   SampleRing ring(2, 30 * 48000);
   CHECK_EQ(ring.capacity(), size_t(1) << 21);
   CHECK(ring.locked());
+}
+
+// R19: a crashed session resumes only on the device it was recording from.
+TEST(lifecycle_resume_input_pins_device) {
+  CaptureConfig in;
+  in.mode = CaptureMode::Exclusive;
+  in.sample_rate = 96000;  // device_id empty: follow the Windows default
+  RecordingState st;
+  st.device_id = L"{pinned}";
+  const CaptureConfig c = resume_input(in, st);
+  CHECK(c.device_id == L"{pinned}");
+  CHECK(c.mode == CaptureMode::Exclusive);
+  CHECK_EQ(c.sample_rate, 96000u);
+  st.device_id.clear();  // synthetic, or a state from before R19: the settings as they are
+  CHECK(resume_input(in, st).device_id.empty());
+
+  // The open source must be that device; a different (default) one is reopened.
+  CHECK(!resume_needs_open(L"{pinned}", true, L"{pinned}"));
+  CHECK(resume_needs_open(L"{other}", true, L"{pinned}"));
+  CHECK(resume_needs_open(L"{pinned}", false, L"{pinned}"));  // not open
+  CHECK(!resume_needs_open(L"", true, L""));                  // nothing pinned: as now
+  CHECK(resume_needs_open(L"", false, L""));
 }

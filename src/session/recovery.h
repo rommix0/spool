@@ -24,6 +24,7 @@ struct RecordingState {
   int32_t local_offset_min = 0;                   // of the session's start_wall
   uint32_t rate = 0;
   uint16_t channels = 0;
+  std::wstring device_id;  // the capture endpoint recorded from ("" for a test source)
   std::vector<DestResume> dests;
 };
 
@@ -49,6 +50,8 @@ struct RepairReport {
   // Every readable current manifest already ends the session with session_end (a clean stop
   // whose crash state could not be cleared): nothing to resume, and no gap was written.
   bool session_ended = false;
+  // The current manifests in which the session is still live (readable, not ended).
+  std::vector<std::wstring> live_heads;
 };
 
 // For each destination, follows its manifest's prev_manifest chain. Every file_open
@@ -62,11 +65,11 @@ struct RepairReport {
 // gap_start (see RepairReport::session_ended).
 RepairReport repair_open_files(IFileSystem&, const RecordingState&);
 
-// When a crashed session will not be resumed: appends session_end(reason) at `at` (use
-// RepairReport::audio_end) to each destination's current manifest, so the session is
-// closed and a later scan sees it as ended. Call after repair_open_files. Best effort:
-// returns the manifests that could not be written.
-std::vector<std::wstring> end_crashed_session(IFileSystem&, const RecordingState&, SampleIndex at,
+// When a crashed session will not be resumed: appends session_end(reason) at
+// RepairReport::audio_end to each manifest in RepairReport::live_heads, so the session is
+// closed and a later scan sees it as ended. Call with the report of repair_open_files. Best
+// effort: returns the manifests that could not be written.
+std::vector<std::wstring> end_crashed_session(IFileSystem&, const RecordingState&, const RepairReport&,
                                               const std::wstring& reason);
 
 struct ResumeInfo {

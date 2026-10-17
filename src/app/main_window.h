@@ -73,7 +73,8 @@ class MainWindow {
   void before_start();                  // raises the working set for the ring
   void after_start();                   // warnings about the started session; refresh
   void use_log(const std::wstring& name);  // log_file(name)
-  enum class Banner { None, Waiting, Recovered };
+  int box(const std::wstring& text, const wchar_t* title, UINT flags);  // MessageBox, counted in modal_
+  enum class Banner { None, Waiting, Recovered, NotResumed, NotResumedNewRecording };
   void show_banner(Banner);
 
   void record();
@@ -107,6 +108,8 @@ class MainWindow {
   bool hotkey_ = false;
   bool awake_ = false;   // SetThreadExecutionState keeps the system awake (while recording)
   Banner banner_mode_ = Banner::None;
+  int modal_ = 0;              // message boxes and Settings open (their loops still run tick())
+  bool reopen_input_ = false;  // an input change was saved during a session: reopen at the next start
   // A crashed session found at launch that waits for its input device (R18).
   std::optional<RecordingState> pending_;
   uint64_t pending_since_ = 0, pending_try_ = 0;  // GetTickCount64

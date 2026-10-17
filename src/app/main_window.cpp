@@ -281,7 +281,7 @@ void MainWindow::on_command(int id) {
       if (recording()) ctx_.mgr.acknowledge();
       break;
     case IDC_BANNER_ACK:
-      if (banner_mode_ == Banner::Recovered) show_banner(Banner::None);
+      if (banner_mode_ != Banner::Waiting) show_banner(Banner::None);
       break;
   }
 }
@@ -321,8 +321,8 @@ LRESULT MainWindow::on_notify(NMHDR* n) {
 
 void MainWindow::on_close() {
   if (recording()) {
-    if (MessageBoxW(hwnd_, L"Recording is in progress. Stop recording and exit?", kTitle,
-                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+    if (box(L"Recording is in progress. Stop recording and exit?", kTitle,
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
       return;
     HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
     ctx_.mgr.stop();
@@ -349,7 +349,15 @@ SessionConfig MainWindow::session_config() const {
   cfg.params.stall_percent = s.stall_percent;
   cfg.dests = s.dests;
   cfg.ring_seconds = s.ring_seconds;
+  if (ctx_.wasapi) cfg.input_device_id = ctx_.wasapi->device_id();  // R19: resume on the same device
   return cfg;
+}
+
+int MainWindow::box(const std::wstring& text, const wchar_t* title, UINT flags) {
+  ++modal_;  // tick() starts nothing while a modal loop runs
+  const int r = MessageBoxW(hwnd_, text.c_str(), title, flags);
+  --modal_;
+  return r;
 }
 
 void MainWindow::record() {
@@ -360,11 +368,17 @@ void MainWindow::record() {
   // A crashed session is waiting for its input: Record retries that now.
   try_resume();
   if (pending_)
-    MessageBoxW(hwnd_, (L"Waiting for the input device to resume the crashed session.\n\n" + pending_err_).c_str(),
-                kCantStart, MB_OK | MB_ICONINFORMATION);
+    box(L"Waiting for the input device to resume the crashed session.\n\n" + pending_err_, kCantStart,
+        MB_OK | MB_ICONINFORMATION);
 }
 
 bool MainWindow::input_ready(std::wstring* err) {
+  if (reopen_input_ && !recording()) {  // an input change saved while a session was running
+    reopen_input_ = false;
+    const bool ok = ctx_.source.open(ctx_.settings.input, err);
+    update_device_name();
+    return ok;
+  }
   if (ctx_.source.format().sample_rate) return true;
   if (!ctx_.source.open(ctx_.settings.input, err)) return false;  // failed at launch: try again
   update_device_name();
@@ -380,7 +394,7 @@ void MainWindow::before_start() {
 bool MainWindow::start_recording(bool ask) {
   if (recording()) return false;
   const auto block = [this](const std::wstring& text) {
-    MessageBoxW(hwnd_, text.c_str(), kCantStart, MB_OK | MB_ICONERROR);
+    box(text, kCantStart, MB_OK | MB_ICONERROR);
     return false;
   };
   std::wstring err;
@@ -396,8 +410,7 @@ bool MainWindow::start_recording(bool ask) {
   std::vector<std::wstring> lines = pf.errors;
   lines.insert(lines.end(), pf.warnings.begin(), pf.warnings.end());
   if (ask && !lines.empty() &&
-      MessageBoxW(hwnd_, (join_lines(lines) + L"\n\nStart anyway?").c_str(), kTitle, MB_YESNO | MB_ICONWARNING) !=
-          IDYES)
+      box(join_lines(lines) + L"\n\nStart anyway?", kTitle, MB_YESNO | MB_ICONWARNING) != IDYES)
     return false;
   before_start();
   if (!ctx_.mgr.start(cfg, nullptr, &err)) {
@@ -435,7 +448,15 @@ void MainWindow::try_resume() {
   const uint64_t now = GetTickCount64();
   pending_try_ = now;
   pending_err_.clear();
-  const bool ready = input_ready(&pending_err_);
+  bool ready;
+  const bool open = ctx_.source.format().sample_rate != 0;
+  if (ctx_.wasapi && resume_needs_open(ctx_.wasapi->device_id(), open, pending_->device_id)) {
+    // R19: only the device the session recorded from, not whatever is the default now.
+    ready = ctx_.source.open(resume_input(ctx_.settings.input, *pending_), &pending_err_);
+    update_device_name();
+  } else {
+    ready = input_ready(&pending_err_);
+  }
   if (ready) before_start();
   HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
   const LaunchRecoveryResult r = resume_when_input_ready(*pending_, ready, now - pending_since_, session_config(),
@@ -454,12 +475,17 @@ void MainWindow::try_resume() {
     after_start();
     return;
   }
-  show_banner(Banner::None);
   use_log(kAppLog);
+  const bool lost = r.outcome == LaunchRecovery::Failed || r.outcome == LaunchRecovery::GaveUp;
+  // Unattended first: start_on_launch records before anything waits for a click. The
+  // failure is already in the event log; the banner reports it.
+  if (auto_start_after(r.outcome, ctx_.settings.start_on_launch) && start_recording(false)) {
+    show_banner(lost ? Banner::NotResumedNewRecording : Banner::None);
+    return;
+  }
+  show_banner(r.outcome == LaunchRecovery::GaveUp ? Banner::NotResumed : Banner::None);
   if (r.outcome == LaunchRecovery::Failed)
-    MessageBoxW(hwnd_, (L"The crashed session couldn't be resumed.\n\n" + r.error).c_str(), kCantStart,
-                MB_OK | MB_ICONERROR);
-  if (auto_start_after(r.outcome, ctx_.settings.start_on_launch)) start_recording(false);
+    box(L"The crashed session couldn't be resumed.\n\n" + r.error, kCantStart, MB_OK | MB_ICONERROR);
 }
 
 void MainWindow::use_log(const std::wstring& name) { ctx_.log.set_file(log_file(name)); }
@@ -467,11 +493,20 @@ void MainWindow::use_log(const std::wstring& name) { ctx_.log.set_file(log_file(
 void MainWindow::show_banner(Banner mode) {
   if (mode == banner_mode_) return;
   banner_mode_ = mode;
-  const bool ack = mode == Banner::Recovered;  // waiting is a status, not a notice to acknowledge
+  // Waiting is a status; the others are notices to acknowledge.
+  const bool ack = mode != Banner::None && mode != Banner::Waiting;
   if (!ack && GetFocus() == banner_ack_) SetFocus(IsWindowEnabled(stop_) ? stop_ : record_);
-  if (mode != Banner::None)
-    SetWindowTextW(banner_, ack ? L"Recovered from a crash. Recording resumed."
-                                : L"Waiting for the input device to resume the crashed session.");
+  const wchar_t* text = L"";
+  switch (mode) {
+    case Banner::None: break;
+    case Banner::Waiting: text = L"Waiting for the input device to resume the crashed session."; break;
+    case Banner::Recovered: text = L"Recovered from a crash. Recording resumed."; break;
+    case Banner::NotResumed: text = L"The crashed session couldn't be resumed."; break;
+    case Banner::NotResumedNewRecording:
+      text = L"The crashed session couldn't be resumed. A new recording started.";
+      break;
+  }
+  SetWindowTextW(banner_, text);
   ShowWindow(banner_, mode != Banner::None ? SW_SHOWNA : SW_HIDE);
   ShowWindow(banner_ack_, ack ? SW_SHOWNA : SW_HIDE);
   layout();
@@ -482,7 +517,7 @@ void MainWindow::show_banner(Banner mode) {
 void MainWindow::confirm_stop() {
   if (!recording()) return;
   // No is the default button, so a stray Enter or Space keeps recording.
-  if (MessageBoxW(hwnd_, L"Stop recording?", kTitle, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
+  if (box(L"Stop recording?", kTitle, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
   HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
   ctx_.mgr.stop();
   SetCursor(old);
@@ -500,7 +535,7 @@ void MainWindow::split() {
 
 void MainWindow::settings() {
   if (recording()) {
-    MessageBoxW(hwnd_, L"Stop recording to change settings.", kTitle, MB_OK | MB_ICONINFORMATION);
+    box(L"Stop recording to change settings.", kTitle, MB_OK | MB_ICONINFORMATION);
     return;
   }
   SettingsChoices choices;
@@ -516,7 +551,10 @@ void MainWindow::settings() {
   }
   const std::wstring ini = settings_path();
   AppSettings edited = ctx_.settings;
-  if (!run_settings_dialog(hwnd_, inst_, choices, ini, edited)) return;
+  ++modal_;
+  const bool saved = run_settings_dialog(hwnd_, inst_, choices, ini, edited);
+  --modal_;
+  if (!saved) return;
 
   // Saved: take the settings as stored, and reopen the input if it changed.
   const CaptureConfig old_input = ctx_.settings.input;
@@ -524,6 +562,14 @@ void MainWindow::settings() {
   const CaptureConfig& in = ctx_.settings.input;
   const bool input_changed = in.device_id != old_input.device_id || in.mode != old_input.mode ||
                              (in.mode == CaptureMode::Exclusive && in.sample_rate != old_input.sample_rate);
+  if (recording()) {
+    // A session started while the dialog was open: never reopen its input under it. The
+    // saved settings apply from the next start.
+    reopen_input_ = reopen_input_ || (input_changed && ctx_.wasapi);
+    update_hotkey();
+    box(L"Stop recording to change settings.", kTitle, MB_OK | MB_ICONINFORMATION);
+    return;
+  }
   if (input_changed && ctx_.wasapi) {
     HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
     std::wstring err;
@@ -588,7 +634,8 @@ void MainWindow::tick() {
   meters_.set_levels(levels);
 
   const uint64_t now = GetTickCount64();
-  if (pending_ && now - pending_try_ >= kResumeRetryMs) try_resume();
+  // Not inside a modal loop (a message box or Settings): the resume would start under it.
+  if (pending_ && !modal_ && now - pending_try_ >= kResumeRetryMs) try_resume();
   if (now - last_slow_ms_ >= kSlowMs) refresh_slow();
 }
 

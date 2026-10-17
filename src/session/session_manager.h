@@ -32,6 +32,7 @@ struct SessionConfig {
   SessionParams params;  // start() sets session_id, start_wall, rate and input_channels (from the source)
   std::vector<DestinationConfig> dests;
   uint32_t ring_seconds = 30;
+  std::wstring input_device_id;  // kept in the crash state, so a resume uses the same device
 };
 
 enum class SessionState { Idle, Recording, InputLost };
