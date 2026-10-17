@@ -1,4 +1,6 @@
+#include <atomic>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "io/fault_file_system.h"
@@ -102,4 +104,81 @@ TEST(preflight_folder_healthy_probe) {
   fs.clear_rules();
   fs.add_rule({L"D:\\", Kind::FailOpen});
   CHECK(!folder_healthy(fs, L"D:\\new\\dir", 0));
+}
+
+
+namespace {
+// Records the files created through it; everything else goes to the FaultFileSystem.
+class RecordingFs : public IFileSystem {
+ public:
+  explicit RecordingFs(FaultFileSystem& fs) : fs_(fs) {}
+  std::unique_ptr<IFile> create_new(const std::wstring& p, std::wstring* err) override {
+    created.push_back(p);
+    return fs_.create_new(p, err);
+  }
+  std::unique_ptr<IFile> open_existing(const std::wstring& p, std::wstring* err) override {
+    return fs_.open_existing(p, err);
+  }
+  bool exists(const std::wstring& p) override { return fs_.exists(p); }
+  bool ensure_dir(const std::wstring& d, std::wstring* err) override { return fs_.ensure_dir(d, err); }
+  bool remove(const std::wstring& p) override { return fs_.remove(p); }
+  std::vector<std::wstring> list(const std::wstring& d, const std::wstring& s) override { return fs_.list(d, s); }
+  std::optional<uint64_t> free_bytes(const std::wstring& d) override { return fs_.free_bytes(d); }
+  std::wstring volume_id(const std::wstring& d) override { return fs_.volume_id(d); }
+
+  std::vector<std::wstring> created;  // single-threaded use only
+
+ private:
+  FaultFileSystem& fs_;
+};
+}  // namespace
+
+// R12: every probe has a name of its own, so destinations probing one folder at the same
+// time (or a probe left open by a hung writer) never make each other fail.
+TEST(preflight_probe_names_are_unique) {
+  FaultFileSystem fault;
+  RecordingFs fs(fault);
+  CHECK(folder_healthy(fs, L"D:\\shared", 0, L"main"));
+  CHECK(folder_healthy(fs, L"D:\\shared", 0, L"copy: 2"));
+  CHECK(folder_healthy(fs, L"D:\\shared", 0, L"main"));
+  CHECK_EQ(fs.created.size(), size_t(3));
+  if (fs.created.size() != 3) return;
+  CHECK(fs.created[0].rfind(L"D:\\shared\\.sl_probe_main_", 0) == 0);
+  CHECK(fs.created[1].rfind(L"D:\\shared\\.sl_probe_copy_ 2_", 0) == 0);  // sanitized
+  CHECK(fs.created[0] != fs.created[2]);
+  for (const auto& p : fs.created) CHECK(p.size() > 4 && p.compare(p.size() - 4, 4, L".tmp") == 0);
+
+  // A probe file still open elsewhere does not get in the way.
+  std::wstring err;
+  auto held = fault.create_new(fs.created[0], &err);
+  CHECK(held != nullptr);
+  CHECK(folder_healthy(fs, L"D:\\shared", 0, L"main"));
+
+  // Two destinations probing the same folder at once.
+  std::atomic<int> failures{0};
+  auto probe = [&](const wchar_t* who) {
+    for (int i = 0; i < 200; ++i)
+      if (!folder_healthy(fault, L"D:\\shared", 0, who)) ++failures;
+  };
+  std::thread a(probe, L"main"), b(probe, L"copy");
+  a.join();
+  b.join();
+  CHECK_EQ(failures.load(), 0);
+  held->close();
+  CHECK_EQ(fault.list(L"D:\\shared", L"").size(), size_t(1));  // only the file held above
+}
+
+// Preflight applies the writer's own rule: a destination whose folders are all below the
+// low-water mark starts in LastResort.
+TEST(preflight_below_low_water_is_last_resort) {
+  FaultFileSystem fs;
+  fs.set_free_bytes(L"D:\\", 100ull << 20);  // below the 1 GB default
+  const auto one = preflight({dest(L"main", {L"D:\\p"})}, SessionParams{}, fs);
+  CHECK(!one.can_start);
+  CHECK_EQ(one.errors.size(), size_t(1));
+  CHECK(any_mentions(one.warnings, L"low-water", L"D:\\p"));
+  const auto two = preflight({dest(L"main", {L"D:\\p"}), dest(L"copy", {L"E:\\c"})}, SessionParams{}, fs);
+  CHECK(two.can_start);
+  CHECK_EQ(two.errors.size(), size_t(1));
+  CHECK(any_mentions(two.errors, L"main"));
 }

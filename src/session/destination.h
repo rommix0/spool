@@ -78,8 +78,12 @@ class Destination {
   // worker is then abandoned).
   void stop(SampleIndex end);
   SampleIndex progress() const;
-  // The stall watchdog fired (see is_stalled): the worker is abandoned where it hangs and a
-  // new one continues from the last confirmed sample in the next healthy folder.
+  // The stall watchdog fired (see is_stalled): the worker is abandoned where it hangs, its
+  // folder is quarantined, and a new one continues from the last confirmed sample in the
+  // next healthy folder. The watchdog may call this whenever is_stalled() holds; it is a
+  // no-op unless the state is Writing or FailingOver (GapClosed and LastResort idle on
+  // purpose), and after a stall takeover it is ignored until progress() reaches the
+  // capture position recorded at the takeover (the new writer starts that far behind).
   void declare_stalled();
   void disable(std::wstring reason);  // state Disabled, nothing (more) written
   DestStatus status() const;

@@ -144,6 +144,7 @@ struct Carry {
   Mode mode = Mode::Writing;
   uint32_t n = 1, seg = 0;
   size_t folder = kNone;  // folder of the open (or last) file
+  std::wstring path;       // the open (or last) file
   SampleIndex session_start = 0, file_start = 0;
   SampleIndex next_boundary = kNoRotation;
   std::set<SampleIndex> splits;
@@ -216,6 +217,7 @@ struct Destination::Core {
   Carry carry;
   size_t busy_folder = kNone;     // folder of the writer's current file I/O
   std::set<size_t> quarantined;   // a writer hung there: never probed again this session
+  SampleIndex stall_grace_until = -1;  // declare_stalled() ignored until the cursor gets here
   int finalizers = 0;             // Retired items still being finished
   std::condition_variable fin_cv;
 
@@ -342,7 +344,7 @@ class Destination::Writer {
       const bool ok = enc_->write(out_.data(), r.frames);
       if (gone()) return;
       if (!ok) {
-        failover("write_error", L"Write failed: " + path_);
+        failover("write_error", L"Write failed: " + c_.path);
         continue;
       }
       cursor_ += SampleIndex(r.frames);
@@ -412,10 +414,13 @@ class Destination::Writer {
     l.str("reason", widen(reason));
     return l;
   }
+  // old_path: the file that failed over (empty if none was open). Crash repair caps its
+  // header at `confirmed`: everything after that is in the next file.
   JsonLine failover_line(SampleIndex at, const std::wstring& from, const std::wstring& to,
-                         std::string_view trigger) const {
+                         std::string_view trigger, const std::wstring& old_path) const {
     JsonLine l = line("failover", at);
     l.str("from", from).str("to", to).str("trigger", widen(trigger)).num("confirmed", at);
+    l.str("old_path", old_path);
     return l;
   }
   JsonLine session_start_line(SampleIndex at, const std::wstring& prev_manifest) const {
@@ -512,20 +517,21 @@ class Destination::Writer {
       return;
     }
     if (c_.mode == Mode::GapClosed) {
-      event(failover_line(cursor_, from, L"", "stall"));
+      event(failover_line(cursor_, from, L"", "stall", L""));  // the last file was closed normally
       commit([&](DestStatus&) { k_.set_state_locked(DestState::GapClosed); });
       return;
     }
     const SampleIndex at = cursor_;
+    const std::wstring old_path = c_.path;
     const LeadFn lead = [&](const std::wstring& to) {
-      return std::vector<JsonLine>{failover_line(at, from, to, "stall")};
+      return std::vector<JsonLine>{failover_line(at, from, to, "stall", old_path)};
     };
     if (open_at(at, c_.n, c_.seg + 1, stalled_, lead, kNone)) {
       log(Severity::Warning, L"Failed over from " + from + L" to " + folder_path(c_.folder) + L" (stall)");
       return;
     }
     if (gone()) return;
-    event(failover_line(at, from, L"", "stall"));
+    event(failover_line(at, from, L"", "stall", old_path));
     enter_last_resort(at);
   }
 
@@ -549,7 +555,7 @@ class Destination::Writer {
         k_.busy_folder = i;
         dir = k_.st.config.folders[i];
       }
-      const bool healthy = folder_healthy(k_.fs, dir, k_.low_water);
+      const bool healthy = folder_healthy(k_.fs, dir, k_.low_water, cfg_.name);
       if (gone()) return false;
       if (healthy && (man_folder_ == i || move_manifest(i, at, lead)) && open_file(i, at, n, seg)) return true;
       if (gone()) return false;
@@ -619,7 +625,7 @@ class Destination::Writer {
       return false;
     }
     enc_ = enc.release();
-    path_ = path;
+    c_.path = path;
     bytes_ = bytes;
     c_.mode = Mode::Writing;
     c_.file_start = at;
@@ -694,7 +700,7 @@ class Destination::Writer {
     delete enc_;
     enc_ = nullptr;
     event(line("file_close", end)
-              .str("path", path_)
+              .str("path", c_.path)
               .num("start", c_.file_start)
               .num("end", end)
               .num("bytes", int64_t(bytes_->load())));
@@ -702,7 +708,7 @@ class Destination::Writer {
       st.current_file.clear();
       if (ok) st.confirmed = end;
     });
-    if (!ok) log(Severity::Error, L"Could not finalize " + path_);
+    if (!ok) log(Severity::Error, L"Could not finalize " + c_.path);
     return end;
   }
 
@@ -711,7 +717,7 @@ class Destination::Writer {
     const bool ok = enc_->flush();
     if (gone()) return false;
     if (!ok) {
-      failover("flush_error", L"Flush failed: " + path_);
+      failover("flush_error", L"Flush failed: " + c_.path);
       return false;
     }
     const SampleIndex confirmed = c_.file_start + SampleIndex(enc_->confirmed_frames());
@@ -769,7 +775,8 @@ class Destination::Writer {
     enc_ = nullptr;
     old.man = std::move(man_);
     man_folder_ = kNone;
-    old.path = path_;
+    const std::wstring old_path = c_.path;
+    old.path = old_path;
     old.start = c_.file_start;
     old.bytes = bytes_;
     if (cfg_.format == OutFormat::Wav) old.truncate_to = uint64_t(confirmed - c_.file_start);
@@ -778,7 +785,7 @@ class Destination::Writer {
     publish_cursor();
 
     const LeadFn lead = [&](const std::wstring& to) {
-      return std::vector<JsonLine>{failover_line(confirmed, from_dir, to, trigger)};
+      return std::vector<JsonLine>{failover_line(confirmed, from_dir, to, trigger, old_path)};
     };
     const bool opened = open_at(confirmed, c_.n, c_.seg + 1, from, lead, kNone);
     if (gone()) {
@@ -786,13 +793,13 @@ class Destination::Writer {
       return;
     }
     const std::wstring to_dir = opened ? folder_path(c_.folder) : std::wstring();
-    old.after.push_back(failover_line(confirmed, from_dir, to_dir, trigger));
+    old.after.push_back(failover_line(confirmed, from_dir, to_dir, trigger, old_path));
     retire(std::move(old));
     if (opened) {
       log(Severity::Warning, L"Failed over from " + from_dir + L" to " + to_dir + L" (" + widen(trigger) + L")");
       return;
     }
-    event(failover_line(confirmed, from_dir, L"", trigger));
+    event(failover_line(confirmed, from_dir, L"", trigger, old_path));
     enter_last_resort(confirmed);
   }
 
@@ -859,7 +866,7 @@ class Destination::Writer {
     if (!open_at(at, c_.n + 1, 0, kNone, lead, kNone)) return;
     c_.gap_in_manifest = false;
     event(gap_line("gap_end", at, "last_resort"));
-    log(Severity::Info, L"Recording again after last resort: " + path_);
+    log(Severity::Info, L"Recording again after last resort: " + c_.path);
   }
 
   void follow_capture() {
@@ -1025,7 +1032,6 @@ class Destination::Writer {
   std::unique_ptr<Manifest> man_;
   size_t man_folder_ = kNone;
   IEncoderFile* enc_ = nullptr;  // the open file, if any
-  std::wstring path_;
   SizeTap bytes_;
 
   uint64_t last_flush_ms_ = 0, last_space_ms_ = 0, next_retry_ms_ = 0;
@@ -1138,7 +1144,16 @@ void Destination::declare_stalled() {
   {
     std::unique_lock<std::shared_mutex> lv(k.live);
     std::lock_guard<std::mutex> lk(k.m);
-    if (!writer_ || !thread_.joinable() || k.st.state == DestState::Stopped) return;
+    if (!writer_ || !thread_.joinable()) return;
+    // Only a writer that is writing (or failing over) can stall; GapClosed and LastResort
+    // idle on purpose and must not cost a healthy folder.
+    if (k.st.state != DestState::Writing && k.st.state != DestState::FailingOver) return;
+    // A generation that took over after a stall starts at least half a ring behind: it is
+    // given until it reaches the capture position recorded at the takeover.
+    if (k.stall_grace_until >= 0) {
+      if (k.cursor.load(std::memory_order_acquire) < k.stall_grace_until) return;
+      k.stall_grace_until = -1;
+    }
     const uint64_t gen = ++k.generation;  // from here on the stuck writer touches nothing shared
     const size_t stalled = k.busy_folder;
     if (stalled < k.st.folders.size()) {
@@ -1151,6 +1166,7 @@ void Destination::declare_stalled() {
       k.st.current_file.clear();
     }
     k.st.needs_ack = true;
+    k.stall_grace_until = k.ring.write_index();
     // The new generation continues from the last confirmed sample with the published carry.
     w = new Writer(core_, gen, k.st.confirmed, k.carry, stalled);
     writer_ = w;  // the old one is leaked: its thread may be stuck in the call that hung

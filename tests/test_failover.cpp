@@ -85,7 +85,7 @@ bool on_folder(const DestStatus& s, size_t i) {
 
 // The failover record that the new manifest carries as its second line.
 void check_failover_record(std::vector<ManifestRecord> recs, const std::string& prev, const std::string& trigger,
-                           SampleIndex confirmed) {
+                           SampleIndex confirmed, const std::wstring& old_path) {
   CHECK(recs.size() >= 2);
   if (recs.size() < 2) return;
   CHECK_EQ(recs[0]["ev"], std::string("session_start"));
@@ -95,6 +95,7 @@ void check_failover_record(std::vector<ManifestRecord> recs, const std::string& 
   CHECK_EQ(recs[1]["to"], narrow(kS));
   CHECK_EQ(recs[1]["trigger"], trigger);
   CHECK_EQ(num(recs[1], "confirmed"), int64_t(confirmed));
+  CHECK_EQ(recs[1]["old_path"], narrow(old_path));  // crash repair caps that file at confirmed
 }
 
 }  // namespace
@@ -125,11 +126,14 @@ TEST(failover_on_write_error_no_loss_no_dup) {
   CHECK_EQ(a.size() + b.size(), size_t(10 * kRate));
   CHECK_EQ(ramp_errors(a, 0) + ramp_errors(b, SampleIndex(a.size())), size_t(0));
 
-  check_failover_record(rig.only_manifest(kS), narrow(kPManifest), "write_error", 2 * kRate);
+  check_failover_record(rig.only_manifest(kS), narrow(kPManifest), "write_error", 2 * kRate, dp[0]);
   // Best effort, but this folder still accepts the small manifest write.
   auto old = events(rig.records(kPManifest), "failover");
   CHECK_EQ(old.size(), size_t(1));
-  if (old.size() == 1) CHECK_EQ(old[0]["to"], narrow(kS));
+  if (old.size() == 1) {
+    CHECK_EQ(old[0]["to"], narrow(kS));
+    CHECK_EQ(old[0]["old_path"], narrow(dp[0]));
+  }
 }
 
 TEST(failover_on_low_space) {
@@ -155,7 +159,7 @@ TEST(failover_on_low_space) {
   CHECK_EQ(a.size(), size_t(4 * kRate));  // flushed right before the check
   CHECK_EQ(a.size() + b.size(), size_t(8 * kRate));
   CHECK_EQ(ramp_errors(a, 0) + ramp_errors(b, SampleIndex(a.size())), size_t(0));
-  check_failover_record(rig.only_manifest(kS), narrow(kPManifest), "low_space", 4 * kRate);
+  check_failover_record(rig.only_manifest(kS), narrow(kPManifest), "low_space", 4 * kRate, dp[0]);
   auto old = rig.records(kPManifest);
   auto closes = events(old, "file_close");
   CHECK_EQ(closes.size(), size_t(1));
@@ -206,7 +210,7 @@ TEST(failover_on_stall_then_stop_returns_fast) {
   CHECK_EQ(a.size(), size_t(2 * kRate));
   CHECK_EQ(a.size() + b.size(), size_t(6 * kRate));
   CHECK_EQ(ramp_errors(a, 0) + ramp_errors(b, SampleIndex(a.size())), size_t(0));
-  check_failover_record(rig.only_manifest(kS), narrow(kPManifest), "stall", 2 * kRate);
+  check_failover_record(rig.only_manifest(kS), narrow(kPManifest), "stall", 2 * kRate, dp[0]);
   const auto c = rig.wavs(L"F:\\c");
   CHECK_EQ(c.size(), size_t(1));
   if (c.size() == 1) CHECK_EQ(wav_samples(rig.fs, c[0]).size(), size_t(6 * kRate));
@@ -233,7 +237,7 @@ TEST(failover_drive_vanishes) {
   CHECK_EQ(a.size(), size_t(2 * kRate));
   CHECK_EQ(a.size() + b.size(), size_t(6 * kRate));
   CHECK_EQ(ramp_errors(a, 0) + ramp_errors(b, SampleIndex(a.size())), size_t(0));
-  check_failover_record(rig.only_manifest(kS), narrow(kPManifest), "write_error", 2 * kRate);
+  check_failover_record(rig.only_manifest(kS), narrow(kPManifest), "write_error", 2 * kRate, dp[0]);
 }
 
 TEST(last_resort_then_append_folder) {
@@ -285,7 +289,10 @@ TEST(last_resort_then_append_folder) {
   }
   auto fo = events(recs, "failover");
   CHECK_EQ(fo.size(), size_t(1));
-  if (fo.size() == 1) CHECK_EQ(fo[0]["to"], std::string());
+  if (fo.size() == 1) {
+    CHECK_EQ(fo[0]["to"], std::string());
+    CHECK(fo[0]["old_path"].rfind("D:\\p\\", 0) == 0);
+  }
 }
 
 TEST(return_to_primary_at_rotation) {
@@ -495,7 +502,7 @@ TEST(failover_at_gap_close_keeps_samples) {
   CHECK_EQ(a.size(), size_t(2 * kRate));
   CHECK_EQ(b.size(), size_t(3 * kRate));
   CHECK_EQ(ramp_errors(a, 0) + ramp_errors(b, 2 * kRate), size_t(0));
-  check_failover_record(rig.only_manifest(kS), narrow(kPManifest), "flush_error", 2 * kRate);
+  check_failover_record(rig.only_manifest(kS), narrow(kPManifest), "flush_error", 2 * kRate, dp[0]);
 }
 
 TEST(failover_at_stop_keeps_samples) {
@@ -522,5 +529,89 @@ TEST(failover_at_stop_keeps_samples) {
   if (!recs.empty()) {
     CHECK_EQ(recs.back()["ev"], std::string("session_end"));
     CHECK_EQ(num(recs.back(), "sample"), int64_t(5 * kRate));
+  }
+}
+
+namespace {
+size_t stall_log_entries(EventLog& log) {
+  size_t n = 0;
+  for (const auto& e : log.recent(1000)) n += e.text.find(L"stalled") != std::wstring::npos;
+  return n;
+}
+}  // namespace
+
+// The watchdog keeps firing while the writer that took over catches up from half a ring
+// behind: only the first call fails over; the healthy folder is not quarantined.
+TEST(failover_stall_declared_twice_fails_over_once) {
+  FoRig rig;
+  Destination d(rig.cfg, rig.sp, rig.ring, rig.fs, rig.clock, rig.log);
+  d.start(0);
+  CHECK(rig.confirm_first_2s(d));
+  rig.fs.add_rule({L"D:\\", Kind::HangWrite});
+  rig.fs.add_rule({L"E:\\", Kind::SlowWrite, 0, 300});  // catching up takes a while
+  feed(rig.ring, 2 * kRate, size_t(kRate));
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  CHECK_EQ(d.progress(), SampleIndex(2 * kRate));
+  d.declare_stalled();
+  d.declare_stalled();  // at once: the new writer is still at the confirmed sample
+  CHECK(poll([&] { return on_folder(d.status(), 1); }));
+  d.declare_stalled();  // writing on E:, but not yet at the takeover's capture position
+  CHECK(d.progress() < 3 * kRate);
+  CHECK(wait_progress(d, 3 * kRate));
+  rig.fs.clear_rules();
+  CHECK(rig.pump(d, 3 * kRate, 5 * kRate));
+  CHECK(on_folder(d.status(), 1));
+  d.stop(5 * kRate);
+  rig.fs.release_hangs();
+
+  CHECK_EQ(stall_log_entries(rig.log), size_t(1));
+  const auto es = rig.wavs(kS);
+  CHECK_EQ(es.size(), size_t(1));
+  if (es.size() == 1) {
+    const auto b = wav_samples(rig.fs, es[0]);
+    CHECK_EQ(b.size(), size_t(3 * kRate));
+    CHECK_EQ(ramp_errors(b, 2 * kRate), size_t(0));
+  }
+  CHECK_EQ(events(rig.only_manifest(kS), "failover").size(), size_t(1));
+}
+
+// LastResort and GapClosed idle on purpose: a watchdog call there must not cost a folder.
+TEST(failover_stall_ignored_when_idle) {
+  {
+    FoRig rig;
+    Destination d(rig.cfg, rig.sp, rig.ring, rig.fs, rig.clock, rig.log);
+    d.start(0);
+    CHECK(rig.confirm_first_2s(d));
+    rig.fs.add_rule({L"D:\\", Kind::FailOpen});
+    rig.fs.add_rule({L"E:\\", Kind::FailOpen});
+    rig.fs.add_rule({L"D:\\", Kind::FailWrite});
+    feed(rig.ring, 2 * kRate, size_t(kRate));
+    CHECK(poll([&] { return d.status().state == DestState::LastResort; }));
+    d.declare_stalled();  // the last folder probed was E:
+    CHECK(d.status().state == DestState::LastResort);
+    rig.fs.clear_rules();
+    rig.fs.add_rule({L"D:\\", Kind::FailOpen});  // only E: comes back
+    rig.clock.advance_ms(30100);
+    CHECK(poll([&] { return on_folder(d.status(), 1); }));  // E: was not quarantined
+    d.stop(d.progress());
+    CHECK_EQ(stall_log_entries(rig.log), size_t(0));
+  }
+  {
+    FoRig rig;
+    rig.cfg.rotation_minutes = 0;
+    Destination d(rig.cfg, rig.sp, rig.ring, rig.fs, rig.clock, rig.log);
+    d.start(0);
+    d.post(CmdCloseForGap{2 * kRate});
+    feed(rig.ring, 0, size_t(2 * kRate));
+    CHECK(poll([&] { return d.status().state == DestState::GapClosed; }));
+    d.declare_stalled();
+    CHECK(d.status().state == DestState::GapClosed);
+    rig.ring.jump_to(4 * kRate);
+    d.post(CmdResumeAt{4 * kRate});
+    CHECK(poll([&] { return on_folder(d.status(), 0); }));  // D:\p, not quarantined
+    CHECK(rig.pump(d, 4 * kRate, 5 * kRate));
+    d.stop(5 * kRate);
+    CHECK_EQ(stall_log_entries(rig.log), size_t(0));
+    CHECK_EQ(rig.wavs(kP).size(), size_t(2));
   }
 }
