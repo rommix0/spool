@@ -1,5 +1,6 @@
 #include <atomic>
 #include <chrono>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -287,6 +288,54 @@ TEST(session_format_change_links_new_session) {
   CHECK(ended);
   CHECK(linked);
   CHECK_EQ(rig.fs.list(kP, L".wav").size(), size_t(2));
+}
+
+// The app keeps one event log per session: the hook runs with each new session's id
+// before that session logs anything (start, and a linked session on the manager thread).
+TEST(session_new_session_hook_switches_log) {
+  SessRig rig;
+  std::mutex m;
+  std::vector<std::wstring> ids;
+  rig.mgr.on_new_session([&](const std::wstring& id) {
+    {
+      std::lock_guard<std::mutex> lk(m);
+      ids.push_back(id);
+    }
+    rig.log.set_file(L"C:\\logs\\" + id + L".log");
+  });
+  CHECK(rig.start());
+  CHECK(rig.pump(2));
+  rig.src.simulate_loss();
+  CHECK(rig.wait_state(SessionState::InputLost));
+  CHECK(rig.advance_lost(1, 2 * kRate, 3 * kRate));
+  rig.src.simulate_return({16000, 1});
+  CHECK(poll([&] {
+    const SessionStats s = rig.mgr.stats();
+    return s.state == SessionState::Recording && s.fmt.sample_rate == 16000;
+  }));
+  CHECK(rig.pump(1));
+  rig.mgr.stop();
+  {
+    std::lock_guard<std::mutex> lk(m);
+    CHECK_EQ(ids.size(), size_t(2));
+    if (ids.size() == 2) {
+      CHECK(ids[0] == L"20261016-143000");
+      CHECK(ids[1] == L"20261016-143003");
+    }
+  }
+  const auto text = [&](const std::wstring& p) {
+    const auto v = rig.fs.contents(p);
+    return std::string(v.begin(), v.end());
+  };
+  const std::string first = text(L"C:\\logs\\20261016-143000.log");
+  const std::string second = text(L"C:\\logs\\20261016-143003.log");
+  CHECK(first.find("Session 20261016-143000 started") != std::string::npos);
+  CHECK(first.find("Input lost") != std::string::npos);
+  CHECK(first.find("ending session 20261016-143000") != std::string::npos);
+  CHECK(second.find("Session 20261016-143003 started") != std::string::npos);
+  CHECK(second.find("linked to 20261016-143000") != std::string::npos);
+  CHECK(second.find("Session 20261016-143003 stopped") != std::string::npos);
+  CHECK(text(L"C:\\logs\\s.log").empty());  // nothing went to the log in use before start
 }
 
 TEST(session_watchdog_fails_over_stalled) {

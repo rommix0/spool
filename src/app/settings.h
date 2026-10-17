@@ -32,6 +32,14 @@ inline constexpr U32Range kStallPercentRange{1, 100};
 std::wstring settings_path();
 // Creates %APPDATA%\SoundLogger if missing.
 bool ensure_settings_dir();
+// %APPDATA%\SoundLogger\state.ini: the crash state (StateStore). A file of its own, since
+// StateStore writes it as UTF-16 with a BOM. Creates nothing.
+std::wstring state_path();
+// %LOCALAPPDATA%\SoundLogger\logs ("" if LOCALAPPDATA is not set). Creates nothing.
+std::wstring logs_dir();
+// <logs_dir>\<name>.log, "" without a logs dir. The app's event log is app.log outside a
+// session and <session_id>.log while one runs (a resumed session appends to its own).
+std::wstring log_file(const std::wstring& name);
 
 // One WAV destination "main", 16-bit, all channels, %USERPROFILE%\Music\SoundLogger, 30 min.
 AppSettings default_settings();

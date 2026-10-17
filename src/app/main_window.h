@@ -3,6 +3,9 @@
 // Marker, Split file, Settings), levels, destinations and the event list. A 33 ms timer
 // updates the meters; stats, destinations and events refresh at 4 Hz. Nothing a single
 // stray click or key does stops a recording: Stop has no shortcut and always asks.
+// At launch it resumes a crashed session (amber banner until acknowledged) or, with
+// start_on_launch, starts recording. While recording the system is kept from sleeping.
+// Event log files: app.log outside sessions, <session_id>.log while one runs.
 #include <windows.h>
 
 #include <cstdint>
@@ -12,7 +15,9 @@
 #include "app/dest_panel.h"
 #include "app/meter_control.h"
 #include "app/settings.h"
+#include "io/file_system.h"
 #include "session/event_log.h"
+#include "session/recovery.h"
 #include "session/session_manager.h"
 
 namespace sl {
@@ -26,10 +31,14 @@ struct AppContext {
   ICaptureSource& source;
   WasapiSource* wasapi;      // the same object as source, or null with --synthetic
   std::wstring source_name;  // shown in the input line for a non-WASAPI source
+  IFileSystem& fs;
+  StateStore& store;         // the crash state; the manager uses the same store
 };
 
 class MainWindow {
  public:
+  static constexpr wchar_t kClassName[] = L"SLMainWindow";  // a second instance finds the window by it
+
   explicit MainWindow(AppContext);
   ~MainWindow();
   MainWindow(const MainWindow&) = delete;
@@ -53,6 +62,16 @@ class MainWindow {
   void on_command(int id);
   LRESULT on_notify(NMHDR*);
   void on_close();
+  void on_launch();  // posted by create(): crash recovery, else start_on_launch
+  void resume(const RecordingState&);
+
+  // Record (ask = true: preflight problems ask "Start anyway?") and auto-start (ask =
+  // false: they are logged and recording starts). Blocking problems show a message.
+  bool start_recording(bool ask);
+  bool input_ready(std::wstring* err);  // reopens the input if it failed to open earlier
+  void before_start();                  // raises the working set for the ring
+  void use_log(const std::wstring& name);  // log_file(name)
+  void show_banner(bool on);
 
   void record();
   void confirm_stop();
@@ -83,6 +102,10 @@ class MainWindow {
   HWND hwnd_ = nullptr;
   HACCEL accel_ = nullptr;
   bool hotkey_ = false;
+  bool awake_ = false;   // SetThreadExecutionState keeps the system awake (while recording)
+  bool banner_on_ = false;
+  RECT banner_rect_{};   // the amber banner row (painted by WM_PAINT)
+  HBRUSH amber_ = nullptr;  // owned
   bool show_config_ = false;  // idle panel shows the configured destinations (settings changed)
   HWND focus_ = nullptr;      // the focused child when the window was last deactivated
 
@@ -90,6 +113,7 @@ class MainWindow {
   HWND marker_ = nullptr, split_ = nullptr, settings_ = nullptr;
   HWND levels_label_ = nullptr, buffer_ = nullptr, dests_label_ = nullptr, ack_ = nullptr;
   HWND events_label_ = nullptr, events_ = nullptr;
+  HWND banner_ = nullptr, banner_ack_ = nullptr;
   MeterControl meters_;
   DestPanel dests_;
 

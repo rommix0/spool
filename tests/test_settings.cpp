@@ -1,6 +1,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -214,6 +215,29 @@ TEST(settings_numeric_ranges_shared) {
   r = load_settings(ini);
   CHECK_EQ(r.ring_seconds, AppSettings{}.ring_seconds);
   CHECK_EQ(r.stall_percent, AppSettings{}.stall_percent);
+}
+
+// The crash state has its own file beside settings.ini; logs are per name under LOCALAPPDATA.
+TEST(settings_app_paths) {
+  const auto get = [](const wchar_t* name) {
+    wchar_t buf[32768];
+    const DWORD n = GetEnvironmentVariableW(name, buf, 32768);
+    return n ? std::optional<std::wstring>(std::wstring(buf, n)) : std::nullopt;
+  };
+  const auto put = [](const wchar_t* name, const std::optional<std::wstring>& v) {
+    SetEnvironmentVariableW(name, v ? v->c_str() : nullptr);
+  };
+  const auto app = get(L"APPDATA"), local = get(L"LOCALAPPDATA");
+  put(L"APPDATA", L"C:\\R");
+  put(L"LOCALAPPDATA", L"C:\\L");
+  CHECK(settings_path() == L"C:\\R\\SoundLogger\\settings.ini");
+  CHECK(state_path() == L"C:\\R\\SoundLogger\\state.ini");
+  CHECK(logs_dir() == L"C:\\L\\SoundLogger\\logs");
+  CHECK(log_file(L"20261016-143000") == L"C:\\L\\SoundLogger\\logs\\20261016-143000.log");
+  put(L"LOCALAPPDATA", std::nullopt);
+  CHECK(log_file(L"app").empty());  // memory-only log
+  put(L"APPDATA", app);
+  put(L"LOCALAPPDATA", local);
 }
 
 TEST(settings_validate_ok_and_empty) {

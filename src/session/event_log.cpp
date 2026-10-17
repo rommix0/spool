@@ -7,10 +7,26 @@
 
 namespace sl {
 
-EventLog::EventLog(IFileSystem& fs, std::wstring path) {
+namespace {
+std::unique_ptr<IFile> open_log(IFileSystem& fs, const std::wstring& path) {
+  if (path.empty()) return nullptr;
   std::wstring err;
-  file_ = fs.create_new(path, &err);
-  if (!file_) file_ = fs.open_existing(path, &err);  // keep appending to an earlier log
+  auto f = fs.create_new(path, &err);
+  if (!f) f = fs.open_existing(path, &err);  // keep appending to an earlier log
+  return f;
+}
+}  // namespace
+
+EventLog::EventLog(IFileSystem& fs, std::wstring path) : fs_(fs), path_(std::move(path)) {
+  file_ = open_log(fs_, path_);
+}
+
+void EventLog::set_file(std::wstring path) {
+  std::lock_guard<std::mutex> io(io_m_);
+  if (file_ && path == path_) return;
+  file_.reset();  // closed before a reopen of the same file
+  path_ = std::move(path);
+  file_ = open_log(fs_, path_);
 }
 
 void EventLog::add(Severity sev, WallTime wall, std::wstring dest, std::wstring text) {

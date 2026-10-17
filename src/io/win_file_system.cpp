@@ -261,8 +261,8 @@ class WinFileSystem : public IFileSystem {
 }  // namespace
 
 IFileSystem& real_fs() {
-  static WinFileSystem fs;
-  return fs;
+  static WinFileSystem* const fs = new WinFileSystem;  // never destroyed: see file_system.h
+  return *fs;
 }
 
 }  // namespace sl

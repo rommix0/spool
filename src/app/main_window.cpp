@@ -3,8 +3,10 @@
 #include <commctrl.h>
 
 #include <algorithm>
+#include <optional>
 
 #include "app/format_text.h"
+#include "app/lifecycle.h"
 #include "app/resource.h"
 #include "app/settings_dialog.h"
 #include "app/text_util.h"
@@ -15,9 +17,12 @@ namespace sl {
 
 namespace {
 
-constexpr wchar_t kClass[] = L"SLMainWindow";
 constexpr wchar_t kTitle[] = L"Sound logger";
 constexpr wchar_t kCantStart[] = L"Can't start recording";
+constexpr wchar_t kAppLog[] = L"app";  // app.log: events outside a session
+constexpr UINT kLaunchMsg = WM_APP + 1;
+constexpr COLORREF kBannerBack = RGB(255, 233, 168);  // the destination panel's amber
+constexpr COLORREF kBannerText = RGB(28, 28, 28);
 constexpr UINT_PTR kTimerId = 1;
 constexpr UINT kTimerMs = 33;
 constexpr uint64_t kSlowMs = 250;  // stats, destinations and events at 4 Hz
@@ -70,6 +75,7 @@ MainWindow::~MainWindow() {
   if (hwnd_) DestroyWindow(hwnd_);
   for (HFONT f : {font_, bold_, clock_font_})
     if (f) DeleteObject(f);
+  if (amber_) DeleteObject(amber_);
 }
 
 bool MainWindow::create(HINSTANCE inst, int show) {
@@ -81,15 +87,16 @@ bool MainWindow::create(HINSTANCE inst, int show) {
   wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
   wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
   wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
-  wc.lpszClassName = kClass;
+  wc.lpszClassName = kClassName;
   if (!RegisterClassExW(&wc)) return false;
   accel_ = LoadAcceleratorsW(inst, MAKEINTRESOURCEW(IDR_ACCEL));
-  if (!CreateWindowExW(0, kClass, kTitle, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
+  if (!CreateWindowExW(0, kClassName, kTitle, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                        CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr, inst, this))
     return false;
   SetWindowPos(hwnd_, nullptr, 0, 0, px(940), px(760), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
   ShowWindow(hwnd_, show);
   UpdateWindow(hwnd_);
+  PostMessageW(hwnd_, kLaunchMsg, 0, 0);  // recovery runs once the window is up
   return true;
 }
 
@@ -133,9 +140,21 @@ LRESULT MainWindow::handle(UINT msg, WPARAM wp, LPARAM lp) {
       layout();
       return 0;
     }
+    case WM_PAINT: {
+      PAINTSTRUCT ps;
+      HDC dc = BeginPaint(hwnd_, &ps);
+      if (banner_on_) FillRect(dc, &banner_rect_, amber_);
+      EndPaint(hwnd_, &ps);
+      return 0;
+    }
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLORBTN: {
       HDC dc = reinterpret_cast<HDC>(wp);
+      if (reinterpret_cast<HWND>(lp) == banner_ || reinterpret_cast<HWND>(lp) == banner_ack_) {
+        SetBkColor(dc, kBannerBack);
+        SetTextColor(dc, kBannerText);
+        return reinterpret_cast<LRESULT>(amber_);
+      }
       SetBkColor(dc, GetSysColor(COLOR_WINDOW));
       SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
       return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
@@ -170,6 +189,9 @@ LRESULT MainWindow::handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ENDSESSION:
       if (wp) ctx_.mgr.stop();  // Windows is ending the session: finalize the files
       return 0;
+    case kLaunchMsg:
+      on_launch();
+      return 0;
     case WM_DESTROY:
       KillTimer(hwnd_, kTimerId);
       if (hotkey_) UnregisterHotKey(hwnd_, kHotkeyId);
@@ -202,6 +224,11 @@ void MainWindow::on_create() {
   dests_label_ = child(hwnd_, inst_, WC_STATICW, L"Destinations", kLabel, IDC_DESTS_LABEL);
   ack_ = child(hwnd_, inst_, WC_BUTTONW, L"Acknowledge", kButton, IDC_ACK);
   ShowWindow(ack_, SW_HIDE);
+  amber_ = CreateSolidBrush(kBannerBack);
+  banner_ = child(hwnd_, inst_, WC_STATICW, L"Recovered from a crash. Recording resumed.", kLabel, IDC_BANNER);
+  banner_ack_ = child(hwnd_, inst_, WC_BUTTONW, L"Acknowledge", kButton, IDC_BANNER_ACK);
+  ShowWindow(banner_, SW_HIDE);
+  ShowWindow(banner_ack_, SW_HIDE);
   dests_.create(hwnd_, IDC_DESTS, inst_);
   events_label_ = child(hwnd_, inst_, WC_STATICW, L"Events", kLabel, IDC_EVENTS_LABEL);
   events_ = CreateWindowExW(0, WC_LISTVIEWW, L"",
@@ -252,6 +279,7 @@ void MainWindow::on_command(int id) {
     case IDC_ACK:
       if (recording()) ctx_.mgr.acknowledge();
       break;
+    case IDC_BANNER_ACK: show_banner(false); break;
   }
 }
 
@@ -296,6 +324,7 @@ void MainWindow::on_close() {
     HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
     ctx_.mgr.stop();
     SetCursor(old);
+    use_log(kAppLog);
   }
   DestroyWindow(hwnd_);
 }
@@ -320,43 +349,99 @@ SessionConfig MainWindow::session_config() const {
   return cfg;
 }
 
-void MainWindow::record() {
-  if (recording()) return;
+void MainWindow::record() { start_recording(true); }
+
+bool MainWindow::input_ready(std::wstring* err) {
+  if (ctx_.source.format().sample_rate) return true;
+  if (!ctx_.source.open(ctx_.settings.input, err)) return false;  // failed at launch: try again
+  update_device_name();
+  return true;
+}
+
+void MainWindow::before_start() {
+  // Lets the session VirtualLock its ring; if Windows refuses, the session logs the warning.
+  const StreamFormat f = ctx_.source.format();
+  raise_working_set(working_set_for_ring(ctx_.settings.ring_seconds, f.sample_rate, f.channels));
+}
+
+bool MainWindow::start_recording(bool ask) {
+  if (recording()) return false;
+  const auto block = [this](const std::wstring& text) {
+    MessageBoxW(hwnd_, text.c_str(), kCantStart, MB_OK | MB_ICONERROR);
+    return false;
+  };
   std::wstring err;
-  if (!ctx_.source.format().sample_rate) {  // the input failed to open at launch: try again
-    if (!ctx_.source.open(ctx_.settings.input, &err)) {
-      MessageBoxW(hwnd_, err.c_str(), kCantStart, MB_OK | MB_ICONERROR);
-      return;
-    }
-    update_device_name();
-  }
+  if (!input_ready(&err)) return block(err);
   const std::vector<std::wstring> problems = validate(ctx_.settings, ctx_.source.format().channels);
-  if (!problems.empty()) {
-    MessageBoxW(hwnd_, join_lines(problems).c_str(), kCantStart, MB_OK | MB_ICONERROR);
-    return;
-  }
+  if (!problems.empty()) return block(join_lines(problems));
   const SessionConfig cfg = session_config();
   HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
   const PreflightResult pf = ctx_.mgr.preflight(cfg);
   SetCursor(old);
-  if (!pf.can_start) {
-    MessageBoxW(hwnd_, join_lines(pf.errors).c_str(), kCantStart, MB_OK | MB_ICONERROR);
-    return;
-  }
+  if (!pf.can_start) return block(join_lines(pf.errors));
   // Destinations that will start in LastResort are not a block while another one works.
   std::vector<std::wstring> lines = pf.errors;
   lines.insert(lines.end(), pf.warnings.begin(), pf.warnings.end());
-  if (!lines.empty() && MessageBoxW(hwnd_, (join_lines(lines) + L"\n\nStart anyway?").c_str(), kTitle,
-                                    MB_YESNO | MB_ICONWARNING) != IDYES)
-    return;
+  if (ask && !lines.empty() &&
+      MessageBoxW(hwnd_, (join_lines(lines) + L"\n\nStart anyway?").c_str(), kTitle, MB_YESNO | MB_ICONWARNING) !=
+          IDYES)
+    return false;
+  before_start();
   if (!ctx_.mgr.start(cfg, nullptr, &err)) {
-    MessageBoxW(hwnd_, err.c_str(), kCantStart, MB_OK | MB_ICONERROR);
-    return;
+    use_log(kAppLog);
+    return block(err);
   }
+  if (!ask)  // auto-start: into the session's log
+    for (const std::wstring& l : lines) warn(l);
   if (ctx_.wasapi && !ctx_.wasapi->raw_active())
     warn(L"Windows audio processing couldn't be turned off for this device.");
   show_config_ = false;
   refresh_slow();
+  return true;
+}
+
+void MainWindow::on_launch() {
+  // Recovery runs on every launch, whether or not Windows passed --recover.
+  const std::optional<RecordingState> st = ctx_.store.load();
+  if (st && st->recording)
+    resume(*st);
+  else if (ctx_.settings.start_on_launch)
+    start_recording(false);
+}
+
+void MainWindow::resume(const RecordingState& st) {
+  use_log(st.session_id);  // the repair lines belong with the crashed session's events
+  std::wstring err;
+  if (!input_ready(&err))  // the resume then fails and says so
+    ctx_.log.add(Severity::Error, system_clock().now(), L"", L"Can't open the input device: " + err);
+  before_start();
+  HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+  const LaunchRecoveryResult r =
+      recover_crashed_session(st, session_config(), ctx_.mgr, ctx_.store, ctx_.fs, system_clock(), ctx_.log);
+  SetCursor(old);
+  if (r.outcome == LaunchRecovery::Resumed) {
+    show_config_ = false;
+    show_banner(true);
+    refresh_slow();
+    return;
+  }
+  use_log(kAppLog);
+  if (r.outcome == LaunchRecovery::Failed)
+    MessageBoxW(hwnd_, (L"The crashed session couldn't be resumed.\n\n" + r.error).c_str(), kCantStart,
+                MB_OK | MB_ICONERROR);
+}
+
+void MainWindow::use_log(const std::wstring& name) { ctx_.log.set_file(log_file(name)); }
+
+void MainWindow::show_banner(bool on) {
+  if (on == banner_on_) return;
+  banner_on_ = on;
+  if (!on && GetFocus() == banner_ack_) SetFocus(IsWindowEnabled(stop_) ? stop_ : record_);
+  ShowWindow(banner_, on ? SW_SHOWNA : SW_HIDE);
+  ShowWindow(banner_ack_, on ? SW_SHOWNA : SW_HIDE);
+  layout();
+  // Everything below the banner moved: repaint all of it (copied bits can be stale).
+  RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
 
 void MainWindow::confirm_stop() {
@@ -366,6 +451,7 @@ void MainWindow::confirm_stop() {
   HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
   ctx_.mgr.stop();
   SetCursor(old);
+  use_log(kAppLog);
   refresh_slow();
 }
 
@@ -474,6 +560,10 @@ void MainWindow::refresh_slow() {
   last_slow_ms_ = GetTickCount64();
   const SessionStats st = ctx_.mgr.stats();
   const bool rec = st.state != SessionState::Idle;
+  if (rec != awake_) {  // §5.2: no system sleep while recording (display sleep is fine)
+    awake_ = rec;
+    SetThreadExecutionState(rec ? ES_CONTINUOUS | ES_SYSTEM_REQUIRED : ES_CONTINUOUS);
+  }
   // stats().fmt stays the last session's format after it stops; idle, the source's is current.
   const StreamFormat fmt = rec && st.fmt.sample_rate ? st.fmt : ctx_.source.format();
 
@@ -566,7 +656,7 @@ void MainWindow::make_fonts() {
 
 void MainWindow::apply_fonts() {
   for (HWND h : {record_, stop_, device_, marker_, split_, settings_, meters_.hwnd(), buffer_, ack_,
-                 dests_.hwnd(), events_})
+                 dests_.hwnd(), events_, banner_, banner_ack_})
     SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
   for (HWND h : {levels_label_, dests_label_, events_label_})
     SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(bold_), TRUE);
@@ -600,6 +690,20 @@ void MainWindow::layout() {
   place(marker_, r, by, px(104), bh);
   place(device_, x, m + (bar - line) / 2, r - px(12) - x, line);
   int y = m + bar + px(12);
+
+  // The crash-recovery banner, until acknowledged.
+  if (banner_on_) {
+    const int bnh = bh + px(12);
+    const RECT old = banner_rect_;
+    banner_rect_ = RECT{m, y, c.right - m, y + bnh};
+    if (!EqualRect(&old, &banner_rect_)) {
+      InvalidateRect(hwnd_, &old, TRUE);
+      InvalidateRect(hwnd_, &banner_rect_, TRUE);
+    }
+    place(banner_ack_, c.right - m - px(6) - px(116), y + px(6), px(116), bh);
+    place(banner_, m + px(12), y + (bnh - line) / 2, width - px(12) - px(116) - px(18), line);
+    y += bnh + px(12);
+  }
 
   // Levels.
   place(levels_label_, m, y, width, line);

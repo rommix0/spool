@@ -116,6 +116,18 @@ bool ensure_dir(const std::wstring& dir) {
 
 std::wstring settings_path() { return env(L"APPDATA") + L"\\SoundLogger\\settings.ini"; }
 
+std::wstring state_path() { return env(L"APPDATA") + L"\\SoundLogger\\state.ini"; }
+
+std::wstring logs_dir() {
+  const std::wstring local = env(L"LOCALAPPDATA");
+  return local.empty() ? std::wstring() : local + L"\\SoundLogger\\logs";
+}
+
+std::wstring log_file(const std::wstring& name) {
+  const std::wstring dir = logs_dir();
+  return dir.empty() ? std::wstring() : dir + L"\\" + name + L".log";
+}
+
 bool ensure_settings_dir() {
   const std::wstring appdata = env(L"APPDATA");
   return !appdata.empty() && ensure_dir(appdata + L"\\SoundLogger");

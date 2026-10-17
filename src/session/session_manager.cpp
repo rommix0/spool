@@ -78,6 +78,8 @@ PreflightResult SessionManager::preflight(const SessionConfig& cfg) {
 
 void SessionManager::set_state_store(StateStore* store) { store_ = store; }
 
+void SessionManager::on_new_session(std::function<void(const std::wstring&)> f) { on_new_session_ = std::move(f); }
+
 bool SessionManager::start(const SessionConfig& cfg, const ResumeInfo* resume, std::wstring* err) {
   std::wstring e;
   if (!err) err = &e;
@@ -122,6 +124,7 @@ bool SessionManager::start(const SessionConfig& cfg, const ResumeInfo* resume, s
     p.session_id = next_session_id(now);
     p.start_wall = now;
   }
+  if (on_new_session_) on_new_session_(p.session_id);
   auto s = make_session(p, fmt, ring_start, std::move(seeds), err);
   if (!s) return false;
 
@@ -475,6 +478,7 @@ void SessionManager::link_new_session(StreamFormat fmt, uint64_t steady_ms, Wall
   p.input_channels = fmt.channels;
   p.start_sample = 0;
   p.start_wall = wall;
+  if (on_new_session_) on_new_session_(p.session_id);
   std::wstring err;
   const auto s = fmt.sample_rate && fmt.channels ? make_session(p, fmt, p.start_sample, {}, &err) : nullptr;
   if (!s) {

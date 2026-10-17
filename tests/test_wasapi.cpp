@@ -14,13 +14,14 @@ namespace {
 
 struct Counter : sl::CaptureCallbacks {
   std::atomic<uint64_t> frames{0};
-  std::atomic<int> lost{0}, returned{0};
+  std::atomic<int> lost{0}, returned{0}, disc{0};
   std::atomic<bool> bad{false};
   uint32_t channels = 0;
-  void on_frames(const float* p, size_t n, bool) override {
+  void on_frames(const float* p, size_t n, bool discontinuity) override {
     for (size_t i = 0; i < n * channels; ++i)
       if (!std::isfinite(p[i])) bad = true;
     frames += n;
+    if (discontinuity) ++disc;
   }
   void on_device_lost() override { ++lost; }
   void on_device_returned(sl::StreamFormat) override { ++returned; }
@@ -66,6 +67,8 @@ void check_capture(WasapiSource& src, int ms) {
   CHECK(!cb.bad.load());
   CHECK_EQ(cb.lost.load(), 0);
   CHECK_EQ(cb.returned.load(), 0);
+  // WASAPI flags the first packet after every start as a discontinuity: not reported.
+  CHECK_EQ(cb.disc.load(), 0);
 
   // No frames after stop(), and the source can be started again.
   const uint64_t after_stop = cb.frames.load();
@@ -75,6 +78,7 @@ void check_capture(WasapiSource& src, int ms) {
   sleep_ms(100);
   src.stop();
   CHECK(cb.frames.load() > after_stop);
+  CHECK_EQ(cb.disc.load(), 0);
   CHECK(src.format() == f);
 }
 

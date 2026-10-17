@@ -27,6 +27,8 @@
 #define IDC_DESTS 313
 #define IDC_EVENTS_LABEL 314
 #define IDC_EVENTS 315
+#define IDC_BANNER 316
+#define IDC_BANNER_ACK 317
 
 // Dialogs.
 #define IDD_SETTINGS 401

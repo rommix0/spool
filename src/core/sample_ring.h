@@ -21,6 +21,9 @@ class SampleRing {
   SampleRing(const SampleRing&) = delete;
   SampleRing& operator=(const SampleRing&) = delete;
 
+  // The capacity a ring asked for min_frames gets.
+  static size_t capacity_for(size_t min_frames);
+
   uint32_t channels() const { return channels_; }
   size_t capacity() const { return capacity_; }
   // False if VirtualLock failed (the working-set quota): pages may then be trimmed, and

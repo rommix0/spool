@@ -118,8 +118,9 @@ TEST(ring_start_index) {
 TEST(ring_reports_lock) {
   SampleRing small(1, 1024);
   CHECK(small.locked());
+  // 64 MiB: locked only if the process working set was raised (the app does; a test may
+  // have). The ring works either way.
   SampleRing big(1, size_t(1) << 24);
-  CHECK(!big.locked());
   write_ramp(big, 0, 4);
   std::vector<float> buf(4);
   CHECK_EQ(big.read(0, buf.data(), 4).frames, size_t(4));

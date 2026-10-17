@@ -25,6 +25,10 @@ class EventLog {
   // reuses its session id and so its log). If neither works the log keeps working in
   // memory only.
   EventLog(IFileSystem&, std::wstring path);
+  // Thread-safe. Later lines go to `path` (created, or appended to), or stay in memory
+  // only if it cannot be opened; the in-memory list is kept. Nothing happens if `path` is
+  // the file already in use. The app switches between app.log and per-session logs.
+  void set_file(std::wstring path);
   // Thread-safe. Appends "2026-10-16 14:30:00  WARN  [main] text\r\n" (local time;
   // "[dest] " omitted when dest is empty) and flushes. CR/LF in dest/text become spaces
   // in the file line only.
@@ -34,7 +38,9 @@ class EventLog {
  private:
   static constexpr size_t kMaxEntries = 1000;
 
-  std::mutex io_m_;               // serializes file writes; recent() never takes it
+  IFileSystem& fs_;
+  std::mutex io_m_;               // serializes file writes and set_file; recent() never takes it
+  std::wstring path_;             // of file_
   std::unique_ptr<IFile> file_;   // null: memory only
   mutable std::mutex m_;          // guards entries_ only
   std::deque<LogEntry> entries_;  // oldest first

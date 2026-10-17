@@ -6,6 +6,7 @@
 #include <thread>
 #include <vector>
 
+#include "app/lifecycle.h"
 #include "audio/synthetic_source.h"
 #include "core/clock.h"
 #include "format/wav_writer.h"
@@ -631,4 +632,106 @@ TEST(recovery_crash_right_after_failover_of_rotated_file) {
   CHECK_EQ(SampleIndex(v2.size()), confirmed - f2);
   CHECK_EQ(SampleIndex(v1.size() + v2.size() + vb.size()), end);
   CHECK_EQ(ramp_errors(v1, 0) + ramp_errors(v2, f2) + ramp_errors(vb, confirmed), size_t(0));
+}
+
+// ---- Task 18: what the app runs at launch when the crash state says recording=1 ----
+
+namespace {
+bool logged(const EventLog& log, Severity sev, const std::wstring& part) {
+  for (const LogEntry& e : log.recent(1000))
+    if (e.sev == sev && e.text.find(part) != std::wstring::npos) return true;
+  return false;
+}
+}  // namespace
+
+TEST(launch_recovery_resumes_and_logs_repairs) {
+  RecRig rig;
+  CHECK(rig.start());
+  const std::wstring id = rig.mgr.stats().session_id;
+  CHECK(rig.pump(10.5));
+  CHECK(rig.state_has_manifest());
+  rig.mgr.abandon_for_test();
+  const auto st = rig.store.load();
+  const auto wavs = rig.fs.list(kP, L".wav");
+  CHECK(st && st->recording);
+  CHECK_EQ(wavs.size(), size_t(1));
+  if (!st || wavs.size() != 1) return;
+  // The wall clock went back across the crash: the resume starts where the repaired audio
+  // ends (RepairReport::audio_end), not at the older last_sample.
+  CHECK(st->last_sample < SampleIndex(10.5 * kRate));
+  rig.clock.set(WallTime{st->last_utc_ms - 60000, r_wall().local_offset_min});
+
+  const LaunchRecoveryResult r =
+      recover_crashed_session(*st, rig.cfg, rig.mgr, rig.store, rig.fs, rig.clock, rig.log);
+  CHECK(r.outcome == LaunchRecovery::Resumed);
+  CHECK(r.error.empty());
+  const SessionStats s = rig.mgr.stats();
+  CHECK(s.state == SessionState::Recording);
+  CHECK(s.recovered_from_crash);
+  CHECK(s.session_id == id);
+  CHECK_EQ(s.position, SampleIndex(10.5 * kRate));
+  CHECK(logged(rig.log, Severity::Info, L"Repaired after the crash: " + wavs[0]));
+  CHECK(rig.pump(1));
+  rig.mgr.stop();
+
+  const auto recs = rig.only_manifest(kP);
+  CHECK_EQ(events(recs, "gap_start").size(), size_t(1));
+  CHECK_EQ(events(recs, "gap_end").size(), size_t(1));
+  const auto opens = events(recs, "file_open");
+  CHECK_EQ(opens.size(), size_t(2));
+  if (opens.size() == 2) CHECK_EQ(num_of(opens[1], "n"), int64_t(2));
+}
+
+// The manifests already end the session (a clean stop whose state was not cleared): no
+// resume, the state is cleared, and an unreadable manifest is logged as an error.
+TEST(launch_recovery_skips_ended_session) {
+  RecRig rig;
+  std::wstring err;
+  rig.fs.ensure_dir(kP, &err);
+  const std::wstring man = kP + L"\\gig_main.jsonl", wav = kP + L"\\gig_001.wav";
+  const std::wstring lost = L"Z:\\gone\\gig_lost.jsonl";
+  const WallTime w = r_wall();
+  put_line(rig.fs, man, JsonLine("session_start", 0, w).str("session_id", L"x").str("dest", L"main"));
+  put_line(rig.fs, man, JsonLine("file_open", 0, w).str("path", wav).num("n", 1).num("seg", 0));
+  put_line(rig.fs, man,
+           JsonLine("file_close", 500, w).str("path", wav).num("start", 0).num("end", 500).num("bytes", 0));
+  put_line(rig.fs, man, JsonLine("session_end", 500, w).str("reason", L"stop"));
+  rig.fs.add_rule({L"Z:\\", Kind::FailOpen});
+  RecordingState st;
+  st.recording = true;
+  st.session_id = L"x";
+  st.rate = uint32_t(kRate);
+  st.channels = 1;
+  st.last_sample = 400;
+  st.dests = {{L"main", man, 2}, {L"lost", lost, 1}};
+  CHECK(rig.store.save(st));
+
+  const LaunchRecoveryResult r = recover_crashed_session(st, rig.cfg, rig.mgr, rig.store, rig.fs, rig.clock, rig.log);
+  CHECK(r.outcome == LaunchRecovery::EndedCleanly);
+  CHECK(rig.mgr.stats().state == SessionState::Idle);
+  const auto after = rig.store.load();
+  CHECK(after && !after->recording);
+  CHECK(logged(rig.log, Severity::Error, L"Couldn't repair after the crash: " + lost));
+  CHECK(logged(rig.log, Severity::Info, L"had ended cleanly"));
+  CHECK_EQ(events(read_manifest(rig.fs, man), "gap_start").size(), size_t(0));
+}
+
+// A resume that cannot start (here the input format changed) clears the state, so the app
+// does not try again on every launch.
+TEST(launch_recovery_failed_resume_clears_state) {
+  RecRig rig;
+  RecordingState st;
+  st.recording = true;
+  st.session_id = L"x";
+  st.rate = 44100;  // the rig's source runs at 8 kHz
+  st.channels = 1;
+  CHECK(rig.store.save(st));
+
+  const LaunchRecoveryResult r = recover_crashed_session(st, rig.cfg, rig.mgr, rig.store, rig.fs, rig.clock, rig.log);
+  CHECK(r.outcome == LaunchRecovery::Failed);
+  CHECK(!r.error.empty());
+  CHECK(rig.mgr.stats().state == SessionState::Idle);
+  const auto after = rig.store.load();
+  CHECK(after && !after->recording);
+  CHECK(logged(rig.log, Severity::Error, L"Couldn't resume the crashed session: " + r.error));
 }

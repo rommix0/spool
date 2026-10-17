@@ -7,6 +7,7 @@
 // state up to date and resumes a crashed session (§8.5).
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -61,6 +62,11 @@ class SessionManager : CaptureCallbacks {
   // Crash state (§8.5): saved by the manager thread every flush_ms of steady time and
   // whenever a destination's file or manifest changes; cleared by stop(). Set before start().
   void set_state_store(StateStore*);
+  // Called with each session's id before that session logs anything: from start() on the
+  // calling thread (a resumed session keeps its id), and for a linked session (§5.3) on the
+  // manager thread. The app uses it to switch the event log to the session's file. Set
+  // before start().
+  void on_new_session(std::function<void(const std::wstring& session_id)>);
   // A new session with id yyyymmdd-hhmmss (local start time). Does not run preflight:
   // destinations without a usable folder start in LastResort.
   // With a resume (after repair_open_files): the crashed session continues with the same
@@ -163,6 +169,7 @@ class SessionManager : CaptureCallbacks {
 
   // Crash state (manager thread while running).
   StateStore* store_ = nullptr;
+  std::function<void(const std::wstring&)> on_new_session_;
   uint64_t saved_seq_ = 0, saved_steady_ = 0;
   std::vector<std::pair<uint32_t, std::wstring>> saved_dests_;  // next n and manifest at the last save
   bool save_warned_ = false;

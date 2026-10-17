@@ -777,6 +777,9 @@ void WasapiImpl::capture_main(uint64_t gen) {
   const Layout l = layout_;
   const size_t stride = l.channels;
   bool failed = false;
+  // WASAPI flags the first packet after every Start() as a discontinuity; nothing was lost
+  // (a device-loss gap is recorded separately), so only later packets are reported.
+  bool first_packet = true;
 
   while (run_.load(std::memory_order_acquire) && !failed) {
     const DWORD w = WaitForMultipleObjects(2, handles, FALSE, kWaitMs);
@@ -799,7 +802,8 @@ void WasapiImpl::capture_main(uint64_t gen) {
         break;
       }
       CaptureCallbacks* cb = cb_.load(std::memory_order_acquire);
-      bool disc = (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0;
+      bool disc = (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0 && !first_packet;
+      first_packet = false;
       const bool silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
       for (size_t done = 0; done < n && cb;) {
         const size_t chunk = std::min<size_t>(n - done, cap_frames);

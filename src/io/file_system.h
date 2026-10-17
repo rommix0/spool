@@ -40,7 +40,9 @@ class IFileSystem {
   virtual std::wstring volume_id(const std::wstring& dir) = 0;                                    // "" if unknown
 };
 
-// The process-wide Win32 implementation.
+// The process-wide Win32 implementation. It is created on first use and never destroyed,
+// so it outlives every writer, including the detached finalizer threads and abandoned
+// (hung) writers that may still be running while the process exits.
 IFileSystem& real_fs();
 
 }  // namespace sl

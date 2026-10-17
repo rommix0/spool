@@ -270,6 +270,29 @@ TEST(event_log_appends_to_existing_file) {
            std::string("earlier line\r\n2026-10-16 10:30:00  INFO  resumed\r\n"));
 }
 
+// The app logs to app.log until a session starts, then to that session's log, and back.
+TEST(event_log_switches_file) {
+  FaultFileSystem fs;
+  std::wstring err;
+  CHECK(fs.ensure_dir(L"D:\\logs", &err));
+  EventLog log(fs, L"D:\\logs\\app.log");
+  log.add(Severity::Info, wall(), L"", L"a");
+  log.set_file(L"D:\\logs\\s1.log");
+  log.add(Severity::Info, wall(), L"", L"b");
+  log.set_file(L"D:\\logs\\s1.log");  // already open: nothing changes
+  log.add(Severity::Info, wall(), L"", L"c");
+  log.set_file(L"D:\\logs\\app.log");  // appends to the earlier file
+  log.add(Severity::Info, wall(), L"", L"d");
+  CHECK_EQ(text_of(fs.contents(L"D:\\logs\\app.log")),
+           std::string("2026-10-16 10:30:00  INFO  a\r\n2026-10-16 10:30:00  INFO  d\r\n"));
+  CHECK_EQ(text_of(fs.contents(L"D:\\logs\\s1.log")),
+           std::string("2026-10-16 10:30:00  INFO  b\r\n2026-10-16 10:30:00  INFO  c\r\n"));
+  log.set_file(L"D:\\nodir\\x.log");  // cannot be opened: memory only
+  log.add(Severity::Info, wall(), L"", L"e");
+  CHECK_EQ(log.recent(10).size(), size_t(5));
+  CHECK_EQ(count_lines(text_of(fs.contents(L"D:\\logs\\app.log"))), size_t(2));
+}
+
 TEST(event_log_file_line_has_no_embedded_newlines) {
   FaultFileSystem fs;
   std::wstring err;

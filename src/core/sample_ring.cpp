@@ -8,17 +8,15 @@
 
 namespace sl {
 
-namespace {
-size_t next_pow2(size_t v) {
+size_t SampleRing::capacity_for(size_t min_frames) {
   size_t p = 1;
-  while (p < v) p <<= 1;
+  while (p < min_frames) p <<= 1;
   return p;
 }
-}  // namespace
 
 SampleRing::SampleRing(uint32_t channels, size_t min_frames, SampleIndex start)
     : channels_(channels ? channels : 1),
-      capacity_(next_pow2(min_frames ? min_frames : 1)),
+      capacity_(capacity_for(min_frames)),
       mask_(capacity_ - 1),
       write_index_(start),
       pending_index_(start),
