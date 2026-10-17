@@ -26,6 +26,7 @@ constexpr COLORREF kBannerText = RGB(28, 28, 28);
 constexpr UINT_PTR kTimerId = 1;
 constexpr UINT kTimerMs = 33;
 constexpr uint64_t kSlowMs = 250;  // stats, destinations and events at 4 Hz
+constexpr uint64_t kResumeRetryMs = 1000;  // a crashed session waiting for its input (R18)
 constexpr int kHotkeyId = 1;
 constexpr size_t kEventRows = 500;
 
@@ -143,7 +144,7 @@ LRESULT MainWindow::handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PAINT: {
       PAINTSTRUCT ps;
       HDC dc = BeginPaint(hwnd_, &ps);
-      if (banner_on_) FillRect(dc, &banner_rect_, amber_);
+      if (banner_mode_ != Banner::None) FillRect(dc, &banner_rect_, amber_);
       EndPaint(hwnd_, &ps);
       return 0;
     }
@@ -225,7 +226,7 @@ void MainWindow::on_create() {
   ack_ = child(hwnd_, inst_, WC_BUTTONW, L"Acknowledge", kButton, IDC_ACK);
   ShowWindow(ack_, SW_HIDE);
   amber_ = CreateSolidBrush(kBannerBack);
-  banner_ = child(hwnd_, inst_, WC_STATICW, L"Recovered from a crash. Recording resumed.", kLabel, IDC_BANNER);
+  banner_ = child(hwnd_, inst_, WC_STATICW, L"", kLabel, IDC_BANNER);
   banner_ack_ = child(hwnd_, inst_, WC_BUTTONW, L"Acknowledge", kButton, IDC_BANNER_ACK);
   ShowWindow(banner_, SW_HIDE);
   ShowWindow(banner_ack_, SW_HIDE);
@@ -279,7 +280,9 @@ void MainWindow::on_command(int id) {
     case IDC_ACK:
       if (recording()) ctx_.mgr.acknowledge();
       break;
-    case IDC_BANNER_ACK: show_banner(false); break;
+    case IDC_BANNER_ACK:
+      if (banner_mode_ == Banner::Recovered) show_banner(Banner::None);
+      break;
   }
 }
 
@@ -349,7 +352,17 @@ SessionConfig MainWindow::session_config() const {
   return cfg;
 }
 
-void MainWindow::record() { start_recording(true); }
+void MainWindow::record() {
+  if (!pending_) {
+    start_recording(true);
+    return;
+  }
+  // A crashed session is waiting for its input: Record retries that now.
+  try_resume();
+  if (pending_)
+    MessageBoxW(hwnd_, (L"Waiting for the input device to resume the crashed session.\n\n" + pending_err_).c_str(),
+                kCantStart, MB_OK | MB_ICONINFORMATION);
+}
 
 bool MainWindow::input_ready(std::wstring* err) {
   if (ctx_.source.format().sample_rate) return true;
@@ -393,52 +406,74 @@ bool MainWindow::start_recording(bool ask) {
   }
   if (!ask)  // auto-start: into the session's log
     for (const std::wstring& l : lines) warn(l);
+  after_start();
+  return true;
+}
+
+void MainWindow::after_start() {
   if (ctx_.wasapi && !ctx_.wasapi->raw_active())
     warn(L"Windows audio processing couldn't be turned off for this device.");
   show_config_ = false;
   refresh_slow();
-  return true;
 }
 
 void MainWindow::on_launch() {
   // Recovery runs on every launch, whether or not Windows passed --recover.
   const std::optional<RecordingState> st = ctx_.store.load();
-  if (st && st->recording)
-    resume(*st);
-  else if (ctx_.settings.start_on_launch)
+  if (st && st->recording) {
+    pending_ = *st;
+    pending_since_ = GetTickCount64();
+    use_log(st->session_id);  // the repair lines belong with the crashed session's events
+    try_resume();
+  } else if (ctx_.settings.start_on_launch) {
     start_recording(false);
+  }
 }
 
-void MainWindow::resume(const RecordingState& st) {
-  use_log(st.session_id);  // the repair lines belong with the crashed session's events
-  std::wstring err;
-  if (!input_ready(&err))  // the resume then fails and says so
-    ctx_.log.add(Severity::Error, system_clock().now(), L"", L"Can't open the input device: " + err);
-  before_start();
+// R18: at launch, then once a second from tick() while the input device is missing.
+void MainWindow::try_resume() {
+  const uint64_t now = GetTickCount64();
+  pending_try_ = now;
+  pending_err_.clear();
+  const bool ready = input_ready(&pending_err_);
+  if (ready) before_start();
   HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-  const LaunchRecoveryResult r =
-      recover_crashed_session(st, session_config(), ctx_.mgr, ctx_.store, ctx_.fs, system_clock(), ctx_.log);
+  const LaunchRecoveryResult r = resume_when_input_ready(*pending_, ready, now - pending_since_, session_config(),
+                                                         ctx_.mgr, ctx_.store, ctx_.fs, system_clock(), ctx_.log);
   SetCursor(old);
-  if (r.outcome == LaunchRecovery::Resumed) {
-    show_config_ = false;
-    show_banner(true);
-    refresh_slow();
+  if (r.outcome == LaunchRecovery::Waiting) {
+    if (banner_mode_ != Banner::Waiting) {
+      warn(L"Waiting for the input device to resume the crashed session. Can't open it: " + pending_err_);
+      show_banner(Banner::Waiting);
+    }
     return;
   }
+  pending_.reset();
+  if (r.outcome == LaunchRecovery::Resumed) {
+    show_banner(Banner::Recovered);
+    after_start();
+    return;
+  }
+  show_banner(Banner::None);
   use_log(kAppLog);
   if (r.outcome == LaunchRecovery::Failed)
     MessageBoxW(hwnd_, (L"The crashed session couldn't be resumed.\n\n" + r.error).c_str(), kCantStart,
                 MB_OK | MB_ICONERROR);
+  if (auto_start_after(r.outcome, ctx_.settings.start_on_launch)) start_recording(false);
 }
 
 void MainWindow::use_log(const std::wstring& name) { ctx_.log.set_file(log_file(name)); }
 
-void MainWindow::show_banner(bool on) {
-  if (on == banner_on_) return;
-  banner_on_ = on;
-  if (!on && GetFocus() == banner_ack_) SetFocus(IsWindowEnabled(stop_) ? stop_ : record_);
-  ShowWindow(banner_, on ? SW_SHOWNA : SW_HIDE);
-  ShowWindow(banner_ack_, on ? SW_SHOWNA : SW_HIDE);
+void MainWindow::show_banner(Banner mode) {
+  if (mode == banner_mode_) return;
+  banner_mode_ = mode;
+  const bool ack = mode == Banner::Recovered;  // waiting is a status, not a notice to acknowledge
+  if (!ack && GetFocus() == banner_ack_) SetFocus(IsWindowEnabled(stop_) ? stop_ : record_);
+  if (mode != Banner::None)
+    SetWindowTextW(banner_, ack ? L"Recovered from a crash. Recording resumed."
+                                : L"Waiting for the input device to resume the crashed session.");
+  ShowWindow(banner_, mode != Banner::None ? SW_SHOWNA : SW_HIDE);
+  ShowWindow(banner_ack_, ack ? SW_SHOWNA : SW_HIDE);
   layout();
   // Everything below the banner moved: repaint all of it (copied bits can be stale).
   RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
@@ -553,6 +588,7 @@ void MainWindow::tick() {
   meters_.set_levels(levels);
 
   const uint64_t now = GetTickCount64();
+  if (pending_ && now - pending_try_ >= kResumeRetryMs) try_resume();
   if (now - last_slow_ms_ >= kSlowMs) refresh_slow();
 }
 
@@ -563,6 +599,7 @@ void MainWindow::refresh_slow() {
   if (rec != awake_) {  // §5.2: no system sleep while recording (display sleep is fine)
     awake_ = rec;
     SetThreadExecutionState(rec ? ES_CONTINUOUS | ES_SYSTEM_REQUIRED : ES_CONTINUOUS);
+    if (!rec) use_log(kAppLog);  // also when the manager went idle by itself (failed linked session)
   }
   // stats().fmt stays the last session's format after it stops; idle, the source's is current.
   const StreamFormat fmt = rec && st.fmt.sample_rate ? st.fmt : ctx_.source.format();
@@ -692,7 +729,7 @@ void MainWindow::layout() {
   int y = m + bar + px(12);
 
   // The crash-recovery banner, until acknowledged.
-  if (banner_on_) {
+  if (banner_mode_ != Banner::None) {
     const int bnh = bh + px(12);
     const RECT old = banner_rect_;
     banner_rect_ = RECT{m, y, c.right - m, y + bnh};

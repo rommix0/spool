@@ -62,6 +62,13 @@ struct RepairReport {
 // gap_start (see RepairReport::session_ended).
 RepairReport repair_open_files(IFileSystem&, const RecordingState&);
 
+// When a crashed session will not be resumed: appends session_end(reason) at `at` (use
+// RepairReport::audio_end) to each destination's current manifest, so the session is
+// closed and a later scan sees it as ended. Call after repair_open_files. Best effort:
+// returns the manifests that could not be written.
+std::vector<std::wstring> end_crashed_session(IFileSystem&, const RecordingState&, SampleIndex at,
+                                              const std::wstring& reason);
+
 struct ResumeInfo {
   RecordingState prior;
   SampleIndex resume_sample;

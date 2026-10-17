@@ -735,3 +735,109 @@ TEST(launch_recovery_failed_resume_clears_state) {
   CHECK(after && !after->recording);
   CHECK(logged(rig.log, Severity::Error, L"Couldn't resume the crashed session: " + r.error));
 }
+
+// R18: while the input device is missing at launch nothing is repaired or cleared; the
+// session resumes once the device is back.
+TEST(launch_recovery_waits_for_input) {
+  RecRig rig;
+  CHECK(rig.start());
+  CHECK(rig.pump(10.5));
+  CHECK(rig.state_has_manifest());
+  rig.mgr.abandon_for_test();
+  const auto st = rig.store.load();
+  const auto mans = rig.fs.list(kP, L".jsonl");
+  const auto wavs = rig.fs.list(kP, L".wav");
+  CHECK(st && st->recording);
+  CHECK_EQ(mans.size(), size_t(1));
+  CHECK_EQ(wavs.size(), size_t(1));
+  if (!st || mans.size() != 1 || wavs.size() != 1) return;
+  const auto man_before = rig.fs.contents(mans[0]);
+  const auto wav_before = rig.fs.contents(wavs[0]);
+  const size_t log_before = rig.log.recent(1000).size();
+
+  const LaunchRecoveryResult w = resume_when_input_ready(*st, false, kResumeWaitMs - 1, rig.cfg, rig.mgr, rig.store,
+                                                         rig.fs, rig.clock, rig.log);
+  CHECK(w.outcome == LaunchRecovery::Waiting);
+  CHECK(rig.mgr.stats().state == SessionState::Idle);
+  const auto kept = rig.store.load();
+  CHECK(kept && kept->recording);
+  CHECK(rig.fs.contents(mans[0]) == man_before);
+  CHECK(rig.fs.contents(wavs[0]) == wav_before);
+  CHECK_EQ(rig.log.recent(1000).size(), log_before);
+
+  const LaunchRecoveryResult r = resume_when_input_ready(*st, true, kResumeWaitMs - 1, rig.cfg, rig.mgr, rig.store,
+                                                         rig.fs, rig.clock, rig.log);
+  CHECK(r.outcome == LaunchRecovery::Resumed);
+  CHECK(rig.mgr.stats().recovered_from_crash);
+  CHECK(logged(rig.log, Severity::Info, L"Repaired after the crash: " + wavs[0]));
+  CHECK(rig.pump(1));
+  rig.mgr.stop();
+  const auto recs = rig.only_manifest(kP);
+  CHECK_EQ(events(recs, "gap_start").size(), size_t(1));
+  CHECK_EQ(events(recs, "gap_end").size(), size_t(1));
+}
+
+// R18 cap: after 30 min without the input the session is repaired, closed with
+// session_end(resume_failed) and the state cleared.
+TEST(launch_recovery_gives_up_after_cap) {
+  RecRig rig;
+  CHECK(rig.start());
+  CHECK(rig.pump(10.5));
+  CHECK(rig.state_has_manifest());
+  rig.mgr.abandon_for_test();
+  const auto st = rig.store.load();
+  const auto wavs = rig.fs.list(kP, L".wav");
+  CHECK(st && st->recording);
+  CHECK_EQ(wavs.size(), size_t(1));
+  if (!st || wavs.size() != 1) return;
+
+  const LaunchRecoveryResult r =
+      resume_when_input_ready(*st, false, kResumeWaitMs, rig.cfg, rig.mgr, rig.store, rig.fs, rig.clock, rig.log);
+  CHECK(r.outcome == LaunchRecovery::GaveUp);
+  CHECK(rig.mgr.stats().state == SessionState::Idle);
+  const auto after = rig.store.load();
+  CHECK(after && !after->recording);
+  CHECK(logged(rig.log, Severity::Info, L"Repaired after the crash: " + wavs[0]));
+  CHECK(logged(rig.log, Severity::Error, L"30 min"));
+  CHECK_EQ(wav_samples(rig.fs, wavs[0]).size(), size_t(10.5 * kRate));
+  const auto recs = rig.only_manifest(kP);
+  CHECK_EQ(events(recs, "gap_start").size(), size_t(1));
+  CHECK(!recs.empty() && str(recs.back(), "ev") == "session_end");
+  if (!recs.empty()) {
+    CHECK_EQ(str(recs.back(), "reason"), std::string("resume_failed"));
+    CHECK_EQ(num_of(recs.back(), "sample"), int64_t(10.5 * kRate));
+  }
+  // A stale state found later would see the session as ended.
+  CHECK(repair_open_files(rig.fs, *st).session_ended);
+}
+
+// Minor 5: a resume that cannot start closes the crashed session in its manifests.
+TEST(launch_recovery_failed_resume_ends_session) {
+  RecRig rig;
+  CHECK(rig.start());
+  CHECK(rig.pump(4));
+  CHECK(rig.state_has_manifest());
+  rig.mgr.abandon_for_test();
+  auto st = rig.store.load();
+  CHECK(st && st->recording);
+  if (!st) return;
+  st->rate = 16000;  // the input (8 kHz) no longer matches
+  const LaunchRecoveryResult r = recover_crashed_session(*st, rig.cfg, rig.mgr, rig.store, rig.fs, rig.clock, rig.log);
+  CHECK(r.outcome == LaunchRecovery::Failed);
+  const auto after = rig.store.load();
+  CHECK(after && !after->recording);
+  const auto recs = rig.only_manifest(kP);
+  CHECK(!recs.empty() && str(recs.back(), "ev") == "session_end");
+  if (!recs.empty()) CHECK_EQ(str(recs.back(), "reason"), std::string("resume_failed"));
+}
+
+// Item 2: start_on_launch still applies when no crashed session was resumed.
+TEST(launch_auto_start_after_recovery) {
+  CHECK(!auto_start_after(LaunchRecovery::Resumed, true));
+  CHECK(!auto_start_after(LaunchRecovery::Waiting, true));
+  CHECK(auto_start_after(LaunchRecovery::EndedCleanly, true));
+  CHECK(auto_start_after(LaunchRecovery::Failed, true));
+  CHECK(auto_start_after(LaunchRecovery::GaveUp, true));
+  CHECK(!auto_start_after(LaunchRecovery::EndedCleanly, false));
+  CHECK(!auto_start_after(LaunchRecovery::GaveUp, false));
+}

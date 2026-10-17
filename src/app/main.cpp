@@ -10,7 +10,12 @@
 //                      crash state and the logs stay out of the user's real folders.
 //   --crash-after <s>  Debug builds only: writes through a null pointer after <s> seconds,
 //                      to test the restart after a crash.
-// --synthetic and --data-root are passed on to the restarted process.
+//   --synthetic-unavailable-for <s>
+//                      Debug builds only, with --synthetic: the synthetic input can't be
+//                      opened for the first <s> seconds, to test a crashed session waiting
+//                      for its input device at launch.
+// --synthetic, --data-root and --synthetic-unavailable-for are passed on to the restarted
+// process.
 #include <windows.h>
 
 #include <commctrl.h>
@@ -39,8 +44,9 @@ constexpr DWORD kRecoverWaitMs = 60000;  // for the crashed instance to let go o
 struct Args {
   bool synthetic = false;
   bool recover = false;
-  std::wstring data_root;
+  std::wstring data_root;      // without trailing backslashes
   unsigned crash_after_s = 0;  // Debug only
+  unsigned unavailable_s = 0;  // Debug only
 };
 
 Args parse_args() {
@@ -55,9 +61,14 @@ Args parse_args() {
       a.recover = true;
     } else if (lstrcmpiW(argv[i], L"--data-root") == 0 && has_value) {
       a.data_root = argv[++i];
+      // "C:\x\" quoted into the restart command line would escape the closing quote.
+      while (a.data_root.size() > 1 && (a.data_root.back() == L'\\' || a.data_root.back() == L'/'))
+        a.data_root.pop_back();
 #ifdef _DEBUG
     } else if (lstrcmpiW(argv[i], L"--crash-after") == 0 && has_value) {
       a.crash_after_s = unsigned(_wtoi(argv[++i]));
+    } else if (lstrcmpiW(argv[i], L"--synthetic-unavailable-for") == 0 && has_value) {
+      a.unavailable_s = unsigned(_wtoi(argv[++i]));
 #endif
     }
   }
@@ -74,6 +85,30 @@ void activate_running_instance() {
 }
 
 #ifdef _DEBUG
+// --synthetic-unavailable-for: a source that can't be opened (and has no format) until the
+// deadline, like an interface that is not back yet.
+class LateSource : public sl::ICaptureSource {
+ public:
+  LateSource(std::unique_ptr<sl::ICaptureSource> inner, unsigned seconds)
+      : inner_(std::move(inner)), until_(GetTickCount64() + uint64_t(seconds) * 1000) {}
+  bool open(const sl::CaptureConfig& c, std::wstring* err) override {
+    if (GetTickCount64() < until_) {
+      if (err) *err = L"The synthetic input is unavailable (test).";
+      return false;
+    }
+    open_ = true;
+    return inner_->open(c, err);
+  }
+  sl::StreamFormat format() const override { return open_ ? inner_->format() : sl::StreamFormat{}; }
+  bool start(sl::CaptureCallbacks* cb) override { return open_ && inner_->start(cb); }
+  void stop() override { inner_->stop(); }
+
+ private:
+  std::unique_ptr<sl::ICaptureSource> inner_;
+  uint64_t until_;
+  bool open_ = false;
+};
+
 [[noreturn]] void crash_now() {
   volatile int* p = nullptr;
   *p = 1;  // an access violation, not a CRT error: Windows Error Reporting handles it
@@ -114,7 +149,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   std::wstring restart = L"--recover";
   if (args.synthetic) restart += L" --synthetic";
   if (!args.data_root.empty()) restart += L" --data-root \"" + args.data_root + L"\"";
-  RegisterApplicationRestart(restart.c_str(), 0);
+#ifdef _DEBUG
+  if (args.unavailable_s) restart += L" --synthetic-unavailable-for " + std::to_wstring(args.unavailable_s);
+#endif
+  const HRESULT restart_hr = RegisterApplicationRestart(restart.c_str(), 0);
 
   // STA for the folder picker; WasapiSource does its COM work on its own MTA threads.
   const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
@@ -134,11 +172,21 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     log.add(Severity::Warning, system_clock().now(), L"",
             L"Can't create the settings folder: a crashed session can't be resumed");
   StateStore store(state_path());
+  if (FAILED(restart_hr))
+    log.add(Severity::Warning, system_clock().now(), L"",
+            L"Couldn't register for a restart after a crash: Windows won't restart the app by itself");
 
   std::unique_ptr<ICaptureSource> source;
   WasapiSource* wasapi = nullptr;
   if (args.synthetic) {
     source = std::make_unique<SyntheticSource>(StreamFormat{48000, 2}, SyntheticSource::Pattern::Sine, false);
+#ifdef _DEBUG
+    if (args.unavailable_s) {
+      source = std::make_unique<LateSource>(std::move(source), args.unavailable_s);
+      if (!source->open(settings.input, &err))
+        log.add(Severity::Error, system_clock().now(), L"", L"Can't open the input device: " + err);
+    }
+#endif
   } else {
     auto w = std::make_unique<WasapiSource>();
     if (!w->open(settings.input, &err))

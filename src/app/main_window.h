@@ -9,6 +9,7 @@
 #include <windows.h>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -62,16 +63,18 @@ class MainWindow {
   void on_command(int id);
   LRESULT on_notify(NMHDR*);
   void on_close();
-  void on_launch();  // posted by create(): crash recovery, else start_on_launch
-  void resume(const RecordingState&);
+  void on_launch();   // posted by create(): crash recovery, else start_on_launch
+  void try_resume();  // the pending crashed session: resume, keep waiting for the input, or give up
 
   // Record (ask = true: preflight problems ask "Start anyway?") and auto-start (ask =
   // false: they are logged and recording starts). Blocking problems show a message.
   bool start_recording(bool ask);
   bool input_ready(std::wstring* err);  // reopens the input if it failed to open earlier
   void before_start();                  // raises the working set for the ring
+  void after_start();                   // warnings about the started session; refresh
   void use_log(const std::wstring& name);  // log_file(name)
-  void show_banner(bool on);
+  enum class Banner { None, Waiting, Recovered };
+  void show_banner(Banner);
 
   void record();
   void confirm_stop();
@@ -103,7 +106,11 @@ class MainWindow {
   HACCEL accel_ = nullptr;
   bool hotkey_ = false;
   bool awake_ = false;   // SetThreadExecutionState keeps the system awake (while recording)
-  bool banner_on_ = false;
+  Banner banner_mode_ = Banner::None;
+  // A crashed session found at launch that waits for its input device (R18).
+  std::optional<RecordingState> pending_;
+  uint64_t pending_since_ = 0, pending_try_ = 0;  // GetTickCount64
+  std::wstring pending_err_;                      // why the input didn't open at the last try
   RECT banner_rect_{};   // the amber banner row (painted by WM_PAINT)
   HBRUSH amber_ = nullptr;  // owned
   bool show_config_ = false;  // idle panel shows the configured destinations (settings changed)

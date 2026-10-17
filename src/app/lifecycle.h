@@ -29,20 +29,40 @@ WorkingSetSize working_set_for_ring(uint32_t ring_seconds, uint32_t rate, uint16
 // (the session logs that the ring is not locked).
 bool raise_working_set(const WorkingSetSize&);
 
-enum class LaunchRecovery { Resumed, EndedCleanly, Failed };
+enum class LaunchRecovery {
+  Resumed,
+  EndedCleanly,  // the manifests show the session had ended: nothing to resume
+  Failed,        // the resume did not start
+  Waiting,       // the input device is not available yet: nothing was touched
+  GaveUp,        // the input did not return within kResumeWaitMs
+};
 
 struct LaunchRecoveryResult {
   LaunchRecovery outcome;
   std::wstring error;  // Failed: why the resume did not start
 };
 
+// How long a crashed session waits at launch for its input device (R18).
+inline constexpr uint64_t kResumeWaitMs = 30ull * 60 * 1000;
+
 // For a crash state with recording=1: repair_open_files, logging each repaired file (Info)
 // and each file or manifest that could not be repaired (Error). If the manifests show the
 // session had already ended, nothing is resumed. Otherwise the session resumes with
-// make_resume(state, clock.now(), audio_end). When nothing is resumed (ended, or the resume
-// failed to start) the state is cleared, so the next launch does not try again. The
-// manager must be idle and use `store` as its state store.
+// make_resume(state, clock.now(), audio_end). If that fails to start, the crashed manifests
+// get session_end(resume_failed). When nothing is resumed the state is cleared, so the next
+// launch does not try again. The manager must be idle and use `store` as its state store.
 LaunchRecoveryResult recover_crashed_session(const RecordingState&, const SessionConfig&, SessionManager&,
                                              StateStore& store, IFileSystem&, IClock&, EventLog&);
+
+// R18, called at launch and then about once a second while it returns Waiting. With the
+// input ready: recover_crashed_session. Without it: Waiting (nothing repaired, the state
+// kept) until waited_ms reaches kResumeWaitMs; then the session is repaired, closed with
+// session_end(resume_failed), the state cleared and an error logged (GaveUp).
+LaunchRecoveryResult resume_when_input_ready(const RecordingState&, bool input_ready, uint64_t waited_ms,
+                                             const SessionConfig&, SessionManager&, StateStore& store, IFileSystem&,
+                                             IClock&, EventLog&);
+
+// Whether start_on_launch applies after the crash recovery ended this way (nothing resumed).
+bool auto_start_after(LaunchRecovery, bool start_on_launch);
 
 }  // namespace sl

@@ -120,14 +120,17 @@ bool ended_cleanly(const std::vector<ManifestRecord>& recs, const std::wstring& 
 
 enum class HeadState { Unreadable, Live, Ended };
 
+// A sample's wall time on the crashed session's clock.
+WallTime session_wall(const RecordingState& st, SampleIndex s) {
+  const int64_t utc = st.rate ? st.start_utc_ms + (s - st.start_sample) * 1000 / int64_t(st.rate) : st.last_utc_ms;
+  return WallTime{utc, st.local_offset_min};
+}
+
 // Repairs one destination; returns the state of its current manifest. *audio_end is raised
 // to where its repaired audio ends.
 HeadState repair_dest(IFileSystem& fs, const RecordingState& st, const DestResume& d, RepairReport& rep,
                       SampleIndex* audio_end) {
-  const auto wall = [&](SampleIndex s) {
-    const int64_t utc = st.rate ? st.start_utc_ms + (s - st.start_sample) * 1000 / int64_t(st.rate) : st.last_utc_ms;
-    return WallTime{utc, st.local_offset_min};
-  };
+  const auto wall = [&](SampleIndex s) { return session_wall(st, s); };
 
   // The chain: the current manifest first, then every prev_manifest it names, and so on.
   std::vector<ManifestFile> chain;
@@ -297,6 +300,21 @@ RepairReport repair_open_files(IFileSystem& fs, const RecordingState& st) {
   }
   rep.session_ended = readable > 0 && ended == readable;
   return rep;
+}
+
+std::vector<std::wstring> end_crashed_session(IFileSystem& fs, const RecordingState& st, SampleIndex at,
+                                              const std::wstring& reason) {
+  std::vector<std::wstring> failed;
+  for (const auto& d : st.dests) {
+    if (d.manifest_path.empty()) continue;
+    try {
+      if (!append_lines(fs, d.manifest_path, {JsonLine("session_end", at, session_wall(st, at)).str("reason", reason)}))
+        failed.push_back(d.manifest_path);
+    } catch (...) {  // out of memory: report it, go on with the others
+      failed.push_back(d.manifest_path);
+    }
+  }
+  return failed;
 }
 
 ResumeInfo make_resume(const RecordingState& st, WallTime now, SampleIndex audio_end) {

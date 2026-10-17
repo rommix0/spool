@@ -113,13 +113,15 @@ TEST(ring_start_index) {
   CHECK_EQ(count_bad(buf, 1'000'000, 4, 1), size_t(0));
 }
 
-// VirtualLock is limited by the working-set minimum (default ~200 KB): a page fits, 64 MB
-// does not. The ring works either way; locked() lets the session warn.
+// VirtualLock is limited by the process working-set minimum: a page always fits; 64 MiB
+// fits only once the minimum has been raised (the app does it before each session, see
+// lifecycle.h). The ring works either way; locked() lets the session warn.
 TEST(ring_reports_lock) {
   SampleRing small(1, 1024);
   CHECK(small.locked());
-  // 64 MiB: locked only if the process working set was raised (the app does; a test may
-  // have). The ring works either way.
+  // Whether this one is locked depends on test order: lifecycle_raised_working_set_lets_ring_lock
+  // raises the working-set minimum (to 80 MiB) for the rest of the process. So locked() is
+  // not asserted here.
   SampleRing big(1, size_t(1) << 24);
   write_ramp(big, 0, 4);
   std::vector<float> buf(4);
