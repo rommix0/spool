@@ -230,23 +230,29 @@ std::unique_ptr<Manifest> Manifest::open_append(IFileSystem& fs, const std::wstr
 
 bool Manifest::append(const JsonLine& l) {
   const std::string line = l.finish();
-  std::lock_guard<std::mutex> lk(m_);
+  std::lock_guard<std::mutex> lk(buf_m_);
   buf_ += line;
   buf_.push_back('\n');
   return true;
 }
 
 bool Manifest::flush() {
-  std::lock_guard<std::mutex> lk(m_);
-  if (!buf_.empty()) {
+  std::lock_guard<std::mutex> flk(flush_m_);
+  std::string taken;
+  {
+    std::lock_guard<std::mutex> lk(buf_m_);
+    taken.swap(buf_);
+  }
+  if (!taken.empty()) {
     std::string out;
     if (lead_newline_) out.push_back('\n');
-    out += buf_;
+    out += taken;
     if (!file_->write(out.data(), out.size())) {
       lead_newline_ = true;  // a partial write may have left a torn line behind
+      std::lock_guard<std::mutex> lk(buf_m_);
+      buf_.insert(0, taken);  // failed bytes stay ahead of anything appended meanwhile
       return false;
     }
-    buf_.clear();
     lead_newline_ = false;
   }
   return file_->flush();

@@ -1,4 +1,6 @@
+#include <chrono>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "core/clock.h"
@@ -220,6 +222,82 @@ TEST(event_log_works_without_file) {
   log.add(Severity::Info, wall(), L"", L"hello");
   CHECK_EQ(log.recent(5).size(), size_t(1));
   CHECK(fs.contents(L"D:\\nodir\\events.log").empty());
+}
+
+TEST(manifest_append_does_not_block_on_hung_flush) {
+  FaultFileSystem fs;
+  std::wstring err;
+  CHECK(fs.ensure_dir(L"D:\\rec", &err));
+  auto m = Manifest::create(fs, L"D:\\rec\\m.jsonl", &err);
+  CHECK(m != nullptr);
+  if (!m) return;
+  fs.add_rule({L"D:\\rec\\m.jsonl", FaultFileSystem::Kind::HangWrite, 0, 0});
+  CHECK(m->append(JsonLine("marker", 1, wall())));
+  bool flush_ok = true;
+  std::thread t([&] { flush_ok = m->flush(); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));  // let flush enter the hung write
+  const auto t0 = std::chrono::steady_clock::now();
+  CHECK(m->append(JsonLine("marker", 2, wall())));
+  const auto took = std::chrono::steady_clock::now() - t0;
+  CHECK(took < std::chrono::milliseconds(500));
+  fs.release_hangs();
+  t.join();
+  CHECK(!flush_ok);
+  fs.clear_rules();
+  CHECK(m->flush());  // the failed bytes were re-queued ahead of the newer append
+  auto recs = read_manifest(fs, L"D:\\rec\\m.jsonl");
+  CHECK_EQ(recs.size(), size_t(2));
+  if (recs.size() == 2) {
+    CHECK_EQ(recs[0]["sample"], std::string("1"));
+    CHECK_EQ(recs[1]["sample"], std::string("2"));
+  }
+}
+
+TEST(event_log_appends_to_existing_file) {
+  FaultFileSystem fs;
+  std::wstring err;
+  CHECK(fs.ensure_dir(L"D:\\logs", &err));
+  {
+    auto f = fs.create_new(L"D:\\logs\\events.log", &err);
+    CHECK(f != nullptr);
+    if (!f) return;
+    const std::string s = "earlier line\r\n";
+    CHECK(f->write(s.data(), s.size()));
+  }
+  EventLog log(fs, L"D:\\logs\\events.log");
+  log.add(Severity::Info, wall(), L"", L"resumed");
+  CHECK_EQ(text_of(fs.contents(L"D:\\logs\\events.log")),
+           std::string("earlier line\r\n2026-10-16 10:30:00  INFO  resumed\r\n"));
+}
+
+TEST(event_log_file_line_has_no_embedded_newlines) {
+  FaultFileSystem fs;
+  std::wstring err;
+  CHECK(fs.ensure_dir(L"D:\\logs", &err));
+  EventLog log(fs, L"D:\\logs\\events.log");
+  log.add(Severity::Info, wall(), L"a\nb", L"x\r\ny");
+  CHECK_EQ(text_of(fs.contents(L"D:\\logs\\events.log")),
+           std::string("2026-10-16 10:30:00  INFO  [a b] x  y\r\n"));
+  auto r = log.recent(1);
+  CHECK_EQ(r.size(), size_t(1));
+  if (r.size() == 1) CHECK(r[0].text == L"x\r\ny");  // in-memory entry unchanged
+}
+
+TEST(event_log_recent_does_not_block_on_hung_write) {
+  FaultFileSystem fs;
+  std::wstring err;
+  CHECK(fs.ensure_dir(L"D:\\logs", &err));
+  EventLog log(fs, L"D:\\logs\\events.log");
+  fs.add_rule({L"D:\\logs\\events.log", FaultFileSystem::Kind::HangWrite, 0, 0});
+  std::thread t([&] { log.add(Severity::Info, wall(), L"", L"stuck"); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  const auto t0 = std::chrono::steady_clock::now();
+  const size_t n = log.recent(10).size();
+  const auto took = std::chrono::steady_clock::now() - t0;
+  CHECK(took < std::chrono::milliseconds(500));
+  CHECK_EQ(n, size_t(1));
+  fs.release_hangs();
+  t.join();
 }
 
 TEST(event_log_caps_memory_at_1000) {

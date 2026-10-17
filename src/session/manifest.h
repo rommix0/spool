@@ -39,15 +39,19 @@ class Manifest {
   // record stays on its own line.
   static std::unique_ptr<Manifest> open_append(IFileSystem&, const std::wstring& path, std::wstring* err);
 
-  bool append(const JsonLine&);  // buffered in memory; thread-safe
-  // Writes the buffered lines, then IFile::flush. On failure the buffer is kept and
-  // false is returned, so the caller can decide on failover.
+  // Buffered in memory; thread-safe. Never waits on file I/O, so it stays responsive
+  // while flush() is stuck on a stalled device.
+  bool append(const JsonLine&);
+  // Writes the buffered lines, then IFile::flush. On failure the buffered lines are
+  // kept (ahead of anything appended meanwhile) and false is returned, so the caller
+  // can decide on failover.
   bool flush();
 
  private:
   explicit Manifest(std::unique_ptr<IFile> f) : file_(std::move(f)) {}
 
-  std::mutex m_;
+  std::mutex buf_m_;    // guards buf_ only; never held across I/O
+  std::mutex flush_m_;  // serializes flush(); guards file_ use and lead_newline_
   std::unique_ptr<IFile> file_;
   std::string buf_;
   bool lead_newline_ = false;  // next write must begin with '\n' (torn last line)

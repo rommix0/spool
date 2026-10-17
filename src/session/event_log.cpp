@@ -20,14 +20,22 @@ void EventLog::add(Severity sev, WallTime wall, std::wstring dest, std::wstring 
   std::snprintf(head, sizeof head, "%04d-%02d-%02d %02d:%02d:%02d  %s  ", t.year, t.month, t.day,
                 t.hour, t.minute, t.second, sev_text);
   std::string line = head;
-  if (!dest.empty()) line += "[" + utf8_from_wide(dest) + "] ";
-  line += utf8_from_wide(text);
+  const auto one_line = [](std::string s) {
+    for (char& c : s)
+      if (c == '\r' || c == '\n') c = ' ';
+    return s;
+  };
+  if (!dest.empty()) line += "[" + one_line(utf8_from_wide(dest)) + "] ";
+  line += one_line(utf8_from_wide(text));
   line += "\r\n";
 
-  std::lock_guard<std::mutex> lk(m_);
+  {
+    std::lock_guard<std::mutex> lk(m_);
+    entries_.push_back({wall, sev, std::move(dest), std::move(text)});
+    if (entries_.size() > kMaxEntries) entries_.pop_front();
+  }
+  std::lock_guard<std::mutex> io(io_m_);  // file I/O may stall; recent() never waits on it
   if (file_ && file_->write(line.data(), line.size())) file_->flush();
-  entries_.push_back({wall, sev, std::move(dest), std::move(text)});
-  if (entries_.size() > kMaxEntries) entries_.pop_front();
 }
 
 std::vector<LogEntry> EventLog::recent(size_t max) const {
