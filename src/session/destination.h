@@ -96,6 +96,9 @@ class Destination {
   //   takeover writer that hangs as well is rescued while its data is still in the ring.
   void declare_stalled();
   void disable(std::wstring reason);  // state Disabled, nothing (more) written
+  // Test hook (crash simulation): the writer stops where it is without finalizing or
+  // flushing anything; its encoder and manifest are leaked unclosed. State Stopped.
+  void abandon_for_test();
   DestStatus status() const;
   uint64_t data_rate() const;  // bytes/s: WAV rate*ch*bytes; Opus bitrate/8
 

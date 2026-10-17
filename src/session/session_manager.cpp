@@ -55,6 +55,7 @@ struct SessionManager::Session {
   SessionParams params;
   StreamFormat fmt;
   uint64_t seq = 0;
+  std::vector<DestResumeSeed> seeds;  // per destination (crash state before its first file)
   // Destroyed in reverse order: destinations and meter before the ring they read.
   std::unique_ptr<SampleRing> ring;
   std::unique_ptr<MeterReader> meter;
@@ -74,13 +75,11 @@ PreflightResult SessionManager::preflight(const SessionConfig& cfg) {
   return sl::preflight(cfg.dests, p, fs_);
 }
 
+void SessionManager::set_state_store(StateStore* store) { store_ = store; }
+
 bool SessionManager::start(const SessionConfig& cfg, const ResumeInfo* resume, std::wstring* err) {
   std::wstring e;
   if (!err) err = &e;
-  if (resume) {
-    *err = L"Resuming a session is not supported";
-    return false;
-  }
   if (thread_.joinable()) {
     *err = L"Already recording";
     return false;
@@ -90,14 +89,39 @@ bool SessionManager::start(const SessionConfig& cfg, const ResumeInfo* resume, s
     *err = L"The input has no format";
     return false;
   }
+  if (resume && !(StreamFormat{resume->prior.rate, resume->prior.channels} == fmt)) {
+    *err = L"The input format (" + fmt_text(fmt) + L") is not the crashed session's (" +
+           fmt_text(StreamFormat{resume->prior.rate, resume->prior.channels}) + L")";
+    return false;
+  }
   cfg_ = cfg;
   SessionParams p = cfg.params;
-  const WallTime now = clock_.now();
-  p.session_id = next_session_id(now);
   p.rate = fmt.sample_rate;
   p.input_channels = fmt.channels;
-  p.start_wall = now;
-  auto s = make_session(p, fmt, err);
+  SampleIndex ring_start = p.start_sample;
+  std::vector<DestResumeSeed> seeds(cfg.dests.size());
+  if (resume) {
+    const RecordingState& prior = resume->prior;
+    p.session_id = prior.session_id;
+    used_ids_.insert(p.session_id);
+    if (!prior.session_name.empty()) p.session_name = prior.session_name;
+    p.start_sample = prior.start_sample;
+    p.start_wall = WallTime{prior.start_utc_ms, prior.local_offset_min};
+    ring_start = std::max(resume->resume_sample, prior.start_sample);
+    std::vector<bool> taken(prior.dests.size());
+    for (size_t i = 0; i < cfg.dests.size(); ++i)
+      for (size_t j = 0; j < prior.dests.size(); ++j)
+        if (!taken[j] && prior.dests[j].name == cfg.dests[i].name) {
+          taken[j] = true;
+          seeds[i] = DestResumeSeed{std::max<uint32_t>(prior.dests[j].next_n, 1), prior.dests[j].manifest_path};
+          break;
+        }
+  } else {
+    const WallTime now = clock_.now();
+    p.session_id = next_session_id(now);
+    p.start_wall = now;
+  }
+  auto s = make_session(p, fmt, ring_start, std::move(seeds), err);
   if (!s) return false;
 
   handled_lost_ = lost_seq_.load(std::memory_order_acquire);  // events before this session do not count
@@ -122,11 +146,16 @@ bool SessionManager::start(const SessionConfig& cfg, const ResumeInfo* resume, s
     *err = L"Cannot start the input";
     return false;
   }
-  for (auto& d : s->dests) d->start(p.start_sample);
+  if (resume) post_all(*s, CmdGapEnd{ring_start, "crash"});  // queued ahead of everything else
+  for (auto& d : s->dests) d->start(ring_start);
   state_.store(SessionState::Recording);
-  log(Severity::Info, L"Session " + p.session_id + L" started (" + fmt_text(fmt) + L")");
+  recovered_.store(resume != nullptr);
+  log(Severity::Info, L"Session " + p.session_id + (resume ? L" resumed after a crash (" : L" started (") +
+                          fmt_text(fmt) + L")");
   quit_.store(false);
   start_steady_ = clock_.steady_ms();
+  saved_seq_ = 0;  // the manager thread saves the crash state at once
+  saved_dests_.clear();
   thread_ = std::thread([this] { run(); });
   return true;
 }
@@ -143,12 +172,33 @@ void SessionManager::stop() {
     stop_all(s->dests, s->ring->write_index(), "stop");
     log(Severity::Info, L"Session " + s->params.session_id + L" stopped");
   }
+  if (store_) store_->clear();
   state_.store(SessionState::Idle);
   std::vector<std::shared_ptr<Session>> old;
   {
     std::lock_guard<std::mutex> lk(sess_m_);
     old.swap(retired_);
   }
+}
+
+void SessionManager::abandon_for_test() {
+  if (!thread_.joinable()) return;
+  quit_.store(true);
+  thread_.join();
+  stop_filler();
+  src_.stop();
+  cap_ring_.store(nullptr);
+  std::shared_ptr<Session> s;
+  std::vector<std::shared_ptr<Session>> old;
+  {
+    std::lock_guard<std::mutex> lk(sess_m_);
+    s.swap(cur_);
+    old.swap(retired_);
+  }
+  // Every writer exits without finalizing; then the sessions (rings, meters) can go.
+  if (s)
+    for (auto& d : s->dests) d->abandon_for_test();
+  state_.store(SessionState::Idle);
 }
 
 void SessionManager::marker(uint32_t seconds_ago) {
@@ -194,7 +244,7 @@ SessionStats SessionManager::stats() const {
     if (ds.state == DestState::Writing || ds.state == DestState::FailingOver) slowest = std::min(slowest, ds.cursor);
   }
   st.ring_fill = std::clamp(double(st.position - slowest) / double(s->ring->capacity()), 0.0, 1.0);
-  st.recovered_from_crash = false;
+  st.recovered_from_crash = recovered_.load();
   return st;
 }
 
@@ -245,14 +295,18 @@ std::shared_ptr<SessionManager::Session> SessionManager::current() const {
 }
 
 std::shared_ptr<SessionManager::Session> SessionManager::make_session(const SessionParams& p, StreamFormat fmt,
+                                                                      SampleIndex ring_start,
+                                                                      std::vector<DestResumeSeed> seeds,
                                                                       std::wstring* err) {
   auto s = std::make_shared<Session>();
   s->params = p;
   s->fmt = fmt;
   s->seq = next_seq_++;
+  seeds.resize(cfg_.dests.size());
+  s->seeds = std::move(seeds);
   const size_t frames = size_t(std::max<uint32_t>(cfg_.ring_seconds, 1)) * fmt.sample_rate;
   try {
-    s->ring = std::make_unique<SampleRing>(fmt.channels, frames, p.start_sample);
+    s->ring = std::make_unique<SampleRing>(fmt.channels, frames, ring_start);
   } catch (const std::bad_alloc&) {
     *err = L"Not enough memory for the capture ring";
     return nullptr;
@@ -261,8 +315,9 @@ std::shared_ptr<SessionManager::Session> SessionManager::make_session(const Sess
     log(Severity::Warning, L"The capture ring could not be locked in memory; capture may glitch under memory pressure");
   s->meter = std::make_unique<MeterReader>(*s->ring, fmt.sample_rate, clock_);
   // A destination whose channel map does not fit the input disables itself (logged as an error).
-  for (const auto& d : cfg_.dests)
-    s->dests.push_back(std::make_unique<Destination>(d, s->params, *s->ring, fs_, clock_, log_));
+  for (size_t i = 0; i < cfg_.dests.size(); ++i)
+    s->dests.push_back(
+        std::make_unique<Destination>(cfg_.dests[i], s->params, *s->ring, fs_, clock_, log_, s->seeds[i]));
   return s;
 }
 
@@ -302,6 +357,9 @@ void SessionManager::run() {
     if (now - last_watchdog >= kWatchdogMs) {
       last_watchdog = now;
       watchdog(s);
+      save_state(s, now);
+    } else if (saved_seq_ != s.seq) {
+      save_state(s, now);  // a new session: at once
     }
     if (now - last_pair >= kClockPairMs) {
       last_pair = now;
@@ -412,10 +470,11 @@ void SessionManager::link_new_session(StreamFormat fmt, uint64_t steady_ms, Wall
   p.start_sample = 0;
   p.start_wall = wall;
   std::wstring err;
-  const auto s = fmt.sample_rate && fmt.channels ? make_session(p, fmt, &err) : nullptr;
+  const auto s = fmt.sample_rate && fmt.channels ? make_session(p, fmt, p.start_sample, {}, &err) : nullptr;
   if (!s) {
     cap_ring_.store(nullptr);
     state_.store(SessionState::Idle);
+    if (store_) store_->clear();  // nothing to resume: the session has ended
     log(Severity::Error, L"Cannot start the linked session: " + (err.empty() ? L"the input has no format" : err));
     return;
   }
@@ -444,6 +503,42 @@ void SessionManager::watchdog(Session& s) {
   const SampleIndex wi = s.ring->write_index();
   for (auto& d : s.dests)
     if (is_stalled(wi, d->progress(), s.ring->capacity(), s.params.stall_percent)) d->declare_stalled();
+}
+
+// The crash state (§8.5): written every flush_ms of steady time, and as soon as a file or
+// manifest changes (rotation, failover) or a linked session replaces this one.
+void SessionManager::save_state(Session& s, uint64_t steady_ms) {
+  if (!store_ || state_.load() == SessionState::Idle) {
+    saved_seq_ = s.seq;  // nothing to keep
+    return;
+  }
+  RecordingState r;
+  r.recording = true;
+  r.session_id = s.params.session_id;
+  r.session_name = s.params.session_name;
+  r.start_sample = s.params.start_sample;
+  r.start_utc_ms = s.params.start_wall.utc_ms;
+  r.local_offset_min = s.params.start_wall.local_offset_min;
+  r.rate = s.fmt.sample_rate;
+  r.channels = s.fmt.channels;
+  std::vector<std::pair<uint32_t, std::wstring>> now_dests;
+  for (size_t i = 0; i < s.dests.size(); ++i) {
+    const DestStatus ds = s.dests[i]->status();
+    const DestResumeSeed& seed = s.seeds[i];
+    // Before its first file (or manifest) a resumed destination still continues the seed's.
+    const uint32_t next_n = ds.n ? ds.n + 1 : seed.first_n;
+    const std::wstring man = ds.manifest_path.empty() ? seed.prev_manifest : ds.manifest_path;
+    r.dests.push_back(DestResume{ds.name, man, next_n});
+    now_dests.emplace_back(next_n, man);
+  }
+  const bool due = saved_seq_ != s.seq || steady_ms - saved_steady_ >= s.params.flush_ms || now_dests != saved_dests_;
+  if (!due) return;
+  r.last_sample = s.ring->write_index();
+  r.last_utc_ms = clock_.now().utc_ms;
+  store_->save(r);
+  saved_seq_ = s.seq;
+  saved_steady_ = steady_ms;
+  saved_dests_ = std::move(now_dests);
 }
 
 // ---- silence filler ----

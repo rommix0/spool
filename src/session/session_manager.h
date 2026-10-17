@@ -3,7 +3,8 @@
 // destinations and a meter reader. Its manager thread drains the UI command queue every
 // 10 ms, runs the stall watchdog every 250 ms and posts a clock pair every 5 min (§8.6).
 // It handles input-device loss with a silence fill, its cap and the jump on return, and a
-// format change with a linked new session (§5.3).
+// format change with a linked new session (§5.3). With a StateStore it keeps the crash
+// state up to date and resumes a crashed session (§8.5).
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -22,6 +23,7 @@
 #include "session/event_log.h"
 #include "session/meter.h"
 #include "session/preflight.h"
+#include "session/recovery.h"
 
 namespace sl {
 
@@ -45,8 +47,6 @@ struct SessionStats {
   bool recovered_from_crash;
 };
 
-struct ResumeInfo;  // Task 13
-
 class SessionManager : CaptureCallbacks {
  public:
   // The source must be open; its format() is the session's format. All references must
@@ -58,13 +58,23 @@ class SessionManager : CaptureCallbacks {
 
   // The UI thread calls everything below.
   PreflightResult preflight(const SessionConfig&);
-  // A new session with id yyyymmdd-hhmmss (local start time). Only resume == nullptr is
-  // supported here. Does not run preflight: destinations without a usable folder start in
-  // LastResort.
+  // Crash state (§8.5): saved by the manager thread every flush_ms of steady time and
+  // whenever a destination's file or manifest changes; cleared by stop(). Set before start().
+  void set_state_store(StateStore*);
+  // A new session with id yyyymmdd-hhmmss (local start time). Does not run preflight:
+  // destinations without a usable folder start in LastResort.
+  // With a resume (after repair_open_files): the crashed session continues with the same
+  // id, name, start_sample and start_wall; the ring starts at resume_sample; each
+  // destination (matched by name) continues its {n} and its manifest, which gets
+  // gap_end(crash); stats().recovered_from_crash is true. Fails if the input format is not
+  // the crashed session's.
   bool start(const SessionConfig&, const ResumeInfo* resume, std::wstring* err);
   // Stops capture, then every destination in parallel (one shared ~3 s budget even with
   // several hung drives).
   void stop();
+  // Test hook (crash simulation): stops every thread without finalizing, flushing or
+  // clearing anything; encoders and manifests are leaked unclosed.
+  void abandon_for_test();
   void marker(uint32_t seconds_ago);  // at max(start_sample, write_index - s*rate), named "Marker N"
   void split();                       // at write_index
   void append_folder(size_t dest, std::wstring path);  // also kept for a linked session
@@ -94,7 +104,8 @@ class SessionManager : CaptureCallbacks {
   void on_device_returned(StreamFormat fmt) override;
 
   std::shared_ptr<Session> current() const;
-  std::shared_ptr<Session> make_session(const SessionParams&, StreamFormat, std::wstring* err);
+  std::shared_ptr<Session> make_session(const SessionParams&, StreamFormat, SampleIndex ring_start,
+                                        std::vector<DestResumeSeed> seeds, std::wstring* err);
   std::wstring next_session_id(WallTime);
   void push(UiCommand);
   void log(Severity, std::wstring text);
@@ -108,6 +119,7 @@ class SessionManager : CaptureCallbacks {
   void link_new_session(StreamFormat fmt, uint64_t steady_ms, WallTime wall);
   void restart_capture(Session&, uint64_t steady_ms);
   void watchdog(Session&);
+  void save_state(Session&, uint64_t steady_ms);  // if due or changed
   void post_all(Session&, const DestCommand&);
   // Silence filler (§5.3): the ring's only producer while the input is lost.
   void start_filler(Session&);
@@ -145,6 +157,12 @@ class SessionManager : CaptureCallbacks {
   std::vector<float> zeros_;
   std::atomic<bool> filler_quit_{false};
   std::thread filler_;
+
+  // Crash state (manager thread while running).
+  StateStore* store_ = nullptr;
+  uint64_t saved_seq_ = 0, saved_steady_ = 0;
+  std::vector<std::pair<uint32_t, std::wstring>> saved_dests_;  // next n and manifest at the last save
+  std::atomic<bool> recovered_{false};
 
   SpscQueue<UiCommand, 256> ui_q_;
   std::atomic<bool> quit_{false};

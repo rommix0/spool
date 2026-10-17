@@ -328,3 +328,107 @@ TEST(wav_open_rejects_bad_params_and_existing_file) {
   CHECK(open_wav(fs, kPath, WavParams{48000, 2}, &err) == nullptr);  // never overwrite
   CHECK(!err.empty());
 }
+
+namespace {
+
+// Counts read_at calls on the wrapped file.
+class CountingFile final : public IFile {
+ public:
+  explicit CountingFile(std::unique_ptr<IFile> f) : f_(std::move(f)) {}
+  bool write(const void* p, size_t n) override { return f_->write(p, n); }
+  bool write_at(uint64_t off, const void* p, size_t n) override { return f_->write_at(off, p, n); }
+  bool read_at(uint64_t off, void* p, size_t n) override {
+    ++reads;
+    return f_->read_at(off, p, n);
+  }
+  bool flush() override { return f_->flush(); }
+  uint64_t size() const override { return f_->size(); }
+  void close() override { f_->close(); }
+  size_t reads = 0;
+
+ private:
+  std::unique_ptr<IFile> f_;
+};
+
+// A crashed file: `flushed` frames claimed by the header, `extra` more written after it.
+void crashed_wav(FaultFileSystem& fs, const WavParams& p, size_t flushed, size_t extra) {
+  auto w = open(fs, p);
+  if (!w) return;
+  const auto a = ramp(0, flushed, p.channels), b = ramp(flushed, extra, p.channels);
+  CHECK(w->write(a.data(), flushed));
+  CHECK(w->flush());
+  if (extra) CHECK(w->write(b.data(), extra));
+  w->abandon();
+}
+
+}  // namespace
+
+// Task 5 follow-up: an unflushed all-zero tail must not be walked as millions of 8-byte
+// chunks; the walk stops at the first chunk id that is not printable ASCII.
+TEST(wav_reader_stops_at_garbage_tail) {
+  FaultFileSystem fs;
+  crashed_wav(fs, WavParams{48000, 2}, 1000, 0);
+  std::wstring err;
+  {
+    auto f = fs.open_existing(kPath, &err);
+    CHECK(f != nullptr);
+    if (!f) return;
+    const std::vector<uint8_t> zeros(2u << 20, 0);
+    CHECK(f->write(zeros.data(), zeros.size()));
+    f->close();
+  }
+  auto raw = fs.open_existing(kPath, &err);
+  CHECK(raw != nullptr);
+  if (!raw) return;
+  CountingFile f(std::move(raw));
+  const auto info = read_wav_info(f);
+  CHECK(info.has_value());
+  if (info) CHECK_EQ(info->frames, 1000u);
+  CHECK(f.reads < 20);
+  const auto r = repair_wav(fs, kPath, &err);
+  CHECK(r.has_value());
+  if (r) CHECK_EQ(*r, 1000u + (2u << 20) / 4);
+}
+
+// A failed-over file: its header is capped at max_frames, the rest becomes a JUNK chunk.
+TEST(wav_repair_caps_at_max_frames) {
+  FaultFileSystem fs;
+  crashed_wav(fs, WavParams{48000, 2}, 1000, 333);
+  std::wstring err;
+  const auto r = repair_wav(fs, kPath, &err, 1200);
+  CHECK(r.has_value());
+  if (r) CHECK_EQ(*r, 1200u);
+  const auto info = info_of(fs);
+  CHECK(info.has_value());
+  if (!info) return;
+  CHECK_EQ(info->frames, 1200u);
+  const auto bytes = fs.contents(kPath);
+  CHECK_EQ(le32(bytes, 4), uint32_t(bytes.size() - 8));
+  const size_t junk = size_t(info->data_offset + info->data_bytes);
+  CHECK(bytes.size() > junk + 8 && std::memcmp(bytes.data() + junk, "JUNK", 4) == 0);
+  CHECK_EQ(size_t(le32(bytes, junk + 4)) + junk + 8, bytes.size());
+  // A cap beyond the physical length repairs to the physical length.
+  FaultFileSystem fs2;
+  crashed_wav(fs2, WavParams{48000, 2}, 1000, 333);
+  const auto r2 = repair_wav(fs2, kPath, &err, 5000);
+  CHECK(r2.has_value());
+  if (r2) CHECK_EQ(*r2, 1333u);
+}
+
+TEST(wav_repair_cap_pads_odd_data) {
+  FaultFileSystem fs;
+  crashed_wav(fs, WavParams{48000, 1, WavDepth::Int24}, 2, 3);
+  std::wstring err;
+  const auto r = repair_wav(fs, kPath, &err, 3);
+  CHECK(r.has_value());
+  if (r) CHECK_EQ(*r, 3u);
+  const auto info = info_of(fs);
+  CHECK(info.has_value());
+  if (!info) return;
+  CHECK_EQ(info->data_bytes, 9u);
+  const auto bytes = fs.contents(kPath);
+  const size_t junk = size_t(info->data_offset) + 10;
+  CHECK(bytes.size() >= junk + 8 && std::memcmp(bytes.data() + junk, "JUNK", 4) == 0);
+  CHECK_EQ(le32(bytes, 4), uint32_t(bytes.size() - 8));
+  CHECK(bytes.size() % 2 == 0);
+}

@@ -29,6 +29,15 @@ uint64_t get64(const uint8_t* p) {
   return x;
 }
 
+// RIFF chunk ids are four printable ASCII characters. Anything else is audio or an
+// unflushed (often all-zero) crash tail: the walk stops there instead of stepping through
+// it 8 bytes at a time.
+bool is_chunk_id(const uint8_t* p) {
+  for (int i = 0; i < 4; ++i)
+    if (p[i] < 0x20 || p[i] > 0x7E) return false;
+  return true;
+}
+
 std::string text_field(const uint8_t* p, size_t width) {
   size_t n = 0;
   while (n < width && p[n]) ++n;
@@ -73,7 +82,7 @@ std::optional<WavInfo> read_wav_info(IFile& f) {
   uint64_t pos = 12;
   while (pos + 8 <= fsize) {
     uint8_t ch[8];
-    if (!f.read_at(pos, ch, 8)) break;
+    if (!f.read_at(pos, ch, 8) || !is_chunk_id(ch)) break;
     const uint32_t size32 = get32(ch + 4);
     const uint64_t payload = pos + 8;
     const uint64_t avail = fsize - payload;

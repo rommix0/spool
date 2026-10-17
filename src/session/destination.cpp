@@ -1280,6 +1280,23 @@ void Destination::declare_stalled() {
                            L"; continuing from the last confirmed sample");
 }
 
+void Destination::abandon_for_test() {
+  Core& k = *core_;
+  {
+    std::unique_lock<std::shared_mutex> lv(k.live);
+    std::lock_guard<std::mutex> lk(k.m);
+    ++k.generation;    // the writer is stale: it abandons its encoder and exits at its next check
+    writer_ = nullptr;  // leaked with its encoder and manifest, like a stalled one
+    k.set_state_locked(DestState::Stopped);
+  }
+  if (!thread_.joinable()) return;
+  if (WaitForSingleObject(thread_.native_handle(), kStopBudgetMs) == WAIT_OBJECT_0) {
+    thread_.join();
+  } else {
+    thread_.detach();  // stuck in file I/O
+  }
+}
+
 void Destination::disable(std::wstring reason) {
   {
     std::lock_guard<std::mutex> lk(core_->m);
