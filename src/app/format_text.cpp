@@ -1,7 +1,10 @@
 #include "app/format_text.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cwchar>
+
+#include "core/clock.h"
 
 namespace sl {
 
@@ -9,6 +12,7 @@ namespace {
 
 constexpr wchar_t kDot[] = L" · ";   // middle dot
 constexpr wchar_t kDash[] = L"–";    // en dash
+constexpr wchar_t kEmDash[] = L"—";  // unknown value
 
 // Whole units of v, never negative; NaN counts as 0.
 int64_t whole(double v) { return v > 0 ? int64_t(std::floor(v)) : 0; }
@@ -58,6 +62,31 @@ std::wstring format_summary(const DestinationConfig& d, uint16_t input_channels)
   }
   if (chs.empty()) return fmt;
   return fmt + kDot + L"ch " + channel_text(chs);
+}
+
+std::wstring format_input_line(const std::wstring& device, StreamFormat fmt, CaptureMode mode) {
+  std::wstring khz = std::to_wstring(fmt.sample_rate / 1000);
+  if (const uint32_t tenths = fmt.sample_rate % 1000 / 100) khz += L"." + std::to_wstring(tenths);
+  return device + kDot + khz + L" kHz" + kDot + std::to_wstring(fmt.channels) + L" ch" + kDot +
+         (mode == CaptureMode::Exclusive ? L"Exclusive" : L"Raw");
+}
+
+std::wstring format_buffer_line(double fill, uint64_t gaps, uint64_t discontinuities) {
+  const double pct = fill > 0 ? std::min(fill, 1.0) * 100 : 0;  // NaN -> 0
+  return L"Buffer " + std::to_wstring(int64_t(std::lround(pct))) + L"%" + kDot + L"Gaps " +
+         std::to_wstring(gaps) + kDot + L"Discontinuities " + std::to_wstring(discontinuities);
+}
+
+std::wstring format_folder_time_left(std::optional<uint64_t> free_bytes, uint64_t bytes_per_s) {
+  if (!free_bytes || bytes_per_s == 0) return kEmDash;
+  return format_time_left(double(*free_bytes) / double(bytes_per_s) / 3600.0);
+}
+
+std::wstring format_clock(WallTime t) {
+  const LocalParts p = local_parts(t);
+  wchar_t buf[16];
+  swprintf(buf, 16, L"%02d:%02d:%02d", p.hour, p.minute, p.second);
+  return buf;
 }
 
 }  // namespace sl

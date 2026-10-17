@@ -40,6 +40,10 @@ file(GLOB SL_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/*.cpp)
 add_executable(sl_tests ${SL_TEST_SOURCES})
 target_link_libraries(sl_tests PRIVATE sl_core)
 
-# ---- sound_logger (enabled in Task 16) ----
-# add_executable(sound_logger WIN32 ...)
-# target_link_libraries(sound_logger PRIVATE sl_core)
+# ---- sound_logger: the dashboard app (window code only; settings/format_text are in sl_core) ----
+file(GLOB SL_APP_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/app/*.cpp)
+list(REMOVE_ITEM SL_APP_SOURCES ${SL_APP_CORE_SOURCES})
+add_executable(sound_logger WIN32 ${SL_APP_SOURCES}
+  src/app/sound_logger.rc
+  src/app/app.manifest)
+target_link_libraries(sound_logger PRIVATE sl_core comctl32 ole32 avrt uuid shell32)

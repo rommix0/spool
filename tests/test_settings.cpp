@@ -304,3 +304,41 @@ TEST(text_summary) {
   o.opus_bitrate = 48000;
   CHECK(format_summary(o, 2) == L"Opus 48k \u00B7 ch 1");
 }
+
+TEST(text_input_line) {
+  CHECK(format_input_line(L"USB mic", StreamFormat{48000, 2}, CaptureMode::Raw) ==
+        L"USB mic · 48 kHz · 2 ch · Raw");
+  CHECK(format_input_line(L"Interface", StreamFormat{44100, 8}, CaptureMode::Exclusive) ==
+        L"Interface · 44.1 kHz · 8 ch · Exclusive");
+  CHECK(format_input_line(L"X", StreamFormat{176400, 1}, CaptureMode::Raw) ==
+        L"X · 176.4 kHz · 1 ch · Raw");
+  CHECK(format_input_line(L"X", StreamFormat{192000, 2}, CaptureMode::Raw) ==
+        L"X · 192 kHz · 2 ch · Raw");
+}
+
+TEST(text_buffer_line) {
+  CHECK(format_buffer_line(0.0, 0, 0) == L"Buffer 0% · Gaps 0 · Discontinuities 0");
+  CHECK(format_buffer_line(0.034, 2, 17) == L"Buffer 3% · Gaps 2 · Discontinuities 17");
+  CHECK(format_buffer_line(0.996, 0, 0) == L"Buffer 100% · Gaps 0 · Discontinuities 0");
+  CHECK(format_buffer_line(1.5, 0, 0) == L"Buffer 100% · Gaps 0 · Discontinuities 0");
+  CHECK(format_buffer_line(-0.2, 0, 0) == L"Buffer 0% · Gaps 0 · Discontinuities 0");
+  CHECK(format_buffer_line(std::nan(""), 0, 0) == L"Buffer 0% · Gaps 0 · Discontinuities 0");
+}
+
+TEST(text_folder_time_left) {
+  const uint64_t rate = 192000;  // 48 kHz, 2 ch, 16-bit
+  CHECK(format_folder_time_left(std::nullopt, rate) == L"—");
+  CHECK(format_folder_time_left(uint64_t(1) << 40, 0) == L"—");
+  CHECK(format_folder_time_left(std::nullopt, 0) == L"—");
+  CHECK(format_folder_time_left(rate * 3600 * 31, rate) == L"31 h left");
+  CHECK(format_folder_time_left(rate * 60 * 45, rate) == L"45 min left");
+  CHECK(format_folder_time_left(0, rate) == L"0 min left");
+  CHECK(format_folder_time_left(UINT64_MAX, 1) == std::to_wstring(UINT64_MAX / 3600) + L" h left");
+}
+
+TEST(text_clock) {
+  const int64_t t = (14 * 3600 + 30 * 60 + 5) * 1000LL + 999;
+  CHECK(format_clock(WallTime{t, 0}) == L"14:30:05");
+  CHECK(format_clock(WallTime{t + 240 * 60000LL, -240}) == L"14:30:05");
+  CHECK(format_clock(WallTime{86400000LL + 2 * 3600000LL, -240}) == L"22:00:00");
+}
