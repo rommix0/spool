@@ -1,17 +1,14 @@
 #include "app/dest_panel.h"
 
-#include <shobjidl.h>
 #include <windowsx.h>
-#include <wrl/client.h>
 
 #include <algorithm>
 
+#include "app/folder_picker.h"
 #include "app/format_text.h"
 #include "app/resource.h"
 
 namespace sl {
-
-using Microsoft::WRL::ComPtr;
 
 namespace {
 
@@ -44,24 +41,6 @@ std::wstring file_name(const std::wstring& path) {
   return slash == std::wstring::npos ? path : path.substr(slash + 1);
 }
 
-// The folder picked in a modal folder dialog, or empty if cancelled or failed.
-std::wstring pick_folder(HWND owner) {
-  ComPtr<IFileOpenDialog> dlg;
-  if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg))))
-    return {};
-  FILEOPENDIALOGOPTIONS opts = 0;
-  dlg->GetOptions(&opts);
-  dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
-  if (FAILED(dlg->Show(owner))) return {};
-  ComPtr<IShellItem> item;
-  if (FAILED(dlg->GetResult(&item))) return {};
-  PWSTR p = nullptr;
-  if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &p)) || !p) return {};
-  std::wstring out = p;
-  CoTaskMemFree(p);
-  return out;
-}
-
 void fill(HDC dc, const RECT& r, COLORREF c) {
   SetDCBrushColor(dc, c);
   FillRect(dc, &r, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
@@ -84,15 +63,17 @@ DestPanel::~DestPanel() {
 }
 
 HWND DestPanel::create(HWND parent, int id, HINSTANCE inst) {
-  return CreateWindowExW(0, kClass, L"", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, parent,
+  return CreateWindowExW(0, kClass, L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL, 0, 0, 0, 0, parent,
                          reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), inst, this);
 }
 
 void DestPanel::set_status(const std::vector<DestStatus>& v, StreamFormat input, bool live) {
   std::vector<Block> blocks;
   blocks.reserve(v.size());
-  for (const DestStatus& d : v) {
+  for (size_t i = 0; i < v.size(); ++i) {
+    const DestStatus& d = v[i];
     Block b;
+    b.index = i;
     b.name = d.name;
     b.summary = format_summary(d.config, input.channels);
     b.file = d.current_file.empty() ? L"—" : file_name(d.current_file);
@@ -104,9 +85,17 @@ void DestPanel::set_status(const std::vector<DestStatus>& v, StreamFormat input,
     else if (d.needs_ack) b.tone = Tone::Amber;
     blocks.push_back(std::move(b));
   }
+  // Red, then amber, then the rest, each in list order, so trouble is never scrolled away.
+  const auto rank = [](const Block& b) { return b.tone == Tone::Red ? 0 : b.tone == Tone::Amber ? 1 : 2; };
+  std::stable_sort(blocks.begin(), blocks.end(), [&](const Block& a, const Block& b) { return rank(a) < rank(b); });
+  const auto attention = [](const std::vector<Block>& bs) {
+    return std::count_if(bs.begin(), bs.end(), [](const Block& b) { return b.tone != Tone::Neutral; });
+  };
   live_ = live;
   if (blocks == blocks_) return;
+  if (attention(blocks) > attention(blocks_)) top_ = 0;  // a new problem: show it
   blocks_ = std::move(blocks);
+  update_scroll();
   if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -118,6 +107,61 @@ int DestPanel::block_height(const Block& b) const {
   return 2 * px(kPad) + int(2 + b.folders.size()) * line_height();
 }
 
+size_t DestPanel::max_top() const {
+  if (blocks_.empty() || !hwnd_) return 0;
+  RECT c;
+  GetClientRect(hwnd_, &c);
+  int h = 0;
+  size_t top = blocks_.size();
+  while (top > 0) {
+    const int add = block_height(blocks_[top - 1]) + (top < blocks_.size() ? px(kBlockGap) : 0);
+    if (h + add > c.bottom) break;
+    h += add;
+    --top;
+  }
+  return std::min(top, blocks_.size() - 1);
+}
+
+void DestPanel::update_scroll() {
+  if (!hwnd_) return;
+  const size_t last = max_top();
+  top_ = std::min(top_, last);
+  SCROLLINFO si{sizeof(si)};
+  si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+  si.nMin = 0;
+  si.nMax = blocks_.empty() ? 0 : int(blocks_.size()) - 1;
+  si.nPage = UINT(std::max<size_t>(1, blocks_.size() - last));  // all blocks fit: no scrollbar
+  si.nPos = int(top_);
+  SetScrollInfo(hwnd_, SB_VERT, &si, TRUE);
+}
+
+void DestPanel::scroll_to(size_t top) {
+  top = std::min(top, max_top());
+  if (top == top_) return;
+  top_ = top;
+  SetScrollPos(hwnd_, SB_VERT, int(top_), TRUE);
+  InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void DestPanel::on_vscroll(int code) {
+  const size_t page = std::max<size_t>(1, blocks_.size() - max_top());
+  switch (code) {
+    case SB_LINEUP: scroll_to(top_ ? top_ - 1 : 0); break;
+    case SB_LINEDOWN: scroll_to(top_ + 1); break;
+    case SB_PAGEUP: scroll_to(top_ > page ? top_ - page : 0); break;
+    case SB_PAGEDOWN: scroll_to(top_ + page); break;
+    case SB_TOP: scroll_to(0); break;
+    case SB_BOTTOM: scroll_to(blocks_.size()); break;
+    case SB_THUMBTRACK:
+    case SB_THUMBPOSITION: {
+      SCROLLINFO si{sizeof(si)};
+      si.fMask = SIF_TRACKPOS;
+      if (GetScrollInfo(hwnd_, SB_VERT, &si)) scroll_to(size_t(std::max(0, si.nTrackPos)));
+      break;
+    }
+  }
+}
+
 int DestPanel::preferred_height() const {
   int h = 0;
   for (size_t i = 0; i < blocks_.size(); ++i) h += block_height(blocks_[i]) + (i ? px(kBlockGap) : 0);
@@ -126,7 +170,7 @@ int DestPanel::preferred_height() const {
 
 int DestPanel::hit_test(POINT p) const {
   int y = 0;
-  for (size_t i = 0; i < blocks_.size(); ++i) {
+  for (size_t i = top_; i < blocks_.size(); ++i) {
     const int h = block_height(blocks_[i]);
     if (p.y >= y && p.y < y + h) return int(i);
     y += h + px(kBlockGap);
@@ -135,7 +179,7 @@ int DestPanel::hit_test(POINT p) const {
 }
 
 void DestPanel::context_menu(POINT screen) {
-  int i = 0;
+  int i = int(top_);
   if (screen.x == -1 && screen.y == -1) {  // from the keyboard: the first block
     RECT r;
     GetWindowRect(hwnd_, &r);
@@ -146,6 +190,8 @@ void DestPanel::context_menu(POINT screen) {
     i = hit_test(c);
   }
   if (i < 0 || size_t(i) >= blocks_.size()) return;
+  // Blocks can re-sort while the menu or the folder picker is up: keep the destination's index.
+  const size_t dest = blocks_[size_t(i)].index;
   HMENU m = CreatePopupMenu();
   if (!m) return;
   const std::wstring text = L"Add folder to \"" + blocks_[size_t(i)].name + L"\"…";
@@ -155,7 +201,7 @@ void DestPanel::context_menu(POINT screen) {
   DestroyMenu(m);
   if (cmd != IDM_ADD_FOLDER) return;
   const std::wstring path = pick_folder(GetAncestor(hwnd_, GA_ROOT));
-  if (!path.empty() && on_add_) on_add_(size_t(i), path);
+  if (!path.empty() && on_add_) on_add_(dest, path);
 }
 
 void DestPanel::set_font(HFONT f) {
@@ -201,6 +247,7 @@ LRESULT DestPanel::handle(UINT msg, WPARAM wp, LPARAM lp) {
   switch (msg) {
     case WM_SETFONT:
       set_font(reinterpret_cast<HFONT>(wp));
+      update_scroll();  // block heights follow the font
       if (LOWORD(lp)) InvalidateRect(hwnd_, nullptr, FALSE);
       return 0;
     case WM_GETFONT:
@@ -208,7 +255,16 @@ LRESULT DestPanel::handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ERASEBKGND:
       return 1;
     case WM_SIZE:
+      update_scroll();
       InvalidateRect(hwnd_, nullptr, FALSE);
+      return 0;
+    case WM_VSCROLL:
+      on_vscroll(LOWORD(wp));
+      return 0;
+    case WM_MOUSEWHEEL:
+      wheel_ += GET_WHEEL_DELTA_WPARAM(wp);
+      for (; wheel_ >= WHEEL_DELTA; wheel_ -= WHEEL_DELTA) on_vscroll(SB_LINEUP);
+      for (; wheel_ <= -WHEEL_DELTA; wheel_ += WHEEL_DELTA) on_vscroll(SB_LINEDOWN);
       return 0;
     case WM_CONTEXTMENU:
       context_menu(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
@@ -251,7 +307,8 @@ void DestPanel::paint(HDC dc, const RECT& c) const {
   constexpr UINT kOne = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
 
   int y = 0;
-  for (const Block& b : blocks_) {
+  for (size_t i = top_; i < blocks_.size() && y < c.bottom; ++i) {
+    const Block& b = blocks_[i];
     const int h = block_height(b);
     const RECT box{0, y, c.right, y + h};
     const COLORREF bg = b.tone == Tone::Red ? kRed : b.tone == Tone::Amber ? kAmber : kNeutral;

@@ -1,5 +1,6 @@
 #pragma code_page(65001)
 #include <winresrc.h>
+#include <commctrl.h>
 
 #include "resource.h"
 
@@ -8,6 +9,83 @@ IDR_ACCEL ACCELERATORS
 BEGIN
   "M", IDM_MARKER_NOW, VIRTKEY
   "S", IDM_SPLIT, VIRTKEY
+END
+
+// Settings (spec 10.5). Dialog units scale with the font and the monitor DPI. Tab order is the
+// order below; each label precedes its control so its & accelerator focuses that control.
+IDD_SETTINGS DIALOGEX 0, 0, 330, 321
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Settings"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+  GROUPBOX        "Input", -1, 7, 4, 316, 82
+  LTEXT           "&Device:", -1, 15, 19, 88, 8
+  COMBOBOX        IDC_S_DEVICE, 105, 17, 210, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+  LTEXT           "&Mode:", -1, 15, 35, 88, 8
+  COMBOBOX        IDC_S_MODE, 105, 33, 140, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+  LTEXT           "Sample &rate:", IDC_S_RATE_LABEL, 15, 51, 88, 8
+  COMBOBOX        IDC_S_RATE, 105, 49, 80, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+  LTEXT           "", IDC_S_RATE_NOTE, 105, 51, 210, 8, SS_NOPREFIX | SS_ENDELLIPSIS
+  LTEXT           "R&ing length (s):", -1, 15, 67, 88, 8
+  EDITTEXT        IDC_S_RING, 105, 65, 40, 12, ES_NUMBER | ES_AUTOHSCROLL
+
+  GROUPBOX        "Destinations", -1, 7, 90, 316, 94
+  CONTROL         "", IDC_S_DESTS, "SysListView32",
+                  LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER | WS_BORDER | WS_TABSTOP,
+                  15, 103, 240, 74
+  PUSHBUTTON      "&Add…", IDC_S_DEST_ADD, 263, 103, 52, 14
+  PUSHBUTTON      "&Edit…", IDC_S_DEST_EDIT, 263, 120, 52, 14
+  PUSHBUTTON      "Remo&ve", IDC_S_DEST_REMOVE, 263, 137, 52, 14
+
+  GROUPBOX        "General", -1, 7, 188, 316, 106
+  LTEXT           "Session &name:", -1, 15, 203, 88, 8
+  EDITTEXT        IDC_S_SESSION, 105, 201, 140, 12, ES_AUTOHSCROLL
+  LTEXT           "&Flush interval (s):", -1, 15, 219, 88, 8
+  EDITTEXT        IDC_S_FLUSH, 105, 217, 40, 12, ES_NUMBER | ES_AUTOHSCROLL
+  LTEXT           "&Low-water mark (min):", -1, 15, 235, 88, 8
+  EDITTEXT        IDC_S_LOW_WATER, 105, 233, 40, 12, ES_NUMBER | ES_AUTOHSCROLL
+  LTEXT           "S&tall threshold (%):", -1, 15, 251, 88, 8
+  EDITTEXT        IDC_S_STALL, 105, 249, 40, 12, ES_NUMBER | ES_AUTOHSCROLL
+  AUTOCHECKBOX    "&Start recording when the program opens", IDC_S_AUTOSTART, 15, 266, 300, 10, WS_TABSTOP
+  AUTOCHECKBOX    "Global marker &hotkey (Ctrl+Alt+M)", IDC_S_HOTKEY, 15, 279, 300, 10, WS_TABSTOP
+
+  DEFPUSHBUTTON   "OK", IDOK, 219, 300, 50, 14
+  PUSHBUTTON      "Cancel", IDCANCEL, 273, 300, 50, 14
+END
+
+// One destination: format, channel map, folder chain, rotation and name template.
+IDD_DEST DIALOGEX 0, 0, 300, 265
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Destination"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+  LTEXT           "&Name:", -1, 7, 9, 66, 8
+  EDITTEXT        IDC_D_NAME, 75, 7, 150, 12, ES_AUTOHSCROLL
+  LTEXT           "&Format:", -1, 7, 25, 66, 8
+  COMBOBOX        IDC_D_FORMAT, 75, 23, 80, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+  LTEXT           "&Bit depth:", IDC_D_DEPTH_LABEL, 7, 41, 66, 8
+  COMBOBOX        IDC_D_DEPTH, 75, 39, 80, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+  LTEXT           "Bit&rate:", IDC_D_BITRATE_LABEL, 7, 41, 66, 8
+  COMBOBOX        IDC_D_BITRATE, 75, 39, 80, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+  LTEXT           "&Channels:", -1, 7, 57, 66, 8
+  CONTROL         "", IDC_D_CHANNELS, "SysListView32",
+                  LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP,
+                  75, 55, 80, 66
+  LTEXT           "Fo&lders:", -1, 7, 129, 66, 8
+  LISTBOX         IDC_D_FOLDERS, 75, 127, 161, 65,
+                  LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_HSCROLL | WS_BORDER | WS_TABSTOP
+  PUSHBUTTON      "&Add…", IDC_D_FOLDER_ADD, 241, 127, 52, 14
+  PUSHBUTTON      "Remo&ve", IDC_D_FOLDER_REMOVE, 241, 144, 52, 14
+  PUSHBUTTON      "&Up", IDC_D_FOLDER_UP, 241, 161, 52, 14
+  PUSHBUTTON      "Do&wn", IDC_D_FOLDER_DOWN, 241, 178, 52, 14
+  LTEXT           "R&otation:", -1, 7, 199, 66, 8
+  COMBOBOX        IDC_D_ROTATION, 75, 197, 80, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+  LTEXT           "Name &template:", -1, 7, 215, 66, 8
+  EDITTEXT        IDC_D_TEMPLATE, 75, 213, 218, 12, ES_AUTOHSCROLL
+  LTEXT           "", IDC_D_PREVIEW, 75, 228, 218, 8, SS_NOPREFIX | SS_ENDELLIPSIS
+
+  DEFPUSHBUTTON   "OK", IDOK, 189, 244, 50, 14
+  PUSHBUTTON      "Cancel", IDCANCEL, 243, 244, 50, 14
 END
 
 VS_VERSION_INFO VERSIONINFO

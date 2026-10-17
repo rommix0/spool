@@ -61,6 +61,7 @@ class MainWindow {
   void settings();
   void marker_menu(const RECT& button_screen);
   void add_folder(size_t dest, std::wstring path);
+  void update_hotkey();  // registers or releases Ctrl+Alt+M to match the settings
 
   void tick();          // 33 ms
   void refresh_slow();  // 4 Hz
@@ -82,6 +83,8 @@ class MainWindow {
   HWND hwnd_ = nullptr;
   HACCEL accel_ = nullptr;
   bool hotkey_ = false;
+  bool show_config_ = false;
+  HWND focus_ = nullptr;      // the focused child when the window was last deactivated  // idle panel shows the configured destinations (settings changed)
 
   HWND record_ = nullptr, stop_ = nullptr, clock_ = nullptr, device_ = nullptr;
   HWND marker_ = nullptr, split_ = nullptr, settings_ = nullptr;

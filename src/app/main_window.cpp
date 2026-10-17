@@ -6,6 +6,7 @@
 
 #include "app/format_text.h"
 #include "app/resource.h"
+#include "app/settings_dialog.h"
 #include "audio/wasapi_source.h"
 #include "core/clock.h"
 
@@ -147,6 +148,15 @@ LRESULT MainWindow::handle(UINT msg, WPARAM wp, LPARAM lp) {
       SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
       return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
     }
+    case WM_ACTIVATE:
+      // Keep the keyboard focus across message boxes and app switches (not a dialog class,
+      // so nothing else remembers it); refresh_slow() then moves it off a button it disables.
+      if (LOWORD(wp) == WA_INACTIVE) {
+        focus_ = GetFocus();
+      } else if (!HIWORD(wp)) {
+        SetFocus(focus_ && IsChild(hwnd_, focus_) && IsWindowEnabled(focus_) ? focus_ : hwnd_);
+      }
+      return 0;
     case WM_TIMER:
       if (wp == kTimerId) tick();
       return 0;
@@ -225,10 +235,7 @@ void MainWindow::on_create() {
   apply_fonts();
   update_device_name();
 
-  if (ctx_.settings.global_hotkey) {
-    hotkey_ = RegisterHotKey(hwnd_, kHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'M') != 0;
-    if (!hotkey_) warn(L"Couldn't register Ctrl+Alt+M. Another program may be using it.");
-  }
+  update_hotkey();
 
   tick();
   refresh_slow();
@@ -262,6 +269,7 @@ LRESULT MainWindow::on_notify(NMHDR* n) {
     return 0;
   }
   if (n->hwndFrom != events_) return 0;
+  if (n->code == LVN_ODFINDITEMW) return -1;  // no type-ahead: it would select a row
   if (n->code == LVN_GETDISPINFOW) {
     LVITEMW& it = reinterpret_cast<NMLVDISPINFOW*>(n)->item;
     if ((it.mask & LVIF_TEXT) && it.iItem >= 0 && size_t(it.iItem) < rows_.size() && it.cchTextMax > 0) {
@@ -353,6 +361,7 @@ void MainWindow::record() {
   }
   if (ctx_.wasapi && !ctx_.wasapi->raw_active())
     warn(L"Windows audio processing couldn't be turned off for this device.");
+  show_config_ = false;
   refresh_slow();
 }
 
@@ -379,7 +388,50 @@ void MainWindow::settings() {
     MessageBoxW(hwnd_, L"Stop recording to change settings.", kTitle, MB_OK | MB_ICONINFORMATION);
     return;
   }
-  // The settings dialog arrives with Task 17.
+  SettingsChoices choices;
+  if (ctx_.wasapi) {
+    choices.devices = list_capture_devices();
+    choices.default_device_id = default_capture_device_id();
+    choices.exclusive_rates = [](const std::wstring& id) { return exclusive_rates(id); };
+  } else {  // --synthetic: the test source is the only input
+    choices.devices = {DeviceInfo{ctx_.settings.input.device_id, ctx_.source_name, ctx_.source.format()}};
+    choices.default_device_id = ctx_.settings.input.device_id;
+    const uint32_t rate = ctx_.source.format().sample_rate;
+    choices.exclusive_rates = [rate](const std::wstring&) { return std::vector<uint32_t>{rate}; };
+  }
+  const std::wstring ini = settings_path();
+  AppSettings edited = ctx_.settings;
+  if (!run_settings_dialog(hwnd_, inst_, choices, ini, edited)) return;
+
+  // Saved: take the settings as stored, and reopen the input if it changed.
+  const CaptureConfig old_input = ctx_.settings.input;
+  ctx_.settings = load_settings(ini);
+  const CaptureConfig& in = ctx_.settings.input;
+  const bool input_changed = in.device_id != old_input.device_id || in.mode != old_input.mode ||
+                             (in.mode == CaptureMode::Exclusive && in.sample_rate != old_input.sample_rate);
+  if (input_changed && ctx_.wasapi) {
+    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    std::wstring err;
+    if (!ctx_.source.open(in, &err))
+      ctx_.log.add(Severity::Error, system_clock().now(), L"", L"Can't open the input device: " + err);
+    SetCursor(old);
+    update_device_name();
+  }
+  update_hotkey();
+  show_config_ = true;
+  refresh_slow();
+}
+
+void MainWindow::update_hotkey() {
+  const bool want = ctx_.settings.global_hotkey;
+  if (want == hotkey_) return;
+  if (!want) {
+    UnregisterHotKey(hwnd_, kHotkeyId);
+    hotkey_ = false;
+    return;
+  }
+  hotkey_ = RegisterHotKey(hwnd_, kHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'M') != 0;
+  if (!hotkey_) warn(L"Couldn't register Ctrl+Alt+M. Another program may be using it.");
 }
 
 void MainWindow::marker_menu(const RECT& r) {
@@ -434,13 +486,17 @@ void MainWindow::refresh_slow() {
   set_text(device_, device_text_,
            fmt.sample_rate ? format_input_line(device_name_, fmt, ctx_.settings.input.mode) : L"No input device");
   set_text(buffer_, buffer_text_, format_buffer_line(st.ring_fill, st.gaps, st.discontinuities));
-  enable(record_, !rec);
-  enable(stop_, rec);
+  // Enable the partner first and hand it the focus, so disabling never strands the keyboard.
+  HWND on = rec ? stop_ : record_, off = rec ? record_ : stop_;
+  enable(on, true);
+  if (GetFocus() == off) SetFocus(on);
+  enable(off, false);
   enable(marker_, rec);
   enable(split_, rec);
 
   std::vector<DestStatus> ds = ctx_.mgr.dest_status();
-  if (ds.empty())  // no session yet: the configured destinations
+  if (ds.empty() || (!rec && show_config_)) {  // no session yet, or settings changed since: the configured ones
+    ds.clear();
     for (const DestinationConfig& c : ctx_.settings.dests) {
       DestStatus d{};
       d.name = c.name;
@@ -449,6 +505,7 @@ void MainWindow::refresh_slow() {
       for (const std::wstring& f : c.folders) d.folders.push_back(FolderStatus{f, FolderHealth::Standby, {}, 0.0});
       ds.push_back(std::move(d));
     }
+  }
   dests_.set_status(ds, fmt, rec);
   const bool ack = rec && std::any_of(ds.begin(), ds.end(), [](const DestStatus& d) { return d.needs_ack; });
   if (ack != ((GetWindowLongW(ack_, GWL_STYLE) & WS_VISIBLE) != 0)) ShowWindow(ack_, ack ? SW_SHOWNA : SW_HIDE);
