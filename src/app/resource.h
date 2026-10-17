@@ -49,6 +49,7 @@
 #define IDC_S_STALL 1014
 #define IDC_S_AUTOSTART 1015
 #define IDC_S_HOTKEY 1016
+#define IDC_S_RATE_NOTE_LABEL 1017
 
 // Destination editor controls.
 #define IDC_D_NAME 1101

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cwctype>
 
+#include "app/text_util.h"
 #include "io/ini_file.h"
 
 namespace sl {
@@ -111,10 +112,6 @@ bool ensure_dir(const std::wstring& dir) {
   return CreateDirectoryW(dir.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS;
 }
 
-bool eq_nocase(const std::wstring& a, const std::wstring& b) {
-  return CompareStringOrdinal(a.c_str(), int(a.size()), b.c_str(), int(b.size()), TRUE) == CSTR_EQUAL;
-}
-
 }  // namespace
 
 std::wstring settings_path() { return env(L"APPDATA") + L"\\SoundLogger\\settings.ini"; }
@@ -142,12 +139,16 @@ AppSettings load_settings(const std::wstring& ini) {
                                                                                           : CaptureMode::Raw;
   s.input.sample_rate = get_u32(ini, L"Input", L"sample_rate", 0, 0, 768000);
 
-  s.ring_seconds = get_u32(ini, L"General", L"ring_seconds", def.ring_seconds, 1, 3600);
+  s.ring_seconds = get_u32(ini, L"General", L"ring_seconds", def.ring_seconds, kRingSecondsRange.lo,
+                           kRingSecondsRange.hi);
   s.session_name = get_str(ini, L"General", L"session_name", def.session_name);
-  s.flush_seconds = get_u32(ini, L"General", L"flush_seconds", def.flush_seconds, 1, 3600);
-  s.low_water_minutes = get_u32(ini, L"General", L"low_water_minutes", def.low_water_minutes, 0, 100000);
+  s.flush_seconds = get_u32(ini, L"General", L"flush_seconds", def.flush_seconds, kFlushSecondsRange.lo,
+                            kFlushSecondsRange.hi);
+  s.low_water_minutes = get_u32(ini, L"General", L"low_water_minutes", def.low_water_minutes,
+                                kLowWaterMinutesRange.lo, kLowWaterMinutesRange.hi);
   s.low_water_min_gb = get_u32(ini, L"General", L"low_water_min_gb", def.low_water_min_gb, 0, 100000);
-  s.stall_percent = get_u32(ini, L"General", L"stall_percent", def.stall_percent, 1, 100);
+  s.stall_percent = get_u32(ini, L"General", L"stall_percent", def.stall_percent, kStallPercentRange.lo,
+                            kStallPercentRange.hi);
   s.start_on_launch = get_bool(ini, L"General", L"start_on_launch", def.start_on_launch);
   s.global_hotkey = get_bool(ini, L"General", L"global_hotkey", def.global_hotkey);
 

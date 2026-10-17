@@ -1,10 +1,9 @@
 #include "app/settings_model.h"
 
-#include <windows.h>
-
 #include <algorithm>
 
 #include "app/settings.h"
+#include "app/text_util.h"
 #include "session/naming.h"
 
 namespace sl {
@@ -16,16 +15,6 @@ std::vector<uint32_t> with_extra(std::vector<uint32_t> standard, uint32_t extra)
   if (std::find(standard.begin(), standard.end(), extra) == standard.end())
     standard.insert(std::upper_bound(standard.begin(), standard.end(), extra), extra);
   return standard;
-}
-
-bool eq_nocase(const std::wstring& a, const std::wstring& b) {
-  return CompareStringOrdinal(a.c_str(), int(a.size()), b.c_str(), int(b.size()), TRUE) == CSTR_EQUAL;
-}
-
-std::wstring trim(const std::wstring& s) {
-  const size_t a = s.find_first_not_of(L" \t");
-  if (a == std::wstring::npos) return {};
-  return s.substr(a, s.find_last_not_of(L" \t") - a + 1);
 }
 
 }  // namespace
@@ -70,12 +59,14 @@ std::vector<bool> channel_checks(const std::vector<uint16_t>& channels, uint16_t
 }
 
 std::optional<std::vector<uint16_t>> channels_from_checks(const std::vector<bool>& checks,
-                                                          uint16_t device_channels) {
+                                                          uint16_t device_channels, bool was_all,
+                                                          OutFormat format) {
   std::vector<uint16_t> out;
   for (size_t i = 0; i < checks.size(); ++i)
     if (checks[i]) out.push_back(uint16_t(i));
   if (out.empty()) return std::nullopt;
-  if (out.size() == checks.size() && checks.size() == device_channels) return std::vector<uint16_t>{};
+  if (was_all && format != OutFormat::Opus && out.size() == checks.size() && checks.size() == device_channels)
+    return std::vector<uint16_t>{};
   return out;
 }
 

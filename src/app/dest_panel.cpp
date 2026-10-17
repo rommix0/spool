@@ -88,12 +88,17 @@ void DestPanel::set_status(const std::vector<DestStatus>& v, StreamFormat input,
   // Red, then amber, then the rest, each in list order, so trouble is never scrolled away.
   const auto rank = [](const Block& b) { return b.tone == Tone::Red ? 0 : b.tone == Tone::Amber ? 1 : 2; };
   std::stable_sort(blocks.begin(), blocks.end(), [&](const Block& a, const Block& b) { return rank(a) < rank(b); });
+  // Which destinations need attention (sorted indices): when that set changes, show the top.
   const auto attention = [](const std::vector<Block>& bs) {
-    return std::count_if(bs.begin(), bs.end(), [](const Block& b) { return b.tone != Tone::Neutral; });
+    std::vector<size_t> out;
+    for (const Block& b : bs)
+      if (b.tone != Tone::Neutral) out.push_back(b.index);
+    std::sort(out.begin(), out.end());
+    return out;
   };
   live_ = live;
   if (blocks == blocks_) return;
-  if (attention(blocks) > attention(blocks_)) top_ = 0;  // a new problem: show it
+  if (attention(blocks) != attention(blocks_)) top_ = 0;
   blocks_ = std::move(blocks);
   update_scroll();
   if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);

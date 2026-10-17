@@ -29,7 +29,8 @@ file(GLOB_RECURSE SL_CORE_SOURCES CONFIGURE_DEPENDS
 file(GLOB SL_APP_CORE_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_SOURCE_DIR}/src/app/settings.cpp
   ${CMAKE_SOURCE_DIR}/src/app/format_text.cpp
-  ${CMAKE_SOURCE_DIR}/src/app/settings_model.cpp)
+  ${CMAKE_SOURCE_DIR}/src/app/settings_model.cpp
+  ${CMAKE_SOURCE_DIR}/src/app/text_util.cpp)
 list(APPEND SL_CORE_SOURCES ${SL_APP_CORE_SOURCES})
 
 add_library(sl_core STATIC ${SL_CORE_SOURCES} src/core/types.h)
@@ -41,7 +42,7 @@ file(GLOB SL_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/*.cpp)
 add_executable(sl_tests ${SL_TEST_SOURCES})
 target_link_libraries(sl_tests PRIVATE sl_core)
 
-# ---- sound_logger: the dashboard app (window code only; settings, format_text and settings_model are in sl_core) ----
+# ---- sound_logger: the dashboard app (window code only; settings, format_text, settings_model and text_util are in sl_core) ----
 file(GLOB SL_APP_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/app/*.cpp)
 list(REMOVE_ITEM SL_APP_SOURCES ${SL_APP_CORE_SOURCES})
 add_executable(sound_logger WIN32 ${SL_APP_SOURCES}

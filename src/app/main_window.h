@@ -83,8 +83,8 @@ class MainWindow {
   HWND hwnd_ = nullptr;
   HACCEL accel_ = nullptr;
   bool hotkey_ = false;
-  bool show_config_ = false;
-  HWND focus_ = nullptr;      // the focused child when the window was last deactivated  // idle panel shows the configured destinations (settings changed)
+  bool show_config_ = false;  // idle panel shows the configured destinations (settings changed)
+  HWND focus_ = nullptr;      // the focused child when the window was last deactivated
 
   HWND record_ = nullptr, stop_ = nullptr, clock_ = nullptr, device_ = nullptr;
   HWND marker_ = nullptr, split_ = nullptr, settings_ = nullptr;

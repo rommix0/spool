@@ -193,6 +193,29 @@ TEST(settings_garbage_falls_back_per_field) {
   CHECK_EQ(s.dests[0].rotation_minutes, 30u);
 }
 
+TEST(settings_numeric_ranges_shared) {
+  // load_settings accepts exactly the ranges the settings dialog enforces.
+  SettingsTempDir dir;
+  const std::wstring ini = dir.path + L"\\settings.ini";
+  AppSettings s = default_settings();
+  s.ring_seconds = kRingSecondsRange.hi;
+  s.flush_seconds = kFlushSecondsRange.lo;
+  s.low_water_minutes = kLowWaterMinutesRange.lo;
+  s.stall_percent = kStallPercentRange.hi;
+  CHECK(save_settings(ini, s));
+  AppSettings r = load_settings(ini);
+  CHECK_EQ(r.ring_seconds, kRingSecondsRange.hi);
+  CHECK_EQ(r.flush_seconds, kFlushSecondsRange.lo);
+  CHECK_EQ(r.low_water_minutes, kLowWaterMinutesRange.lo);
+  CHECK_EQ(r.stall_percent, kStallPercentRange.hi);
+  s.ring_seconds = kRingSecondsRange.hi + 1;
+  s.stall_percent = kStallPercentRange.hi + 1;
+  CHECK(save_settings(ini, s));
+  r = load_settings(ini);
+  CHECK_EQ(r.ring_seconds, AppSettings{}.ring_seconds);
+  CHECK_EQ(r.stall_percent, AppSettings{}.stall_percent);
+}
+
 TEST(settings_validate_ok_and_empty) {
   CHECK(validate(default_settings(), 2).empty());
   AppSettings none;

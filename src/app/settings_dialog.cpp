@@ -10,6 +10,7 @@
 #include "app/format_text.h"
 #include "app/resource.h"
 #include "app/settings_model.h"
+#include "app/text_util.h"
 #include "core/clock.h"
 
 namespace sl {
@@ -56,24 +57,8 @@ int index_of(const std::vector<T>& v, const T& x) {
   return it == v.end() ? -1 : int(it - v.begin());
 }
 
-std::wstring trim(const std::wstring& s) {
-  const size_t a = s.find_first_not_of(L" \t");
-  if (a == std::wstring::npos) return {};
-  return s.substr(a, s.find_last_not_of(L" \t") - a + 1);
-}
-
-bool eq_nocase(const std::wstring& a, const std::wstring& b) {
-  return CompareStringOrdinal(a.c_str(), int(a.size()), b.c_str(), int(b.size()), TRUE) == CSTR_EQUAL;
-}
-
-std::wstring join(const std::vector<std::wstring>& lines) {
-  std::wstring out;
-  for (const auto& l : lines) out += (out.empty() ? L"" : L"\n") + l;
-  return out;
-}
-
 void show_problems(HWND dlg, const std::vector<std::wstring>& p) {
-  MessageBoxW(dlg, join(p).c_str(), kCheckTitle, MB_OK | MB_ICONWARNING);
+  MessageBoxW(dlg, join_lines(p).c_str(), kCheckTitle, MB_OK | MB_ICONWARNING);
 }
 
 void add_column(HWND lv, int i, const wchar_t* title, int width) {
@@ -237,7 +222,7 @@ void dest_ok(HWND dlg) {
   HWND lv = item(dlg, IDC_D_CHANNELS);
   std::vector<bool> checks(size_t(ListView_GetItemCount(lv)));
   for (size_t i = 0; i < checks.size(); ++i) checks[i] = ListView_GetCheckState(lv, int(i)) != 0;
-  const auto chs = channels_from_checks(checks, st->device_channels);
+  const auto chs = channels_from_checks(checks, st->device_channels, st->d.channels.empty(), out.format);
   if (!chs) {
     show_problems(dlg, {L"Choose at least one channel."});
     return;
@@ -341,6 +326,10 @@ void settings_update_rate_row(HWND dlg) {
   }
   show(dlg, IDC_S_RATE, exclusive);
   enable(dlg, IDC_S_RATE, exclusive && !st->rates.empty());
+  // Raw: the combo and its "Sample &rate:" label (whose accelerator would focus nothing) give
+  // way to the read-only note and a plain caption.
+  show(dlg, IDC_S_RATE_LABEL, exclusive);
+  show(dlg, IDC_S_RATE_NOTE_LABEL, !exclusive);
   show(dlg, IDC_S_RATE_NOTE, !exclusive);
   set_text(dlg, IDC_S_RATE_NOTE, raw_rate_note(dev ? dev->mix_format.sample_rate : 0));
 }
@@ -462,10 +451,9 @@ void settings_ok(HWND dlg) {
   AppSettings out = st->s;
   std::vector<std::wstring> problems;
 
-  const auto number = [&](int id, uint32_t lo, uint32_t hi, const wchar_t* what, const wchar_t* unit,
-                          uint32_t& field) {
-    if (const auto v = parse_number(text_of(dlg, id), lo, hi)) field = *v;
-    else problems.push_back(range_message(what, lo, hi, unit));
+  const auto number = [&](int id, U32Range r, const wchar_t* what, const wchar_t* unit, uint32_t& field) {
+    if (const auto v = parse_number(text_of(dlg, id), r.lo, r.hi)) field = *v;
+    else problems.push_back(range_message(what, r.lo, r.hi, unit));
   };
 
   // Input. A settings file that follows the default device keeps doing so while that's selected.
@@ -478,14 +466,14 @@ void settings_ok(HWND dlg) {
   // (An unplugged saved device can't be asked; its saved rate stays.)
   if (out.input.mode == CaptureMode::Exclusive && st->rates.empty() && dev && dev->mix_format.sample_rate)
     problems.push_back(L"This device doesn't support exclusive mode.");
-  number(IDC_S_RING, 1, 3600, L"Ring length", L" seconds", out.ring_seconds);
+  number(IDC_S_RING, kRingSecondsRange, L"Ring length", L" seconds", out.ring_seconds);
 
   // General.
   out.session_name = trim(text_of(dlg, IDC_S_SESSION));
   if (out.session_name.empty()) problems.push_back(L"Enter a session name.");
-  number(IDC_S_FLUSH, 1, 3600, L"Flush interval", L" seconds", out.flush_seconds);
-  number(IDC_S_LOW_WATER, 0, 100000, L"Low-water mark", L" minutes", out.low_water_minutes);
-  number(IDC_S_STALL, 1, 100, L"Stall threshold", L"%", out.stall_percent);
+  number(IDC_S_FLUSH, kFlushSecondsRange, L"Flush interval", L" seconds", out.flush_seconds);
+  number(IDC_S_LOW_WATER, kLowWaterMinutesRange, L"Low-water mark", L" minutes", out.low_water_minutes);
+  number(IDC_S_STALL, kStallPercentRange, L"Stall threshold", L"%", out.stall_percent);
   out.start_on_launch = IsDlgButtonChecked(dlg, IDC_S_AUTOSTART) == BST_CHECKED;
   out.global_hotkey = IsDlgButtonChecked(dlg, IDC_S_HOTKEY) == BST_CHECKED;
 

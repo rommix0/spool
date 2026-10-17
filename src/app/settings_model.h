@@ -30,10 +30,13 @@ WavDepth depth_from_index(int);
 // Channel checklist rows: one per device channel, plus rows up to any channel the destination
 // names that the device lacks (so validation can still name it). Empty channels = all checked.
 std::vector<bool> channel_checks(const std::vector<uint16_t>& channels, uint16_t device_channels);
-// Back from the checklist: every device channel checked -> {} (all channels); nothing
-// checked -> nullopt; otherwise the checked rows, 0-based.
+// Back from the checklist: nothing checked -> nullopt; otherwise the checked rows, 0-based.
+// It gives {} ("all input channels") only when the destination already meant all channels
+// (was_all), it isn't Opus (1-2 channels, so it must not follow a bigger device), and every
+// device row is checked. An explicit list stays explicit.
 std::optional<std::vector<uint16_t>> channels_from_checks(const std::vector<bool>& checks,
-                                                          uint16_t device_channels);
+                                                          uint16_t device_channels, bool was_all,
+                                                          OutFormat format);
 
 // expand_name(tmpl) for file 1 with no failover segment at `now`, plus ".wav" or ".opus".
 std::wstring name_preview(const std::wstring& tmpl, const std::wstring& session, const std::wstring& dest,

@@ -18,6 +18,16 @@ struct AppSettings {
   std::vector<DestinationConfig> dests;
 };
 
+// Accepted ranges for the numeric fields (load falls back to the default outside them; the
+// settings dialog rejects them).
+struct U32Range {
+  uint32_t lo, hi;
+};
+inline constexpr U32Range kRingSecondsRange{1, 3600};
+inline constexpr U32Range kFlushSecondsRange{1, 3600};
+inline constexpr U32Range kLowWaterMinutesRange{0, 100000};
+inline constexpr U32Range kStallPercentRange{1, 100};
+
 // %APPDATA%\SoundLogger\settings.ini. Creates nothing.
 std::wstring settings_path();
 // Creates %APPDATA%\SoundLogger if missing.

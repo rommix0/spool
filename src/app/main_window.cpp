@@ -7,6 +7,7 @@
 #include "app/format_text.h"
 #include "app/resource.h"
 #include "app/settings_dialog.h"
+#include "app/text_util.h"
 #include "audio/wasapi_source.h"
 #include "core/clock.h"
 
@@ -22,15 +23,6 @@ constexpr UINT kTimerMs = 33;
 constexpr uint64_t kSlowMs = 250;  // stats, destinations and events at 4 Hz
 constexpr int kHotkeyId = 1;
 constexpr size_t kEventRows = 500;
-
-std::wstring join(const std::vector<std::wstring>& lines) {
-  std::wstring out;
-  for (const auto& l : lines) {
-    if (!out.empty()) out += L"\n";
-    out += l;
-  }
-  return out;
-}
 
 std::wstring one_line(std::wstring s) {
   std::replace_if(s.begin(), s.end(), [](wchar_t c) { return c == L'\r' || c == L'\n'; }, L' ');
@@ -154,7 +146,9 @@ LRESULT MainWindow::handle(UINT msg, WPARAM wp, LPARAM lp) {
       if (LOWORD(wp) == WA_INACTIVE) {
         focus_ = GetFocus();
       } else if (!HIWORD(wp)) {
-        SetFocus(focus_ && IsChild(hwnd_, focus_) && IsWindowEnabled(focus_) ? focus_ : hwnd_);
+        HWND to = focus_ && IsChild(hwnd_, focus_) && IsWindowEnabled(focus_) ? focus_ : nullptr;
+        if (!to) to = IsWindowEnabled(record_) ? record_ : IsWindowEnabled(stop_) ? stop_ : hwnd_;
+        SetFocus(to);
       }
       return 0;
     case WM_TIMER:
@@ -338,7 +332,7 @@ void MainWindow::record() {
   }
   const std::vector<std::wstring> problems = validate(ctx_.settings, ctx_.source.format().channels);
   if (!problems.empty()) {
-    MessageBoxW(hwnd_, join(problems).c_str(), kCantStart, MB_OK | MB_ICONERROR);
+    MessageBoxW(hwnd_, join_lines(problems).c_str(), kCantStart, MB_OK | MB_ICONERROR);
     return;
   }
   const SessionConfig cfg = session_config();
@@ -346,14 +340,14 @@ void MainWindow::record() {
   const PreflightResult pf = ctx_.mgr.preflight(cfg);
   SetCursor(old);
   if (!pf.can_start) {
-    MessageBoxW(hwnd_, join(pf.errors).c_str(), kCantStart, MB_OK | MB_ICONERROR);
+    MessageBoxW(hwnd_, join_lines(pf.errors).c_str(), kCantStart, MB_OK | MB_ICONERROR);
     return;
   }
   // Destinations that will start in LastResort are not a block while another one works.
   std::vector<std::wstring> lines = pf.errors;
   lines.insert(lines.end(), pf.warnings.begin(), pf.warnings.end());
-  if (!lines.empty() &&
-      MessageBoxW(hwnd_, (join(lines) + L"\n\nStart anyway?").c_str(), kTitle, MB_YESNO | MB_ICONWARNING) != IDYES)
+  if (!lines.empty() && MessageBoxW(hwnd_, (join_lines(lines) + L"\n\nStart anyway?").c_str(), kTitle,
+                                    MB_YESNO | MB_ICONWARNING) != IDYES)
     return;
   if (!ctx_.mgr.start(cfg, nullptr, &err)) {
     MessageBoxW(hwnd_, err.c_str(), kCantStart, MB_OK | MB_ICONERROR);
@@ -480,7 +474,8 @@ void MainWindow::refresh_slow() {
   last_slow_ms_ = GetTickCount64();
   const SessionStats st = ctx_.mgr.stats();
   const bool rec = st.state != SessionState::Idle;
-  const StreamFormat fmt = st.fmt.sample_rate ? st.fmt : ctx_.source.format();
+  // stats().fmt stays the last session's format after it stops; idle, the source's is current.
+  const StreamFormat fmt = rec && st.fmt.sample_rate ? st.fmt : ctx_.source.format();
 
   set_text(clock_, clock_text_, format_elapsed(st.elapsed_s));
   set_text(device_, device_text_,
@@ -495,7 +490,8 @@ void MainWindow::refresh_slow() {
   enable(split_, rec);
 
   std::vector<DestStatus> ds = ctx_.mgr.dest_status();
-  if (ds.empty() || (!rec && show_config_)) {  // no session yet, or settings changed since: the configured ones
+  const bool configured = ds.empty() || (!rec && show_config_);  // no session yet, or settings changed since
+  if (configured) {
     ds.clear();
     for (const DestinationConfig& c : ctx_.settings.dests) {
       DestStatus d{};
@@ -506,7 +502,8 @@ void MainWindow::refresh_slow() {
       ds.push_back(std::move(d));
     }
   }
-  dests_.set_status(ds, fmt, rec);
+  // A finished session's blocks keep that session's format; the configured ones use the source's.
+  dests_.set_status(ds, configured || !st.fmt.sample_rate ? fmt : st.fmt, rec);
   const bool ack = rec && std::any_of(ds.begin(), ds.end(), [](const DestStatus& d) { return d.needs_ack; });
   if (ack != ((GetWindowLongW(ack_, GWL_STYLE) & WS_VISIBLE) != 0)) ShowWindow(ack_, ack ? SW_SHOWNA : SW_HIDE);
   if (dests_.preferred_height() != dests_height_) layout();

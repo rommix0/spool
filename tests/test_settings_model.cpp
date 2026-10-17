@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "app/settings_model.h"
+#include "app/text_util.h"
 #include "test.h"
 
 using namespace sl;
@@ -61,14 +62,48 @@ TEST(model_channel_checks) {
 }
 
 TEST(model_channels_from_checks) {
-  CHECK((channels_from_checks({true, true}, 2) == std::vector<uint16_t>{}));  // all -> "all channels"
-  CHECK((channels_from_checks({true, false, true}, 3) == std::vector<uint16_t>{0, 2}));
-  CHECK(!channels_from_checks({false, false}, 2).has_value());
-  CHECK(!channels_from_checks({}, 0).has_value());
+  constexpr OutFormat kWav = OutFormat::Wav;
+  CHECK((channels_from_checks({true, false, true}, 3, false, kWav) == std::vector<uint16_t>{0, 2}));
+  CHECK(!channels_from_checks({false, false}, 2, true, kWav).has_value());
+  CHECK(!channels_from_checks({}, 0, true, kWav).has_value());
   // Rows beyond the device: an explicit list even when all are checked.
-  CHECK((channels_from_checks({true, true, true}, 2) == std::vector<uint16_t>{0, 1, 2}));
+  CHECK((channels_from_checks({true, true, true}, 2, true, kWav) == std::vector<uint16_t>{0, 1, 2}));
   // Round trip.
-  CHECK((channels_from_checks(channel_checks({1, 3}, 4), 4) == std::vector<uint16_t>{1, 3}));
+  CHECK((channels_from_checks(channel_checks({1, 3}, 4), 4, false, kWav) == std::vector<uint16_t>{1, 3}));
+}
+
+TEST(model_channels_explicit_stays_explicit) {
+  // {0,1} on a 2-ch device, every row checked: still {0,1}, so a later 8-ch device doesn't
+  // make it record all 8.
+  const std::vector<uint16_t> explicit_list{0, 1};
+  const auto checks = channel_checks(explicit_list, 2);
+  CHECK((channels_from_checks(checks, 2, false, OutFormat::Wav) == explicit_list));
+  CHECK((channels_from_checks(checks, 2, false, OutFormat::Opus) == explicit_list));
+}
+
+TEST(model_channels_all_stays_all) {
+  // Empty ("all channels") with every row still checked stays empty for WAV.
+  const auto checks = channel_checks({}, 4);
+  CHECK((channels_from_checks(checks, 4, true, OutFormat::Wav) == std::vector<uint16_t>{}));
+  // Unchecking one makes it explicit.
+  CHECK((channels_from_checks({true, true, false, true}, 4, true, OutFormat::Wav) ==
+         std::vector<uint16_t>{0, 1, 3}));
+}
+
+TEST(model_channels_opus_never_all) {
+  // Opus is 1-2 channels: "all" would break on a bigger device, so it is always explicit.
+  const auto checks = channel_checks({}, 2);
+  CHECK((channels_from_checks(checks, 2, true, OutFormat::Opus) == std::vector<uint16_t>{0, 1}));
+  CHECK((channels_from_checks({true}, 1, true, OutFormat::Opus) == std::vector<uint16_t>{0}));
+}
+
+TEST(model_text_helpers) {
+  CHECK(trim(L"  a b \t") == L"a b");
+  CHECK(trim(L" \t ").empty());
+  CHECK(eq_nocase(L"Destination 3", L"destination 3"));
+  CHECK(!eq_nocase(L"main", L"mains"));
+  CHECK(join_lines({L"a", L"b", L"c"}) == L"a\nb\nc");
+  CHECK(join_lines({}).empty());
 }
 
 TEST(model_name_preview) {
