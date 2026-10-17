@@ -8,6 +8,7 @@ namespace {
 constexpr float kFloorDb = -60.0f;
 constexpr float kClipLevel = 0.988553f;  // -0.1 dBFS
 constexpr uint64_t kHoldMs = 2000;
+constexpr uint64_t kDeadMs = 300;  // no new frames for this long: capture is dead
 constexpr size_t kChunkFrames = 4096;
 
 float to_db(double lin) {
@@ -28,10 +29,12 @@ MeterReader::MeterReader(SampleRing& ring, uint32_t rate, IClock& clock)
       ch_(ring.channels()),
       out_(ring.channels(), ChannelMeter{kFloorDb, kFloorDb, kFloorDb, 0}) {
   for (auto& c : ch_) c.squares.assign(window_, 0.0f);
+  last_frames_ms_ = clock_.steady_ms();
 }
 
 void MeterReader::resync(SampleIndex to) {
-  cursor_ = std::max<SampleIndex>(to, 0);
+  // Never below the oldest valid frame (a jump_to raises that floor past write_index - margin).
+  cursor_ = std::max<SampleIndex>({to, ring_.oldest_valid(), 0});
   for (auto& c : ch_) c.in_clip = false;  // the gap breaks any clip run
 }
 
@@ -41,11 +44,15 @@ void MeterReader::update() {
   if (end - cursor_ > static_cast<SampleIndex>(ring_.capacity())) resync(end - margin);
 
   bool saw_frames = false;
+  bool resynced_in_loop = false;
 
   while (cursor_ < end) {
     const size_t want = static_cast<size_t>(std::min<SampleIndex>(end - cursor_, kChunkFrames));
     const auto r = ring_.read(cursor_, scratch_.data(), want);
     if (r.overrun) {
+      // A second overrun in one update means the producer is still racing us: try next update.
+      if (resynced_in_loop) break;
+      resynced_in_loop = true;
       resync(ring_.write_index() - margin);
       end = ring_.write_index();
       continue;
@@ -59,7 +66,8 @@ void MeterReader::update() {
       Channel& c = ch_[k];
       size_t pos = pos_;
       for (size_t i = 0; i < r.frames; ++i) {
-        const float a = std::fabs(scratch_[i * channels_ + k]);
+        float a = std::fabs(scratch_[i * channels_ + k]);
+        if (!std::isfinite(a)) a = 0.0f;  // NaN/Inf must not poison the running sum
         if (a > c.peak) c.peak = a;
         if (a >= kClipLevel) {
           if (!c.in_clip) { ++out_[k].clips; c.in_clip = true; }
@@ -69,7 +77,12 @@ void MeterReader::update() {
         const float sq = a * a;
         c.sum += static_cast<double>(sq) - static_cast<double>(c.squares[pos]);
         c.squares[pos] = sq;
-        if (++pos == window_) pos = 0;
+        if (++pos == window_) {
+          pos = 0;
+          double sum = 0;  // exact recompute once per window wrap bounds running-sum drift
+          for (const float v : c.squares) sum += static_cast<double>(v);
+          c.sum = sum;
+        }
       }
     }
     pos_ = (pos_ + r.frames) % window_;
@@ -78,6 +91,17 @@ void MeterReader::update() {
   }
 
   const uint64_t now = clock_.steady_ms();
+  if (saw_frames) {
+    last_frames_ms_ = now;
+  } else if (now - last_frames_ms_ > kDeadMs) {
+    // Capture is dead: report the floor instead of freezing the last levels.
+    for (auto& c : ch_) {
+      c.peak = 0.0f;
+      c.sum = 0.0;
+      std::fill(c.squares.begin(), c.squares.end(), 0.0f);
+    }
+    filled_ = 0;
+  }
   for (uint32_t k = 0; k < channels_; ++k) {
     Channel& c = ch_[k];
     ChannelMeter& o = out_[k];

@@ -10,7 +10,9 @@
 namespace sl {
 
 struct ChannelMeter {
-  float peak_db;  // max |x| over the frames seen by the latest update(), floor -60
+  float peak_db;  // max |x| over the frames seen by the latest update(), floor -60;
+                  // with no new frames it keeps the last reading, and drops to the floor
+                  // after 300 ms of silence from capture
   float hold_db;  // highest peak held for 2 s, then falls back to the current peak
   float rms_db;   // RMS over the last 300 ms
   uint64_t clips; // session clip count; each run of |x| >= -0.1 dBFS counts once
@@ -42,6 +44,7 @@ class MeterReader {
   IClock& clock_;
   uint32_t channels_;
   SampleIndex cursor_;
+  uint64_t last_frames_ms_ = 0;  // steady time of the last update that saw frames
   size_t window_;        // frames in the RMS window
   size_t filled_ = 0;    // frames currently in the window (<= window_)
   size_t pos_ = 0;       // next slot in each channel's squares ring

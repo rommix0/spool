@@ -1,4 +1,7 @@
+#include <atomic>
 #include <cmath>
+#include <limits>
+#include <thread>
 #include <vector>
 
 #include "core/clock.h"
@@ -130,4 +133,76 @@ TEST(meter_skips_when_far_behind) {
   m.update();
   const auto g = m.get();
   CHECK_NEAR(g[0].peak_db, -12.04, 0.05);  // only the resynced tail is seen
+}
+
+TEST(meter_jump_to_does_not_spin) {
+  SampleRing ring(1, kRate / 10);
+  FakeClock clock;
+  MeterReader m(ring, kRate, clock);
+  write_const(ring, 1000, 1.0f);
+  ring.jump_to(ring.write_index() + 50000);
+  write_const(ring, 200, 0.1f);
+  m.update();  // reader is below the jump floor: must resync and return
+  CHECK_NEAR(g0(m).peak_db, -20.0, 0.05);  // only post-jump data
+  ring.jump_to(ring.write_index() + 50000);
+  m.update();  // jump with no post-jump data: returns, nothing new to read
+  CHECK_NEAR(g0(m).peak_db, -20.0, 0.05);
+}
+
+TEST(meter_concurrent_writer_terminates) {
+  SampleRing ring(1, 4096);
+  FakeClock clock;
+  MeterReader m(ring, kRate, clock);
+  std::atomic<bool> stop{false};
+  std::thread w([&] {
+    std::vector<float> blk(256, 0.5f);
+    while (!stop.load()) ring.write(blk.data(), blk.size());
+  });
+  for (int i = 0; i < 2000; ++i) {
+    m.update();
+    const float p = g0(m).peak_db;
+    CHECK(p == -60.0f || std::fabs(p + 6.02f) < 0.05f);  // never torn data
+  }
+  stop = true;
+  w.join();
+}
+
+TEST(meter_non_finite_samples_do_not_poison_rms) {
+  SampleRing ring(1, kRate);
+  FakeClock clock;
+  MeterReader m(ring, kRate, clock);
+  const float bad[] = {std::numeric_limits<float>::quiet_NaN(),
+                       std::numeric_limits<float>::infinity(),
+                       -std::numeric_limits<float>::infinity()};
+  ring.write(bad, 3);
+  m.update();
+  CHECK_EQ(g0(m).peak_db, -60.0f);
+  CHECK_EQ(g0(m).clips, uint64_t(0));
+  write_sine(ring, kRate / 2, 1.0f);
+  m.update();
+  CHECK_NEAR(g0(m).rms_db, -3.01, 0.1);
+  CHECK_NEAR(g0(m).peak_db, 0.0, 0.1);
+}
+
+TEST(meter_dead_capture_drops_to_floor) {
+  SampleRing ring(1, kRate);
+  FakeClock clock;
+  MeterReader m(ring, kRate, clock);
+  write_sine(ring, kRate / 2, 1.0f);
+  m.update();
+  clock.advance_ms(250);
+  m.update();  // brief gap: last reading kept
+  CHECK_NEAR(g0(m).peak_db, 0.0, 0.1);
+  CHECK_NEAR(g0(m).rms_db, -3.01, 0.1);
+  clock.advance_ms(60);  // 310 ms without frames
+  m.update();
+  CHECK_EQ(g0(m).peak_db, -60.0f);
+  CHECK_EQ(g0(m).rms_db, -60.0f);
+  CHECK_NEAR(g0(m).hold_db, 0.0, 0.01);  // hold still running
+  clock.advance_ms(2000);
+  m.update();
+  CHECK_EQ(g0(m).hold_db, -60.0f);
+  write_sine(ring, kRate / 2, 1.0f);  // capture comes back with a clean window
+  m.update();
+  CHECK_NEAR(g0(m).rms_db, -3.01, 0.1);
 }
