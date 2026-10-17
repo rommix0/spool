@@ -83,9 +83,12 @@ class Destination {
   // next healthy folder. The watchdog may call this whenever is_stalled() holds:
   // - It is a no-op when Stopped or Disabled.
   // - In Writing and FailingOver it is honored. In any other state (Idle, GapClosed,
-  //   LastResort) it is honored only while the writer is inside file I/O (a hang in the
-  //   first open, a LastResort retry or a resume reopen); a writer idle on purpose is not
-  //   stalled and keeps its folders.
+  //   LastResort) it is honored only while the writer has been inside one file I/O call
+  //   (probe, open, manifest flush, ...) for at least 2 s of steady time: a hang in the
+  //   first open, a LastResort retry or a resume reopen. A writer idle on purpose, or in a
+  //   routine flush, is not stalled and keeps its folders.
+  // - A hang reopening the seed manifest (crash resume) is never retried: the next
+  //   generation starts a new manifest that names it as prev_manifest.
   // - After a stall takeover it is ignored until progress() reaches the capture position
   //   recorded at the takeover (the new writer starts that far behind) or a grace deadline
   //   passes, whichever comes first. Deadline = takeover steady time + clamp(headroom / 2,

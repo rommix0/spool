@@ -1,5 +1,7 @@
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -693,6 +695,9 @@ TEST(failover_stall_in_first_open) {
   d.start(0);
   std::this_thread::sleep_for(std::chrono::milliseconds(200));  // stuck in D:'s probe
   CHECK(d.status().state == DestState::Idle);
+  d.declare_stalled();  // stuck, but not for 2 s yet (R14): ignored
+  CHECK_EQ(stall_log_entries(rig.log), size_t(0));
+  rig.clock.advance_ms(2100);
   d.declare_stalled();
   CHECK(poll([&] { return on_folder(d.status(), 1); }));
   CHECK(rig.pump(d, 0, 3 * kRate));
@@ -731,6 +736,9 @@ TEST(failover_stall_in_last_resort_retry) {
   feed(rig.ring, 3 * kRate, size_t(kRate));
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   CHECK_EQ(d.progress(), SampleIndex(3 * kRate));  // stuck: no longer following the capture
+  d.declare_stalled();  // stuck, but not for 2 s yet (R14): ignored
+  CHECK_EQ(stall_log_entries(rig.log), size_t(0));
+  rig.clock.advance_ms(2100);
   d.declare_stalled();
   CHECK(wait_progress(d, 4 * kRate));  // following again
   CHECK(d.status().state == DestState::LastResort);
@@ -765,6 +773,9 @@ TEST(failover_stall_in_resume_reopen) {
   d.post(CmdResumeAt{4 * kRate});
   std::this_thread::sleep_for(std::chrono::milliseconds(200));  // stuck in D:'s probe
   CHECK(d.status().state == DestState::GapClosed);
+  d.declare_stalled();  // stuck, but not for 2 s yet (R14): ignored
+  CHECK_EQ(stall_log_entries(rig.log), size_t(0));
+  rig.clock.advance_ms(2100);
   d.declare_stalled();
   CHECK(poll([&] { return on_folder(d.status(), 1); }));
   CHECK(rig.pump(d, 4 * kRate, 5 * kRate));
@@ -780,4 +791,209 @@ TEST(failover_stall_in_resume_reopen) {
   const auto v = wav_samples(rig.fs, es[0]);
   CHECK_EQ(v.size(), size_t(kRate));
   CHECK_EQ(ramp_errors(v, 4 * kRate), size_t(0));
+}
+
+namespace {
+// Forwards to the FaultFileSystem, but open_existing of one path blocks until release()
+// (FaultFileSystem cannot hang an open). Must outlive every writer that may be blocked in it.
+class HangOpenFs : public IFileSystem {
+ public:
+  HangOpenFs(FaultFileSystem& fs, std::wstring path) : fs_(fs), path_(std::move(path)) {}
+  ~HangOpenFs() override { release(); }
+  void release() {
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      released_ = true;
+    }
+    cv_.notify_all();
+  }
+  int hung() const {
+    std::lock_guard<std::mutex> lk(m_);
+    return hung_;
+  }
+
+  std::unique_ptr<IFile> open_existing(const std::wstring& p, std::wstring* err) override {
+    if (p == path_) {
+      std::unique_lock<std::mutex> lk(m_);
+      ++hung_;
+      cv_.wait(lk, [&] { return released_; });
+    }
+    return fs_.open_existing(p, err);
+  }
+  std::unique_ptr<IFile> create_new(const std::wstring& p, std::wstring* err) override {
+    return fs_.create_new(p, err);
+  }
+  bool exists(const std::wstring& p) override { return fs_.exists(p); }
+  bool ensure_dir(const std::wstring& d, std::wstring* err) override { return fs_.ensure_dir(d, err); }
+  bool remove(const std::wstring& p) override { return fs_.remove(p); }
+  std::vector<std::wstring> list(const std::wstring& d, const std::wstring& s) override { return fs_.list(d, s); }
+  std::optional<uint64_t> free_bytes(const std::wstring& d) override { return fs_.free_bytes(d); }
+  std::wstring volume_id(const std::wstring& d) override { return fs_.volume_id(d); }
+
+ private:
+  FaultFileSystem& fs_;
+  const std::wstring path_;
+  mutable std::mutex m_;
+  std::condition_variable cv_;
+  bool released_ = false;
+  int hung_ = 0;
+};
+}  // namespace
+
+// Crash resume: reopening the seed manifest on D: hangs. One declare: the next generation
+// does not try that manifest again (it would hang the same way), starts a new one in E:
+// that names the seed as prev_manifest, and records from the session start.
+TEST(failover_stall_in_seed_manifest_reopen) {
+  FoRig rig;
+  std::wstring err;
+  CHECK(rig.fs.ensure_dir(kP, &err));
+  {
+    auto f = rig.fs.create_new(kPManifest, &err);
+    CHECK(f != nullptr);
+    if (!f) return;
+    const std::string line = "{\"ev\":\"session_end\",\"sample\":0}\n";
+    CHECK(f->write(line.data(), line.size()));
+    f->close();
+  }
+  const auto before = rig.fs.contents(kPManifest);
+  HangOpenFs fs(rig.fs, kPManifest);
+  {
+    DestResumeSeed seed;
+    seed.first_n = 5;
+    seed.prev_manifest = kPManifest;
+    Destination d(rig.cfg, rig.sp, rig.ring, fs, rig.clock, rig.log, seed);
+    d.start(0);
+    CHECK(poll([&] { return fs.hung() == 1; }));
+    rig.clock.advance_ms(2100);
+    d.declare_stalled();
+    CHECK(poll([&] { return on_folder(d.status(), 1); }));
+    CHECK(rig.pump(d, 0, 3 * kRate));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK_EQ(fs.hung(), 1);  // nobody reopened the seed
+    d.stop(3 * kRate);
+  }
+  fs.release();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));  // the stuck writer leaves
+
+  CHECK_EQ(stall_log_entries(rig.log), size_t(1));
+  CHECK(rig.fs.contents(kPManifest) == before);
+  const auto es = rig.wavs(kS);
+  CHECK_EQ(es.size(), size_t(1));
+  if (es.size() == 1) {
+    CHECK(ends_with(es[0], L"_005.wav"));
+    const auto v = wav_samples(rig.fs, es[0]);
+    CHECK_EQ(v.size(), size_t(3 * kRate));
+    CHECK_EQ(ramp_errors(v, 0), size_t(0));
+  }
+  auto recs = rig.only_manifest(kS);
+  CHECK(!recs.empty());
+  if (!recs.empty()) {
+    CHECK_EQ(recs[0]["ev"], std::string("session_start"));
+    CHECK_EQ(recs[0]["prev_manifest"], narrow(kPManifest));
+  }
+}
+
+// R14: in GapClosed the cursor is parked (is_stalled holds on every watchdog tick); a tick
+// landing inside a routine manifest flush is not a stall.
+TEST(failover_stall_routine_flush_in_gap_is_not_a_stall) {
+  FoRig rig;
+  rig.cfg.rotation_minutes = 0;
+  Destination d(rig.cfg, rig.sp, rig.ring, rig.fs, rig.clock, rig.log);
+  d.start(0);
+  d.post(CmdCloseForGap{2 * kRate});
+  feed(rig.ring, 0, size_t(2 * kRate));
+  CHECK(poll([&] { return d.status().state == DestState::GapClosed; }));
+  rig.clock.advance_ms(2100);  // first flush of the manifest (no rule yet)
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  rig.fs.add_rule({kPManifest, Kind::SlowWrite, 0, 100});
+  d.post(CmdMarker{2 * kRate, L"in the gap"});
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  rig.clock.advance_ms(2100);  // the next flush writes the marker: 100 ms on the device
+  const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+  while (std::chrono::steady_clock::now() < until) {
+    d.declare_stalled();
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  CHECK_EQ(stall_log_entries(rig.log), size_t(0));
+  CHECK(d.status().state == DestState::GapClosed);
+  rig.fs.clear_rules();
+  rig.ring.jump_to(4 * kRate);
+  d.post(CmdResumeAt{4 * kRate});
+  CHECK(poll([&] { return on_folder(d.status(), 0); }));  // D: was not quarantined
+  CHECK(rig.pump(d, 4 * kRate, 5 * kRate));
+  d.stop(5 * kRate);
+  CHECK_EQ(events(rig.records(kPManifest), "marker").size(), size_t(1));
+}
+
+// R14: a manifest flush in GapClosed that hangs for 2 s is a stall.
+TEST(failover_stall_hung_flush_in_gap) {
+  FoRig rig;
+  rig.cfg.rotation_minutes = 0;
+  Destination d(rig.cfg, rig.sp, rig.ring, rig.fs, rig.clock, rig.log);
+  d.start(0);
+  d.post(CmdCloseForGap{2 * kRate});
+  feed(rig.ring, 0, size_t(2 * kRate));
+  CHECK(poll([&] { return d.status().state == DestState::GapClosed; }));
+  rig.fs.add_rule({kPManifest, Kind::HangWrite});
+  d.post(CmdMarker{2 * kRate, L"in the gap"});
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  rig.clock.advance_ms(2100);  // the flush starts and hangs
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  d.declare_stalled();  // not 2 s yet: ignored
+  CHECK_EQ(stall_log_entries(rig.log), size_t(0));
+  rig.clock.advance_ms(2100);
+  d.declare_stalled();  // stuck for 2.1 s: honored
+  CHECK_EQ(stall_log_entries(rig.log), size_t(1));
+  CHECK(d.status().state == DestState::GapClosed);
+  rig.ring.jump_to(4 * kRate);
+  d.post(CmdResumeAt{4 * kRate});
+  CHECK(poll([&] { return on_folder(d.status(), 1); }));  // D: is quarantined
+  CHECK(rig.pump(d, 4 * kRate, 5 * kRate));
+  d.stop(5 * kRate);
+  rig.fs.release_hangs();
+
+  const auto es = rig.wavs(kS);
+  CHECK_EQ(es.size(), size_t(1));
+  if (es.size() == 1) {
+    const auto v = wav_samples(rig.fs, es[0]);
+    CHECK_EQ(v.size(), size_t(kRate));
+    CHECK_EQ(ramp_errors(v, 4 * kRate), size_t(0));
+  }
+}
+
+// The writer published its state (carry.started) when D: failed its probe, then hung in
+// E:'s probe before any file was open. The takeover opens the session's first file, seg 0.
+TEST(failover_stall_before_first_file) {
+  const std::wstring kF = L"F:\\f";
+  FoRig rig;
+  rig.cfg.folders = {kP, kS, kF};
+  rig.fs.add_rule({L"D:\\", Kind::FailOpen});
+  rig.fs.add_rule({L"E:\\", Kind::HangWrite});
+  Destination d(rig.cfg, rig.sp, rig.ring, rig.fs, rig.clock, rig.log);
+  d.start(0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));  // stuck in E:'s probe
+  CHECK(d.status().state == DestState::Idle);
+  CHECK(d.status().folders[0].health == FolderHealth::Failed);
+  rig.clock.advance_ms(2100);
+  d.declare_stalled();
+  CHECK(poll([&] { return on_folder(d.status(), 2); }));
+  CHECK(rig.pump(d, 0, 3 * kRate));
+  d.stop(3 * kRate);
+  rig.fs.release_hangs();
+
+  const auto ff = rig.wavs(kF);
+  CHECK_EQ(ff.size(), size_t(1));
+  if (ff.size() == 1) {
+    CHECK(ends_with(ff[0], L"_001.wav"));  // not _001_b: no file was ever open
+    const auto v = wav_samples(rig.fs, ff[0]);
+    CHECK_EQ(v.size(), size_t(3 * kRate));
+    CHECK_EQ(ramp_errors(v, 0), size_t(0));
+  }
+  auto recs = rig.only_manifest(kF);
+  CHECK(recs.size() >= 2);
+  if (recs.size() >= 2) {
+    CHECK_EQ(recs[1]["ev"], std::string("failover"));
+    CHECK_EQ(recs[1]["from"], narrow(kS));
+    CHECK_EQ(recs[1]["old_path"], std::string());
+  }
 }

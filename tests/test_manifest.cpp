@@ -309,3 +309,24 @@ TEST(event_log_caps_memory_at_1000) {
   CHECK(r.front().text == L"1004");
   CHECK(r.back().text == L"5");
 }
+
+// Nothing new since the last successful flush: no device flush (a writer parked in a gap
+// stays off the device). Bytes whose device flush failed are flushed again next time.
+TEST(manifest_flush_skips_device_when_clean) {
+  FaultFileSystem fs;
+  std::wstring err;
+  CHECK(fs.ensure_dir(L"D:\\rec", &err));
+  auto m = Manifest::create(fs, L"D:\\rec\\m.jsonl", &err);
+  CHECK(m != nullptr);
+  if (!m) return;
+  fs.add_rule({L"D:\\rec", FaultFileSystem::Kind::FailFlush, 0, 0});
+  CHECK(m->flush());  // nothing written yet: the failing device flush is not called
+  CHECK(m->append(JsonLine("marker", 1, wall())));
+  CHECK(!m->flush());  // written, but not durable
+  CHECK(!m->flush());  // still dirty: the device flush is tried again
+  fs.clear_rules();
+  CHECK(m->flush());
+  fs.add_rule({L"D:\\rec", FaultFileSystem::Kind::FailFlush, 0, 0});
+  CHECK(m->flush());  // clean again
+  CHECK_EQ(read_manifest(fs, L"D:\\rec\\m.jsonl").size(), size_t(1));
+}

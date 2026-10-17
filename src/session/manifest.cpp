@@ -254,8 +254,12 @@ bool Manifest::flush() {
       return false;
     }
     lead_newline_ = false;
+    dirty_ = true;
   }
-  return file_->flush();
+  if (!dirty_) return true;  // nothing changed: no device flush (a parked writer stays idle)
+  if (!file_->flush()) return false;
+  dirty_ = false;
+  return true;
 }
 
 std::vector<ManifestRecord> read_manifest(IFileSystem& fs, const std::wstring& path) {

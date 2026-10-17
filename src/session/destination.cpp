@@ -37,6 +37,7 @@ constexpr uint64_t kRetryMs = 30000;       // LastResort retry interval (§4.3)
 constexpr DWORD kStopBudgetMs = 3000;
 constexpr size_t kNone = SIZE_MAX;
 constexpr uint64_t kMinStallGraceMs = 500, kMaxStallGraceMs = 5000;
+constexpr uint64_t kIdleStallMs = 2000;  // R14: I/O this long outside Writing is a hang
 
 uint32_t bytes_per_sample(WavDepth d) {
   switch (d) {
@@ -229,6 +230,9 @@ struct Destination::Core {
   Carry carry;
   size_t busy_folder = kNone;     // folder of the writer's current file I/O
   bool io_busy = false;           // the current writer is inside file I/O (Writer::IoScope)
+  uint64_t io_since_ms = 0;       // ... since this steady time
+  bool seed_opening = false;      // the current writer is reopening the seed manifest
+  bool skip_seed = false;         // that reopen hung: never try it again
   std::set<size_t> quarantined;   // a writer hung there: never probed again this session
   SampleIndex stall_grace_until = -1;  // declare_stalled() ignored until the cursor gets here
   uint64_t stall_grace_deadline_ms = 0;  // ... or until this steady time (R13)
@@ -417,6 +421,8 @@ class Destination::Writer {
     io_depth_ += delta;
     std::lock_guard<std::mutex> lk(k_.m);
     if (stale()) return;
+    // Not stale with m held: the Destination (and so the clock) is alive.
+    if (delta > 0 && io_depth_ == 1) k_.io_since_ms = k_.clock.steady_ms();
     k_.io_busy = io_depth_ > 0;
     if (delta > 0 && folder != kNone) k_.busy_folder = folder;
   }
@@ -523,14 +529,29 @@ class Destination::Writer {
       c_.manifest_path = k_.seed.prev_manifest;  // linked from a new manifest if it cannot be reused
       std::wstring err;
       const size_t folder = folder_of(k_.seed.prev_manifest);
-      std::unique_ptr<Manifest> m;
+      bool skip = false;
       {
+        std::lock_guard<std::mutex> lk(k_.m);
+        if (stale()) return;
+        // An earlier generation hung reopening it (or hung in its folder): never again, or
+        // every takeover would hang the same way. The new manifest still links it.
+        skip = k_.skip_seed || k_.quarantined.count(folder) != 0;
+        k_.seed_opening = !skip;
+      }
+      std::unique_ptr<Manifest> m;
+      if (skip) {
+        err = L"its folder hung";
+      } else {
         IoScope io(*this, folder);
         m = Manifest::open_append(k_.fs, k_.seed.prev_manifest, &err);
       }
       if (gone()) {
         (void)m.release();
         return;
+      }
+      {
+        std::lock_guard<std::mutex> lk(k_.m);
+        if (!stale()) k_.seed_opening = false;
       }
       if (m) {
         man_ = std::move(m);
@@ -1147,6 +1168,7 @@ void Destination::start(SampleIndex at) {
     Carry c;
     c.n = k.seed.first_n;
     c.session_start = at;
+    k.carry = c;  // what a takeover starts from if the first writer hangs before any commit
     w = new Writer(core_, k.generation.load(), at, std::move(c), kNone);
     writer_ = w;
   }
@@ -1209,12 +1231,13 @@ void Destination::declare_stalled() {
     std::lock_guard<std::mutex> lk(k.m);
     if (!writer_ || !thread_.joinable()) return;
     // A writer that writes (or fails over) can stall at any time. In the other states it
-    // idles on purpose (GapClosed, LastResort) unless it is inside file I/O: a hang in the
-    // first open, a LastResort retry or a resume reopen is a stall; an idle writer is not,
-    // and must not cost a healthy folder.
+    // idles on purpose (GapClosed, LastResort) unless it has been inside one file I/O call
+    // for kIdleStallMs (R14): a hang in the first open, a LastResort retry, a resume reopen
+    // or a manifest flush is a stall; an idle writer, or a routine flush, is not and must
+    // not cost a healthy folder.
     if (k.st.state == DestState::Stopped || k.st.state == DestState::Disabled) return;
     const bool writing = k.st.state == DestState::Writing || k.st.state == DestState::FailingOver;
-    if (!writing && !k.io_busy) return;
+    if (!writing && !(k.io_busy && k.clock.steady_ms() - k.io_since_ms >= kIdleStallMs)) return;
     // A generation that took over after a stall starts at least half a ring behind: it is
     // given until it reaches the capture position recorded at the takeover, or until the
     // grace deadline if it hangs too (R13).
@@ -1236,6 +1259,8 @@ void Destination::declare_stalled() {
     }
     k.st.needs_ack = true;
     k.io_busy = false;  // the new generation starts outside file I/O
+    if (k.seed_opening) k.skip_seed = true;
+    k.seed_opening = false;
     k.stall_grace_until = k.ring.write_index();
     k.stall_grace_deadline_ms = k.clock.steady_ms() + stall_grace_ms(k.sp, k.ring_capacity);
     // The new generation continues from the last confirmed sample with the published carry.

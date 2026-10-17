@@ -42,7 +42,8 @@ class Manifest {
   // Buffered in memory; thread-safe. Never waits on file I/O, so it stays responsive
   // while flush() is stuck on a stalled device.
   bool append(const JsonLine&);
-  // Writes the buffered lines, then IFile::flush. On failure the buffered lines are
+  // Writes the buffered lines, then IFile::flush. With nothing new since the last successful
+  // flush it returns true without touching the device. On failure the buffered lines are
   // kept (ahead of anything appended meanwhile) and false is returned, so the caller
   // can decide on failover.
   bool flush();
@@ -51,10 +52,11 @@ class Manifest {
   explicit Manifest(std::unique_ptr<IFile> f) : file_(std::move(f)) {}
 
   std::mutex buf_m_;    // guards buf_ only; never held across I/O
-  std::mutex flush_m_;  // serializes flush(); guards file_ use and lead_newline_
+  std::mutex flush_m_;  // serializes flush(); guards file_ use, lead_newline_ and dirty_
   std::unique_ptr<IFile> file_;
   std::string buf_;
   bool lead_newline_ = false;  // next write must begin with '\n' (torn last line)
+  bool dirty_ = false;         // written since the last successful IFile::flush
 };
 
 using ManifestRecord = std::map<std::string, std::string>;  // values unescaped; numbers as text
