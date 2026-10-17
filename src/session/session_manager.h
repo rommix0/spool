@@ -69,7 +69,8 @@ class SessionManager : CaptureCallbacks {
   // before start().
   void on_new_session(std::function<void(const std::wstring& session_id)>);
   // A new session with id yyyymmdd-hhmmss (local start time). Does not run preflight:
-  // destinations without a usable folder start in LastResort.
+  // destinations without a usable folder start in LastResort. Also after a linked session
+  // failed to start (the manager went Idle by itself).
   // With a resume (after repair_open_files): the crashed session continues with the same
   // id, name, start_sample and start_wall; the ring starts at resume_sample; each
   // destination (matched by name) continues its {n} and its manifest, which gets
@@ -115,7 +116,9 @@ class SessionManager : CaptureCallbacks {
 
   std::shared_ptr<Session> current() const;
   // Keeps the session's final stats and destinations, then frees it (and any retired one).
-  void release_session();
+  // retire (manager thread): the UI may still use its meter, so it is freed by the UI's
+  // next meter(), start() or stop() instead.
+  void release_session(bool retire = false);
   std::shared_ptr<Session> make_session(const SessionParams&, StreamFormat, SampleIndex ring_start,
                                         std::vector<DestResumeSeed> seeds, std::wstring* err);
   std::wstring next_session_id(WallTime);

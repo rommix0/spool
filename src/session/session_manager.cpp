@@ -84,8 +84,11 @@ bool SessionManager::start(const SessionConfig& cfg, const ResumeInfo* resume, s
   std::wstring e;
   if (!err) err = &e;
   if (thread_.joinable()) {
-    *err = L"Already recording";
-    return false;
+    if (state_.load() != SessionState::Idle) {
+      *err = L"Already recording";
+      return false;
+    }
+    thread_.join();  // the manager thread ended itself: a linked session could not start
   }
   const StreamFormat fmt = src_.format();
   if (!fmt.sample_rate || !fmt.channels) {
@@ -317,8 +320,7 @@ std::shared_ptr<SessionManager::Session> SessionManager::current() const {
   return cur_;
 }
 
-// UI thread (stop): nothing else uses the session's meter now.
-void SessionManager::release_session() {
+void SessionManager::release_session(bool retire) {
   SessionStats st = stats();
   std::vector<DestStatus> ds = dest_status();
   std::shared_ptr<Session> s;  // freed here, outside the lock
@@ -327,7 +329,11 @@ void SessionManager::release_session() {
   last_stats_ = std::move(st);
   last_dests_ = std::move(ds);
   s.swap(cur_);
-  old.swap(retired_);
+  if (retire) {
+    retired_.push_back(std::move(s));
+  } else {
+    old.swap(retired_);
+  }
 }
 
 std::shared_ptr<SessionManager::Session> SessionManager::make_session(const SessionParams& p, StreamFormat fmt,
@@ -389,7 +395,9 @@ void SessionManager::run() {
     drain_ui(*current());
     if (quitting) return;
     handle_device_events();
-    Session& s = *current();  // only this thread replaces it
+    const auto cur = current();  // only this thread replaces it
+    if (!cur) return;            // a linked session could not start: nothing left to run
+    Session& s = *cur;
     const uint64_t now = clock_.steady_ms();
     if (now - last_watchdog >= kWatchdogMs) {
       last_watchdog = now;
@@ -515,6 +523,7 @@ void SessionManager::link_new_session(StreamFormat fmt, uint64_t steady_ms, Wall
     state_.store(SessionState::Idle);
     clear_state();  // nothing to resume: the session has ended
     log(Severity::Error, L"Cannot start the linked session: " + (err.empty() ? L"the input has no format" : err));
+    release_session(true);  // the manager thread ends; Record starts a new session
     return;
   }
   cap_ring_.store(s->ring.get(), std::memory_order_release);

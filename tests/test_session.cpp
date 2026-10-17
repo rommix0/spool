@@ -514,3 +514,33 @@ TEST(session_no_clock_pair_while_input_lost) {
   CHECK_EQ(cp.size(), size_t(1));
   if (cp.size() == 1) CHECK(num_of(cp[0], "sample") >= back);
 }
+
+// A linked session that cannot start ends the manager's work: Record works again without
+// restarting the app, and the ended session is freed.
+TEST(session_record_again_after_failed_linked_session) {
+  const int base = SampleRing::live_count();
+  SessRig rig;
+  CHECK(rig.start());
+  CHECK(rig.pump(1));
+  rig.src.simulate_loss();
+  CHECK(rig.wait_state(SessionState::InputLost));
+  rig.src.simulate_return({0, 0});  // a format no session can use
+  CHECK(rig.wait_state(SessionState::Idle));
+  CHECK(poll([&] {
+    for (const auto& e : rig.log.recent(100))
+      if (e.text.find(L"Cannot start the linked session") != std::wstring::npos) return true;
+    return false;
+  }));
+  CHECK(rig.mgr.meter() == nullptr);
+  CHECK(rig.mgr.stats().session_id == L"20261016-143000");  // the ended session's numbers
+  rig.src.simulate_loss();
+  rig.src.simulate_return({uint32_t(kRate), 1});  // the input is usable again
+  CHECK(rig.start());
+  CHECK_EQ(SampleRing::live_count(), base + 1);
+  CHECK(rig.mgr.stats().state == SessionState::Recording);
+  CHECK(rig.pump(1));
+  CHECK_EQ(rig.mgr.stats().position, kRate);
+  rig.mgr.stop();
+  CHECK_EQ(SampleRing::live_count(), base);
+  CHECK_EQ(rig.fs.list(kP, L".wav").size(), size_t(2));
+}
