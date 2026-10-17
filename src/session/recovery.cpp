@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "format/wav_repair.h"
+#include "io/ini_file.h"
 #include "session/manifest.h"
 
 namespace sl {
@@ -19,51 +20,13 @@ namespace {
 
 // ---- StateStore helpers ----
 
-constexpr DWORD kValueChars = 32768;  // a long path plus quotes
-constexpr wchar_t kMissing[] = L"\x01";
+using ini::ensure_unicode_file;
+using ini::get;
+using ini::get_i64;
+using ini::quoted;
+using ini::write_section;
 
 std::wstring dest_section(size_t i) { return L"Dest" + std::to_wstring(i); }
-
-// GetPrivateProfileString strips one pair of surrounding quotes, so quoting keeps leading
-// and trailing spaces (and inner quotes) intact.
-std::wstring quoted(const std::wstring& v) { return L"\"" + v + L"\""; }
-
-// WritePrivateProfileString writes ANSI unless the file already starts with a UTF-16LE BOM.
-// False if the file neither exists nor can be created.
-bool ensure_unicode_file(const std::wstring& path) {
-  const HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (h == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_EXISTS;
-  const uint8_t bom[2] = {0xFF, 0xFE};
-  DWORD done = 0;
-  const bool ok = WriteFile(h, bom, 2, &done, nullptr) && done == 2;
-  CloseHandle(h);
-  return ok;
-}
-
-// One whole section, replacing what was there.
-bool write_section(const std::wstring& path, const std::wstring& section,
-                   const std::vector<std::pair<std::wstring, std::wstring>>& kv) {
-  std::wstring block;
-  for (const auto& [k, v] : kv) {
-    block += k + L"=" + v;
-    block.push_back(L'\0');
-  }
-  block.push_back(L'\0');
-  return WritePrivateProfileSectionW(section.c_str(), block.c_str(), path.c_str()) != 0;
-}
-
-std::optional<std::wstring> get(const std::wstring& path, const std::wstring& section, const wchar_t* key) {
-  std::wstring buf(kValueChars, L'\0');
-  const DWORD n = GetPrivateProfileStringW(section.c_str(), key, kMissing, buf.data(), kValueChars, path.c_str());
-  buf.resize(n);
-  if (buf == kMissing) return std::nullopt;
-  return buf;
-}
-
-int64_t get_i64(const std::wstring& path, const std::wstring& section, const wchar_t* key) {
-  const auto v = get(path, section, key);
-  return v ? std::wcstoll(v->c_str(), nullptr, 10) : 0;
-}
 
 size_t saved_dest_count(const std::wstring& path) {
   return size_t(std::clamp<int64_t>(get_i64(path, L"State", L"dests"), 0, 1024));

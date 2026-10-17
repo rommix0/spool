@@ -26,11 +26,10 @@ file(GLOB_RECURSE SL_CORE_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_SOURCE_DIR}/src/format/*.cpp
   ${CMAKE_SOURCE_DIR}/src/session/*.cpp
   ${CMAKE_SOURCE_DIR}/src/audio/*.cpp)
-foreach(f settings.cpp format_text.cpp)
-  if(EXISTS ${CMAKE_SOURCE_DIR}/src/app/${f})
-    list(APPEND SL_CORE_SOURCES ${CMAKE_SOURCE_DIR}/src/app/${f})
-  endif()
-endforeach()
+file(GLOB SL_APP_CORE_SOURCES CONFIGURE_DEPENDS
+  ${CMAKE_SOURCE_DIR}/src/app/settings.cpp
+  ${CMAKE_SOURCE_DIR}/src/app/format_text.cpp)
+list(APPEND SL_CORE_SOURCES ${SL_APP_CORE_SOURCES})
 
 add_library(sl_core STATIC ${SL_CORE_SOURCES} src/core/types.h)
 target_include_directories(sl_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
