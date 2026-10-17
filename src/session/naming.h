@@ -10,6 +10,8 @@
 namespace sl {
 
 // <>:"/\|?* and chars < 0x20 -> '_'; trailing '.' and ' ' trimmed; empty -> "_".
+// A reserved device name before the first '.' (CON, PRN, AUX, NUL, COM1-9, LPT1-9, any
+// case) gets a leading '_'.
 std::wstring sanitize_component(std::wstring s);
 
 struct NameInputs {

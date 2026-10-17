@@ -64,6 +64,22 @@ TEST(name_sanitizes_illegal_chars) {
   CHECK(sanitize_component(L"a<b>c\"d\\e|f?g*h\ti") == L"a_b_c_d_e_f_g_h_i");
 }
 
+// Windows reserves these device names, with any extension: "nul.wav" is the NUL device.
+TEST(name_sanitizes_reserved_device_names) {
+  for (const wchar_t* r : {L"CON", L"prn", L"Aux", L"NUL", L"COM1", L"com9", L"LPT1", L"lpt9"})
+    CHECK(sanitize_component(r) == std::wstring(L"_") + r);
+  CHECK(sanitize_component(L"nul.backup") == L"_nul.backup");
+  CHECK(sanitize_component(L"Con.") == L"_Con");  // the trailing dot goes first
+  CHECK(sanitize_component(L"COM0") == L"COM0");
+  CHECK(sanitize_component(L"COM10") == L"COM10");
+  CHECK(sanitize_component(L"console") == L"console");
+  CHECK(sanitize_component(L"aux_1") == L"aux_1");
+  CHECK(sanitize_component(L"my.nul") == L"my.nul");
+  NameInputs in;
+  in.dest = L"aux";
+  CHECK(expand_name(L"{dest}", in) == L"_aux");
+}
+
 TEST(name_unique_path_on_collision) {
   FaultFileSystem fs;
   std::wstring err;

@@ -1,10 +1,21 @@
 #include "session/naming.h"
 
 #include <cstdio>
+#include <cwctype>
 
 #include "core/clock.h"
 
 namespace sl {
+
+namespace {
+// CON, PRN, AUX, NUL, COM1-COM9, LPT1-LPT9 (any case): Windows device names.
+bool reserved_name(std::wstring stem) {
+  for (auto& c : stem) c = wchar_t(std::towupper(c));
+  if (stem == L"CON" || stem == L"PRN" || stem == L"AUX" || stem == L"NUL") return true;
+  return stem.size() == 4 && (stem.compare(0, 3, L"COM") == 0 || stem.compare(0, 3, L"LPT") == 0) &&
+         stem[3] >= L'1' && stem[3] <= L'9';
+}
+}  // namespace
 
 std::wstring sanitize_component(std::wstring s) {
   for (auto& c : s) {
@@ -14,6 +25,7 @@ std::wstring sanitize_component(std::wstring s) {
   }
   while (!s.empty() && (s.back() == L'.' || s.back() == L' ')) s.pop_back();
   if (s.empty()) s = L"_";
+  if (reserved_name(s.substr(0, s.find(L'.')))) s.insert(0, 1, L'_');  // "nul.wav" is the NUL device
   return s;
 }
 
