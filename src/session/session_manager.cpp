@@ -398,7 +398,8 @@ void SessionManager::run() {
     // Every tick, so a new file or manifest (rotation, failover) reaches the crash state
     // within one tick even while steady time stands still.
     save_state(s, now);
-    if (now - last_pair >= kClockPairMs) {
+    // Not on silence fill: the pair that falls due while the input is lost follows its return.
+    if (now - last_pair >= kClockPairMs && state_.load() != SessionState::InputLost) {
       last_pair = now;
       post_all(s, CmdClockPair{s.ring->write_index(), clock_.now()});
     }

@@ -489,3 +489,28 @@ TEST(session_stop_releases_the_session) {
   rig.mgr.stop();
   CHECK_EQ(SampleRing::live_count(), base);
 }
+
+// §8.6: a clock pair pairs a captured sample with the wall clock; none is taken while the
+// input is lost (the samples are silence fill). The pair that fell due comes after return.
+TEST(session_no_clock_pair_while_input_lost) {
+  SessRig rig;
+  CHECK(rig.start());
+  CHECK(rig.pump(0.1));
+  rig.src.simulate_loss();
+  CHECK(rig.wait_state(SessionState::InputLost));
+  const SampleIndex from = kRate / 10;
+  CHECK(rig.advance_lost(305, from, from + 305 * kRate, 5000));  // 5 min and several flushes
+  CHECK(events(rig.only_manifest(kP), "clock_pair").empty());
+  rig.src.simulate_return({uint32_t(kRate), 1});
+  CHECK(rig.wait_state(SessionState::Recording));
+  const SampleIndex back = rig.mgr.stats().position;
+  CHECK(poll([&] {
+    rig.src.pump(size_t(kRate / 10));
+    rig.clock.advance_ms(100);
+    return !events(rig.only_manifest(kP), "clock_pair").empty();
+  }));
+  rig.mgr.stop();
+  const auto cp = events(rig.only_manifest(kP), "clock_pair");
+  CHECK_EQ(cp.size(), size_t(1));
+  if (cp.size() == 1) CHECK(num_of(cp[0], "sample") >= back);
+}
