@@ -13,9 +13,10 @@ namespace {
 constexpr wchar_t kDot[] = L" · ";   // middle dot
 constexpr wchar_t kDash[] = L"–";    // en dash
 constexpr wchar_t kEmDash[] = L"—";  // unknown value
+constexpr double kMaxWhole = 9e15;    // < 2^53: exact, and far inside int64_t (inf, huge values)
 
-// Whole units of v, never negative; NaN counts as 0.
-int64_t whole(double v) { return v > 0 ? int64_t(std::floor(v)) : 0; }
+// Whole units of v, clamped to [0, kMaxWhole]; NaN counts as 0.
+int64_t whole(double v) { return v > 0 ? int64_t(std::floor(std::min(v, kMaxWhole))) : 0; }
 
 // Runs of consecutive ascending channels: "1–2", "3", "1, 3, 5–6" (1-based).
 std::wstring channel_text(const std::vector<uint16_t>& chs) {
@@ -41,7 +42,7 @@ std::wstring format_elapsed(double seconds) {
 }
 
 std::wstring format_time_left(double hours) {
-  if (hours < 1) return std::to_wstring(whole(hours * 60)) + L" min left";
+  if (!(hours >= 1)) return std::to_wstring(whole(hours * 60)) + L" min left";
   return std::to_wstring(whole(hours)) + L" h left";
 }
 

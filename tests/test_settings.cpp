@@ -323,6 +323,13 @@ TEST(text_elapsed_and_time_left) {
   CHECK(format_time_left(1.0) == L"1 h left");
   CHECK(format_time_left(0.0) == L"0 min left");
   CHECK(format_time_left(-1.0) == L"0 min left");
+  // Non-finite or huge values never reach the int64 cast unclamped; NaN counts as 0.
+  CHECK(format_elapsed(std::nan("")) == L"00:00:00");
+  CHECK(format_elapsed(-INFINITY) == L"00:00:00");
+  CHECK(format_elapsed(INFINITY) == L"2500000000000:00:00");  // clamped to 9e15 s
+  CHECK(format_elapsed(1e300) == L"2500000000000:00:00");
+  CHECK(format_time_left(INFINITY) == L"9000000000000000 h left");
+  CHECK(format_time_left(std::nan("")) == L"0 min left");
 }
 
 TEST(text_summary) {
