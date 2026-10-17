@@ -77,7 +77,7 @@ class SessionManager : CaptureCallbacks {
   // the crashed session's.
   bool start(const SessionConfig&, const ResumeInfo* resume, std::wstring* err);
   // Stops capture, then every destination in parallel (one shared ~3 s budget even with
-  // several hung drives).
+  // several hung drives), and frees the session (ring, meter, destinations).
   void stop();
   // Test hook (crash simulation): stops every thread without finalizing, flushing or
   // clearing anything; encoders and manifests are leaked unclosed.
@@ -88,7 +88,8 @@ class SessionManager : CaptureCallbacks {
   void split();                       // at write_index
   void append_folder(size_t dest, std::wstring path);  // also kept for a linked session
   void acknowledge();
-  // Never wait on file I/O (callable at UI rate).
+  // Never wait on file I/O (callable at UI rate). Idle after a session, they report that
+  // session's final numbers and destinations (state Idle) until the next start().
   SessionStats stats() const;
   std::vector<DestStatus> dest_status() const;
   // The current session's meter, or null when idle. A format change replaces it: fetch it
@@ -113,6 +114,8 @@ class SessionManager : CaptureCallbacks {
   void on_device_returned(StreamFormat fmt) override;
 
   std::shared_ptr<Session> current() const;
+  // Keeps the session's final stats and destinations, then frees it (and any retired one).
+  void release_session();
   std::shared_ptr<Session> make_session(const SessionParams&, StreamFormat, SampleIndex ring_start,
                                         std::vector<DestResumeSeed> seeds, std::wstring* err);
   std::wstring next_session_id(WallTime);
@@ -141,9 +144,11 @@ class SessionManager : CaptureCallbacks {
   IClock& clock_;
   EventLog& log_;
 
-  mutable std::mutex sess_m_;            // guards cur_ and retired_ only; never held across I/O
+  mutable std::mutex sess_m_;            // guards cur_, retired_ and the final snapshot; never held across I/O
   std::shared_ptr<Session> cur_;
   std::vector<std::shared_ptr<Session>> retired_;  // replaced by a linked session; freed on the UI thread
+  SessionStats last_stats_{};            // the last session's, once it is freed
+  std::vector<DestStatus> last_dests_;
   SessionConfig cfg_;                    // manager thread while running (append_folder updates it)
   std::set<std::wstring> used_ids_;
   uint64_t next_seq_ = 1;

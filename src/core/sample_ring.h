@@ -23,6 +23,8 @@ class SampleRing {
 
   // The capacity a ring asked for min_frames gets.
   static size_t capacity_for(size_t min_frames);
+  // Rings alive in this process (tests check that a session frees its ring).
+  static int live_count() { return live_.load(); }
 
   uint32_t channels() const { return channels_; }
   size_t capacity() const { return capacity_; }
@@ -59,6 +61,7 @@ class SampleRing {
   // Readers use it after copying to detect slots overwritten while they were reading.
   alignas(64) std::atomic<int64_t> pending_index_;
   alignas(64) std::atomic<int64_t> jump_floor_;
+  inline static std::atomic<int> live_{0};
 };
 
 }  // namespace sl

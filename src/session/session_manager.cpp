@@ -125,6 +125,13 @@ bool SessionManager::start(const SessionConfig& cfg, const ResumeInfo* resume, s
     p.start_wall = now;
   }
   if (on_new_session_) on_new_session_(p.session_id);
+  {  // the previous session (and any retired one) goes before the new ring is allocated
+    std::shared_ptr<Session> prev;
+    std::vector<std::shared_ptr<Session>> old;
+    std::lock_guard<std::mutex> lk(sess_m_);
+    prev.swap(cur_);
+    old.swap(retired_);
+  }
   auto s = make_session(p, fmt, ring_start, std::move(seeds), err);
   if (!s) return false;
 
@@ -138,7 +145,8 @@ bool SessionManager::start(const SessionConfig& cfg, const ResumeInfo* resume, s
   {
     std::lock_guard<std::mutex> lk(sess_m_);
     cur_ = s;
-    retired_.clear();
+    last_stats_ = SessionStats{};
+    last_dests_.clear();
   }
   cap_ring_.store(s->ring.get(), std::memory_order_release);
   if (!src_.start(this)) {
@@ -181,11 +189,7 @@ void SessionManager::stop() {
   }
   clear_state();
   state_.store(SessionState::Idle);
-  std::vector<std::shared_ptr<Session>> old;
-  {
-    std::lock_guard<std::mutex> lk(sess_m_);
-    old.swap(retired_);
-  }
+  release_session();
 }
 
 void SessionManager::abandon_for_test() {
@@ -237,8 +241,13 @@ void SessionManager::acknowledge() {
 
 SessionStats SessionManager::stats() const {
   SessionStats st{};
+  std::shared_ptr<Session> s;
+  {
+    std::lock_guard<std::mutex> lk(sess_m_);
+    s = cur_;
+    if (!s) st = last_stats_;
+  }
   st.state = state_.load();
-  const auto s = current();
   if (!s) return st;
   st.session_id = s->params.session_id;
   st.fmt = s->fmt;
@@ -258,7 +267,13 @@ SessionStats SessionManager::stats() const {
 
 std::vector<DestStatus> SessionManager::dest_status() const {
   std::vector<DestStatus> out;
-  if (const auto s = current())
+  std::shared_ptr<Session> s;
+  {
+    std::lock_guard<std::mutex> lk(sess_m_);
+    s = cur_;
+    if (!s) out = last_dests_;
+  }
+  if (s)
     for (const auto& d : s->dests) out.push_back(d->status());
   return out;
 }
@@ -300,6 +315,19 @@ void SessionManager::on_device_returned(StreamFormat fmt) {
 std::shared_ptr<SessionManager::Session> SessionManager::current() const {
   std::lock_guard<std::mutex> lk(sess_m_);
   return cur_;
+}
+
+// UI thread (stop): nothing else uses the session's meter now.
+void SessionManager::release_session() {
+  SessionStats st = stats();
+  std::vector<DestStatus> ds = dest_status();
+  std::shared_ptr<Session> s;  // freed here, outside the lock
+  std::vector<std::shared_ptr<Session>> old;
+  std::lock_guard<std::mutex> lk(sess_m_);
+  last_stats_ = std::move(st);
+  last_dests_ = std::move(ds);
+  s.swap(cur_);
+  old.swap(retired_);
 }
 
 std::shared_ptr<SessionManager::Session> SessionManager::make_session(const SessionParams& p, StreamFormat fmt,

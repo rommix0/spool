@@ -459,3 +459,33 @@ TEST(session_synthetic_source_realtime_blocks) {
   CHECK_EQ(cb.total.load(), after_stop);
   CHECK_EQ(cb.last.load(), size_t(480));  // 10 ms blocks
 }
+
+// stop() frees the session (ring, meter, destinations) but keeps its final numbers for the
+// dashboard; a stop/start cycle never holds two rings.
+TEST(session_stop_releases_the_session) {
+  const int base = SampleRing::live_count();
+  SessRig rig;
+  CHECK(rig.start());
+  CHECK_EQ(SampleRing::live_count(), base + 1);
+  CHECK(rig.mgr.meter() != nullptr);
+  CHECK(rig.pump(1));
+  rig.mgr.stop();
+  CHECK(rig.mgr.meter() == nullptr);
+  CHECK_EQ(SampleRing::live_count(), base);
+  const SessionStats st = rig.mgr.stats();
+  CHECK(st.state == SessionState::Idle);
+  CHECK(st.session_id == L"20261016-143000");
+  CHECK(st.fmt == (StreamFormat{uint32_t(kRate), 1}));
+  CHECK_EQ(st.position, kRate);
+  CHECK_NEAR(st.elapsed_s, 1.0, 1e-9);
+  const auto ds = rig.mgr.dest_status();
+  CHECK_EQ(ds.size(), size_t(1));
+  if (ds.size() == 1) CHECK(ds[0].state == DestState::Stopped);
+
+  CHECK(rig.start());
+  CHECK_EQ(SampleRing::live_count(), base + 1);
+  CHECK(rig.mgr.stats().session_id == L"20261016-143001");
+  CHECK_EQ(rig.mgr.stats().position, SampleIndex(0));
+  rig.mgr.stop();
+  CHECK_EQ(SampleRing::live_count(), base);
+}

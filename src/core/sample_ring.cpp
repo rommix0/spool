@@ -29,9 +29,11 @@ SampleRing::SampleRing(uint32_t channels, size_t min_frames, SampleIndex start)
   volatile char* bytes_p = static_cast<volatile char*>(p);
   for (size_t off = 0; off < bytes; off += 4096) bytes_p[off] = 0;
   locked_ = VirtualLock(p, bytes) != FALSE;  // best effort; may fail against the working-set quota
+  ++live_;
 }
 
 SampleRing::~SampleRing() {
+  --live_;
   if (data_) {
     if (locked_) VirtualUnlock(data_, capacity_ * channels_ * sizeof(float));
     VirtualFree(data_, 0, MEM_RELEASE);
