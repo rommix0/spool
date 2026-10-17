@@ -271,12 +271,14 @@ class WasapiImpl {
     stop_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   }
   ~WasapiImpl() {
+    std::thread w;
     {
       std::lock_guard<std::mutex> lk(wk_m_);
       quit_ = true;
+      w = std::move(worker_);
     }
     wk_cv_.notify_all();
-    if (worker_.joinable()) worker_.join();
+    if (w.joinable()) w.join();
     CloseHandle(buffer_event_);
     CloseHandle(stop_event_);
   }
@@ -288,9 +290,17 @@ class WasapiImpl {
       close_client();
       lost_.store(false);
       retry_pending_ = false;
-      ok = open_client(cfg, err);
       cfg_ = cfg;
+      ok = open_client(cfg_, err);
       opened_ = ok;
+      if (ok) {
+        cfg_.device_id = dev_id_;  // pin the endpoint: a default-device config never follows another device
+      } else {
+        std::lock_guard<std::mutex> lk(fmt_m_);
+        fmt_ = {};
+        pinned_id_.clear();
+        raw_active_.store(false);
+      }
     });
     return ok;
   }
@@ -314,6 +324,12 @@ class WasapiImpl {
 
   bool raw_active() const { return raw_active_.load(); }
 
+  // The endpoint id the source is bound to (resolved at open(); empty when not open).
+  std::wstring device_id() const {
+    std::lock_guard<std::mutex> lk(fmt_m_);
+    return pinned_id_;
+  }
+
   // Any thread (also COM notification threads): only a short mutex, never blocks on work.
   void post(Event e) {
     {
@@ -327,13 +343,22 @@ class WasapiImpl {
   class NotifClient;
 
   bool ensure_worker(std::wstring* err) {
-    if (worker_.joinable()) return true;
     std::promise<HRESULT> ready;
     auto fut = ready.get_future();
-    worker_ = std::thread([this, p = std::move(ready)]() mutable { worker_main(std::move(p)); });
+    {
+      std::lock_guard<std::mutex> lk(wk_m_);
+      if (worker_.joinable()) return true;
+      if (quit_) return false;
+      worker_ = std::thread([this, p = std::move(ready)]() mutable { worker_main(std::move(p)); });
+    }
     const HRESULT hr = fut.get();
     if (FAILED(hr)) {
-      worker_.join();
+      std::thread w;
+      {
+        std::lock_guard<std::mutex> lk(wk_m_);
+        w = std::move(worker_);
+      }
+      w.join();
       set_err(err, L"Could not initialize the audio device service", hr);
       return false;
     }
@@ -343,6 +368,10 @@ class WasapiImpl {
   // Runs f on the worker and waits for it. False when there is no worker.
   template <class F>
   bool run(F&& f) {
+    if (std::this_thread::get_id() == worker_tid_) {  // e.g. start() from on_device_returned
+      f();
+      return true;
+    }
     auto task = std::make_shared<std::packaged_task<void()>>(std::forward<F>(f));
     auto done = task->get_future();
     {
@@ -373,6 +402,7 @@ class WasapiImpl {
   // Shared with other threads.
   mutable std::mutex fmt_m_;
   StreamFormat fmt_;
+  std::wstring pinned_id_;
   std::atomic<bool> raw_active_{false};
   std::atomic<bool> lost_{false};
   std::atomic<CaptureCallbacks*> cb_{nullptr};
@@ -384,6 +414,9 @@ class WasapiImpl {
   std::deque<Event> events_;
   bool quit_ = false;
   std::thread worker_;
+  std::thread::id worker_tid_;  // set by the worker before it reports ready
+  // Capture thread -> worker failure signal (gen + 1 of the failed stream); lock-free to set.
+  std::atomic<uint64_t> fail_gen_{0};
 
   HANDLE buffer_event_ = nullptr, stop_event_ = nullptr;
 
@@ -445,6 +478,7 @@ class WasapiImpl::NotifClient : public IMMNotificationClient {
 
 void WasapiImpl::worker_main(std::promise<HRESULT> ready) {
   ComInit com;
+  worker_tid_ = std::this_thread::get_id();
   NotifClient* nc = nullptr;
   HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&en_));
   if (SUCCEEDED(hr)) {
@@ -460,9 +494,17 @@ void WasapiImpl::worker_main(std::promise<HRESULT> ready) {
 
   std::unique_lock<std::mutex> lk(wk_m_);
   while (!quit_) {
-    if (jobs_.empty() && events_.empty()) {
-      if (retry_pending_) wk_cv_.wait_until(lk, retry_at_);
-      else wk_cv_.wait(lk);
+    const auto signalled = [&] {
+      return quit_ || !jobs_.empty() || !events_.empty() || fail_gen_.load() != 0;
+    };
+    if (!signalled()) {
+      // The capture thread signals without the lock, so a notify can slip between the check
+      // and the wait: while it runs, wake every 100 ms to look at fail_gen_ regardless.
+      auto until = std::chrono::steady_clock::time_point::max();
+      if (retry_pending_) until = retry_at_;
+      if (capture_.joinable()) until = std::min(until, std::chrono::steady_clock::now() + std::chrono::milliseconds(100));
+      if (until == std::chrono::steady_clock::time_point::max()) wk_cv_.wait(lk, signalled);
+      else wk_cv_.wait_until(lk, until);
     }
     if (quit_) break;
     auto jobs = std::move(jobs_);
@@ -472,6 +514,7 @@ void WasapiImpl::worker_main(std::promise<HRESULT> ready) {
     lk.unlock();
     for (auto& j : jobs) j();
     for (const Event& e : events) handle_event(e);
+    if (const uint64_t f = fail_gen_.exchange(0)) handle_event({Event::CaptureFailed, {}, f - 1});
     if (retry_pending_ && std::chrono::steady_clock::now() >= retry_at_) try_reopen();
     lk.lock();
   }
@@ -483,12 +526,10 @@ void WasapiImpl::worker_main(std::promise<HRESULT> ready) {
   en_.Reset();
 }
 
-// With a default-device config the watched device is whichever endpoint is default now.
+// The source stays bound to the endpoint chosen at open(): a different microphone must
+// never resume the session as "the same device".
 bool WasapiImpl::matches_device(const std::wstring& id) {
-  if (id == dev_id_) return true;
-  if (!cfg_.device_id.empty()) return false;
-  ComPtr<IMMDevice> def;
-  return SUCCEEDED(get_device(en_.Get(), L"", &def)) && device_id_of(def.Get()) == id;
+  return id == dev_id_;
 }
 
 void WasapiImpl::handle_event(const Event& e) {
@@ -685,6 +726,7 @@ bool WasapiImpl::finish_open(ComPtr<IAudioClient> client, const WAVEFORMATEX* wf
   {
     std::lock_guard<std::mutex> lk(fmt_m_);
     fmt_ = {l.rate, l.channels};
+    pinned_id_ = dev_id_;
   }
   return true;
 }
@@ -789,7 +831,10 @@ void WasapiImpl::capture_main(uint64_t gen) {
       if (!run_.load(std::memory_order_acquire)) break;
     }
   }
-  if (failed && run_.load()) post({Event::CaptureFailed, {}, gen});
+  if (failed && run_.load()) {
+    fail_gen_.store(gen + 1);
+    wk_cv_.notify_one();
+  }
   if (mm) AvRevertMmThreadCharacteristics(mm);
 }
 
@@ -803,5 +848,6 @@ StreamFormat WasapiSource::format() const { return p_->format(); }
 bool WasapiSource::start(CaptureCallbacks* cb) { return p_->start(cb); }
 void WasapiSource::stop() { p_->stop(); }
 bool WasapiSource::raw_active() const { return p_->raw_active(); }
+std::wstring WasapiSource::device_id() const { return p_->device_id(); }
 
 }  // namespace sl

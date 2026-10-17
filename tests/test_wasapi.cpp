@@ -49,8 +49,40 @@ TEST(wasapi_open_unknown_device_fails_cleanly) {
   CHECK(sl::exclusive_rates(cfg.device_id).empty());
 }
 
+namespace {
+
+// Captures `ms` of audio from an already opened source and checks the frame count.
+void check_capture(WasapiSource& src, int ms) {
+  const sl::StreamFormat f = src.format();
+  Counter cb;
+  cb.channels = f.channels;
+  CHECK(src.start(&cb));
+  sleep_ms(ms);
+  src.stop();
+  const uint64_t got = cb.frames.load();
+  const uint64_t expect = uint64_t(f.sample_rate) * ms / 1000;
+  CHECK(got > expect * 9 / 10);
+  CHECK(got < expect * 11 / 10);
+  CHECK(!cb.bad.load());
+  CHECK_EQ(cb.lost.load(), 0);
+  CHECK_EQ(cb.returned.load(), 0);
+
+  // No frames after stop(), and the source can be started again.
+  const uint64_t after_stop = cb.frames.load();
+  sleep_ms(50);
+  CHECK_EQ(cb.frames.load(), after_stop);
+  CHECK(src.start(&cb));
+  sleep_ms(100);
+  src.stop();
+  CHECK(cb.frames.load() > after_stop);
+  CHECK(src.format() == f);
+}
+
+}  // namespace
+
 TEST(wasapi_raw_capture_one_second) {
-  if (sl::default_capture_device_id().empty()) SKIP("no capture device");
+  const std::wstring def = sl::default_capture_device_id();
+  if (def.empty()) SKIP("no capture device");
   WasapiSource src;
   CaptureConfig cfg;  // default device, raw
   std::wstring err;
@@ -58,25 +90,38 @@ TEST(wasapi_raw_capture_one_second) {
   const sl::StreamFormat f = src.format();
   CHECK(f.sample_rate >= 8000);
   CHECK(f.channels >= 1 && f.channels <= 8);
+  // The source is bound to the endpoint that was default at open() (not to "whatever is default").
+  CHECK(src.device_id() == def);
+  for (const auto& d : sl::list_capture_devices())
+    if (d.id == def && d.mix_format.channels != 0) CHECK_EQ(f.channels, d.mix_format.channels);
+  check_capture(src, 1000);
+}
 
-  Counter cb;
-  cb.channels = f.channels;
-  CHECK(src.start(&cb));
-  sleep_ms(1000);
-  src.stop();
-  const uint64_t got = cb.frames.load();
-  CHECK(got > f.sample_rate * 9 / 10);
-  CHECK(got < f.sample_rate * 11 / 10);
-  CHECK(!cb.bad.load());
-  CHECK_EQ(cb.lost.load(), 0);
+TEST(wasapi_exclusive_capture_one_second) {
+  const std::wstring def = sl::default_capture_device_id();
+  if (def.empty()) SKIP("no capture device");
+  const auto rates = sl::exclusive_rates(def);
+  if (rates.empty()) SKIP("exclusive mode not available");
+  WasapiSource src;
+  CaptureConfig cfg;
+  cfg.mode = CaptureMode::Exclusive;
+  cfg.sample_rate = rates[0];
+  std::wstring err;
+  if (!src.open(cfg, &err)) SKIP("exclusive open failed (device busy or not allowed)");
+  CHECK_EQ(src.format().sample_rate, rates[0]);
+  CHECK(src.raw_active());
+  CHECK(src.device_id() == def);
+  check_capture(src, 1000);
+}
 
-  // No frames after stop(), and the source can be started again.
-  const uint64_t after_stop = cb.frames.load();
-  sleep_ms(50);
-  CHECK_EQ(cb.frames.load(), after_stop);
-  CHECK(src.start(&cb));
-  sleep_ms(150);
-  src.stop();
-  CHECK(cb.frames.load() > after_stop);
-  CHECK(src.format() == f);
+TEST(wasapi_failed_open_clears_state) {
+  WasapiSource src;
+  std::wstring err;
+  src.open(CaptureConfig{}, &err);  // may fail without a device; then there is no earlier state to clear
+  CaptureConfig cfg;
+  cfg.device_id = L"{0.0.1.00000000}.{00000000-0000-0000-0000-000000000000}";
+  CHECK(!src.open(cfg, &err));
+  CHECK(src.format() == sl::StreamFormat{});
+  CHECK(!src.raw_active());
+  CHECK(src.device_id().empty());
 }

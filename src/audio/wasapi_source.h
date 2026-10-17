@@ -46,6 +46,11 @@ class WasapiSource : public ICaptureSource {
   // False after a fallback to normal shared mode (the app should warn).
   bool raw_active() const;
 
+  // The endpoint this source is bound to: resolved at open() (so an empty config id becomes
+  // the then-default device) and kept across loss and return; empty when not open. It never
+  // follows another device, so on_device_returned always means the same device.
+  std::wstring device_id() const;
+
  private:
   std::unique_ptr<WasapiImpl> p_;
 };
