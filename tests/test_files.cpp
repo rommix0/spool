@@ -440,3 +440,98 @@ TEST(win_long_path) {
   CHECK(fs.remove(p));
   CHECK(!fs.exists(p));
 }
+
+// ---- fix round 1 ----
+
+TEST(fault_size_does_not_block_while_write_hangs) {
+  FaultFileSystem fs;
+  auto f = make_file(fs, L"H:\\rec", L"a.bin");
+  CHECK(f != nullptr);
+  if (!f) return;
+  CHECK(f->write("abc", 3));
+  fs.add_rule({L"H:\\", Kind::HangWrite});  // the next write hangs
+  std::atomic<bool> write_done{false};
+  std::thread writer([&] { f->write("def", 3); write_done = true; });
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));  // writer is now parked
+
+  std::atomic<bool> got{false};
+  std::atomic<uint64_t> seen{0};
+  std::thread reader([&] { seen = f->size(); got = true; });
+  const bool prompt = wait_for([&] { return got.load(); }, 1000);
+  CHECK(prompt);
+  CHECK(!write_done.load());
+  CHECK_EQ(seen.load(), uint64_t(3));
+
+  fs.release_hangs();  // always unblock, even on failure, so the joins cannot hang
+  writer.join();
+  reader.join();
+}
+
+TEST(fault_list_order_matches_win32) {
+  FaultFileSystem fs;
+  std::wstring err;
+  CHECK(fs.ensure_dir(L"D:\\rec", &err));
+  for (const wchar_t* n : {L"D:\\rec\\a_1.wav", L"D:\\rec\\ab.wav", L"D:\\rec\\Aa.wav"})
+    CHECK(fs.create_new(n, &err) != nullptr);
+  auto l = fs.list(L"D:\\rec", L".wav");
+  // Ordinal ignore-case compares upper-cased: 'B' (0x42) < '_' (0x5F).
+  CHECK_EQ(l.size(), size_t(3));
+  if (l.size() == 3) {
+    CHECK(l[0] == L"D:\\rec\\Aa.wav");
+    CHECK(l[1] == L"D:\\rec\\ab.wav");
+    CHECK(l[2] == L"D:\\rec\\a_1.wav");
+  }
+}
+
+TEST(win_list_order_matches_fault_fs) {
+  TempDir td;
+  sl::IFileSystem& fs = sl::real_fs();
+  std::wstring err;
+  for (const wchar_t* n : {L"\\a_1.wav", L"\\ab.wav", L"\\Aa.wav"})
+    CHECK(fs.create_new(td.path + n, &err) != nullptr);
+  auto l = fs.list(td.path, L".wav");
+  CHECK_EQ(l.size(), size_t(3));
+  if (l.size() == 3) {
+    CHECK(l[0] == td.path + L"\\Aa.wav");
+    CHECK(l[1] == td.path + L"\\ab.wav");
+    CHECK(l[2] == td.path + L"\\a_1.wav");
+  }
+}
+
+TEST(win_free_bytes_of_nonexistent_dir_uses_ancestor) {
+  TempDir td;
+  sl::IFileSystem& fs = sl::real_fs();
+  auto existing = fs.free_bytes(td.path);
+  auto missing = fs.free_bytes(td.path + L"\\nonexistent\\deeper");
+  auto trailing = fs.free_bytes(td.path + L"\\nonexistent\\deeper\\");
+  CHECK(existing.has_value());
+  CHECK(missing.has_value());
+  CHECK(trailing.has_value());
+  if (missing) CHECK(*missing > 0);
+  // A drive that does not exist stays unknown, not "falls back to the current drive".
+  CHECK(!fs.free_bytes(L"\\\\no-such-host-sl-test\\share\\x").has_value());
+}
+
+TEST(win_size_is_tracked_without_syscalls) {
+  TempDir td;
+  sl::IFileSystem& fs = sl::real_fs();
+  std::wstring err;
+  const std::wstring p = td.path + L"\\a.bin";
+  auto f = fs.create_new(p, &err);
+  CHECK(f != nullptr);
+  if (!f) return;
+  CHECK_EQ(f->size(), uint64_t(0));
+  CHECK(f->write("abcd", 4));
+  CHECK_EQ(f->size(), uint64_t(4));
+  CHECK(f->write_at(2, "XY", 2));  // inside: no growth
+  CHECK_EQ(f->size(), uint64_t(4));
+  CHECK(f->write_at(10, "Z", 1));  // beyond: extends
+  CHECK_EQ(f->size(), uint64_t(11));
+  CHECK(f->write("!", 1));
+  CHECK_EQ(f->size(), uint64_t(12));
+  f->close();
+  CHECK_EQ(f->size(), uint64_t(0));
+  auto g = fs.open_existing(p, &err);  // reopened: starts from the real length
+  CHECK(g != nullptr);
+  if (g) CHECK_EQ(g->size(), uint64_t(12));
+}

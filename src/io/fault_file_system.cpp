@@ -302,7 +302,8 @@ std::vector<std::wstring> FaultFileSystem::list(const std::wstring& dir, const s
   std::wstring base = dir;
   while (!base.empty() && (base.back() == L'\\' || base.back() == L'/')) base.pop_back();
   const std::wstring skey = norm(suffix);
-  // Map order is normalized-name order, which is the sorted order promised.
+  // Sorted like Win32 (CompareStringOrdinal ignore-case folds to upper case).
+  std::vector<std::pair<std::wstring, std::wstring>> found;  // (upper-case name, full path)
   for (const auto& f : st_->files) {
     const Node& n = *f.second;
     if (parent_key(n.key) != dkey) continue;
@@ -310,8 +311,12 @@ std::vector<std::wstring> FaultFileSystem::list(const std::wstring& dir, const s
     const std::wstring name = n.path.substr(cut == std::wstring::npos ? 0 : cut + 1);
     const std::wstring nkey = norm(name);
     if (nkey.size() < skey.size() || nkey.compare(nkey.size() - skey.size(), skey.size(), skey) != 0) continue;
-    out.push_back(base + L"\\" + name);
+    std::wstring upper = name;
+    for (wchar_t& c : upper) c = static_cast<wchar_t>(std::towupper(c));
+    found.emplace_back(std::move(upper), base + L"\\" + name);
   }
+  std::sort(found.begin(), found.end());
+  for (auto& e : found) out.push_back(std::move(e.second));
   return out;
 }
 

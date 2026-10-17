@@ -17,7 +17,11 @@ class IFile {
   virtual bool write_at(uint64_t off, const void* p, size_t n) = 0;
   virtual bool read_at(uint64_t off, void* p, size_t n) = 0;        // false on short read
   virtual bool flush() = 0;                                          // data on stable storage (FlushFileBuffers)
+  // Never blocks, even while another thread is stuck inside write/flush on this
+  // handle (a stalled device); returns the last known length, 0 once closed.
   virtual uint64_t size() const = 0;
+  // May block behind an in-flight operation on the same handle: never call it on a
+  // handle whose writer is stalled. Stalled writers are abandoned (leaked) by design.
   virtual void close() = 0;
 };
 

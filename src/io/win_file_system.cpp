@@ -2,6 +2,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cwchar>
 #include <cwctype>
@@ -53,21 +54,21 @@ constexpr size_t kMaxIo = size_t(1) << 30;
 
 class WinFile : public IFile {
  public:
-  explicit WinFile(HANDLE h) : h_(h) {}
+  WinFile(HANDLE h, uint64_t initial_size) : h_(h), size_(initial_size) {}
   ~WinFile() override { close(); }
 
   bool write(const void* p, size_t n) override {
     std::lock_guard<std::mutex> lk(mu_);
     if (h_ == INVALID_HANDLE_VALUE) return false;
-    LARGE_INTEGER zero{};
-    if (!SetFilePointerEx(h_, zero, nullptr, FILE_END)) return false;
-    return write_all(p, n);
+    LARGE_INTEGER zero{}, end{};
+    if (!SetFilePointerEx(h_, zero, &end, FILE_END)) return false;
+    return write_all(p, n) ? publish_size(static_cast<uint64_t>(end.QuadPart) + n) : resync_size();
   }
 
   bool write_at(uint64_t off, const void* p, size_t n) override {
     std::lock_guard<std::mutex> lk(mu_);
     if (h_ == INVALID_HANDLE_VALUE || !seek(off)) return false;
-    return write_all(p, n);
+    return write_all(p, n) ? publish_size(off + n) : resync_size();
   }
 
   bool read_at(uint64_t off, void* p, size_t n) override {
@@ -89,12 +90,8 @@ class WinFile : public IFile {
     return h_ != INVALID_HANDLE_VALUE && FlushFileBuffers(h_) != 0;
   }
 
-  uint64_t size() const override {
-    std::lock_guard<std::mutex> lk(mu_);
-    LARGE_INTEGER sz{};
-    if (h_ == INVALID_HANDLE_VALUE || !GetFileSizeEx(h_, &sz)) return 0;
-    return static_cast<uint64_t>(sz.QuadPart);
-  }
+  // Lock-free so a stalled write cannot block size() callers (e.g. a watchdog).
+  uint64_t size() const override { return size_.load(std::memory_order_acquire); }
 
   void close() override {
     std::lock_guard<std::mutex> lk(mu_);
@@ -102,6 +99,7 @@ class WinFile : public IFile {
       CloseHandle(h_);
       h_ = INVALID_HANDLE_VALUE;
     }
+    size_.store(0, std::memory_order_release);
   }
 
  private:
@@ -124,8 +122,24 @@ class WinFile : public IFile {
     return true;
   }
 
-  mutable std::mutex mu_;  // seek + transfer must not interleave between threads
+  // Records a successful write ending at `end`; always returns true.
+  bool publish_size(uint64_t end) {
+    if (end > size_.load(std::memory_order_relaxed)) size_.store(end, std::memory_order_release);
+    return true;
+  }
+
+  // After a failed write the file length is uncertain: re-read it. Returns false.
+  bool resync_size() {
+    LARGE_INTEGER sz{};
+    if (GetFileSizeEx(h_, &sz)) size_.store(static_cast<uint64_t>(sz.QuadPart), std::memory_order_release);
+    return false;
+  }
+
+  // Held across blocking I/O (seek + transfer must not interleave), so a stalled
+  // device blocks every other call that takes it. size() deliberately does not.
+  std::mutex mu_;
   HANDLE h_;
+  std::atomic<uint64_t> size_;
 };
 
 class WinFileSystem : public IFileSystem {
@@ -176,9 +190,18 @@ class WinFileSystem : public IFileSystem {
   }
 
   std::optional<uint64_t> free_bytes(const std::wstring& dir) override {
-    ULARGE_INTEGER avail{};
-    if (!GetDiskFreeSpaceExW(api_path(dir).c_str(), &avail, nullptr, nullptr)) return std::nullopt;
-    return static_cast<uint64_t>(avail.QuadPart);
+    // A not-yet-created folder lives on the volume of its nearest existing ancestor.
+    std::wstring p = dir;
+    for (;;) {
+      ULARGE_INTEGER avail{};
+      if (GetDiskFreeSpaceExW(api_path(p).c_str(), &avail, nullptr, nullptr))
+        return static_cast<uint64_t>(avail.QuadPart);
+      while (!p.empty() && is_sep(p.back())) p.pop_back();
+      const size_t cut = p.find_last_of(L"\\/");
+      if (cut == std::wstring::npos || cut < 2) return std::nullopt;  // never fall to "\\" or "\\server"
+      p.resize(cut);
+      if (p.back() == L':') p += L'\\';  // "C:" means the current dir; use the root
+    }
   }
 
   std::wstring volume_id(const std::wstring& dir) override {
@@ -206,7 +229,9 @@ class WinFileSystem : public IFileSystem {
       set_err(err, L"CreateFileW", GetLastError());
       return nullptr;
     }
-    return std::make_unique<WinFile>(h);
+    LARGE_INTEGER sz{};
+    const uint64_t initial = GetFileSizeEx(h, &sz) ? static_cast<uint64_t>(sz.QuadPart) : 0;
+    return std::make_unique<WinFile>(h, initial);
   }
 
   // Creates d and any missing parents. (SHCreateDirectoryExW cannot take \\?\ paths.)

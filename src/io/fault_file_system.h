@@ -33,6 +33,9 @@ class FaultFileSystem : public IFileSystem {
 
   FaultFileSystem();
   ~FaultFileSystem() override;  // releases hung writers
+  // Handles: size() and close() never block here, even while another thread is
+  // hung in write(). Callers must not rely on close() being non-blocking: the
+  // real IFile::close() may block behind an in-flight operation.
 
   void add_rule(Rule r);
   void clear_rules();                // does not wake hung writers; see release_hangs
