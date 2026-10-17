@@ -3,6 +3,7 @@
 #include <opusenc.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 namespace sl {
@@ -22,7 +23,7 @@ constexpr size_t kMaxBlock = 1 << 20;    // frames per ope_encoder_write_float c
 struct State {
   std::unique_ptr<IFile> file;
   OggOpusEnc* enc = nullptr;
-  bool abandoned = false;
+  std::atomic<bool> abandoned{false};  // set by the watchdog thread while a callback may run
   int64_t granule = -1;   // of the last page successfully written to the file
   int64_t preskip = 0;    // from the OpusHead packet
 };
@@ -66,9 +67,11 @@ class OpusFile final : public IEncoderFile {
 
   bool write(const float* in, size_t frames) override {
     if (!s_ || !s_->enc || bad_) return false;
+    // Locals: abandon() may null s_ from another thread while this call is stalled in a write.
+    OggOpusEnc* const enc = s_->enc;
     for (size_t done = 0; done < frames;) {
       const size_t n = std::min(kMaxBlock, frames - done);
-      if (ope_encoder_write_float(s_->enc, in + done * channels_, int(n)) != OPE_OK) {
+      if (ope_encoder_write_float(enc, in + done * channels_, int(n)) != OPE_OK) {
         bad_ = true;  // libopusenc is unrecoverable after a failed page write
         return false;
       }
@@ -80,7 +83,10 @@ class OpusFile final : public IEncoderFile {
 
   bool flush() override {
     if (!s_ || !s_->file || bad_) return false;
-    if (!s_->file->flush()) return false;
+    if (!s_->file->flush()) {
+      bad_ = true;  // durability of the pending data is unknown from here on
+      return false;
+    }
     confirmed_ = std::max(confirmed_, confirmed_from_granule());
     return true;
   }
@@ -152,15 +158,7 @@ std::unique_ptr<IEncoderFile> open_opus(IFileSystem& fs, const std::wstring& pat
   s->enc = ope_encoder_create_callbacks(&kCallbacks, s.get(), comments, opus_int32(p.input_rate),
                                         p.channels, kFamily, &e);
   ope_comments_destroy(comments);
-  if (!s->enc || e != OPE_OK) {
-    if (s->enc) {
-      s->abandoned = true;  // nothing written yet; skip close_cb
-      ope_encoder_destroy(s->enc);
-      s->enc = nullptr;
-      s->abandoned = false;
-    }
-    return drop_file(L"cannot create Opus encoder");
-  }
+  if (!s->enc) return drop_file(L"cannot create Opus encoder");
 
   const opus_int32 bitrate = p.bitrate ? opus_int32(p.bitrate) : (p.channels == 1 ? 64000 : 128000);
   if (ope_encoder_ctl(s->enc, OPUS_SET_BITRATE(bitrate)) != OPE_OK ||

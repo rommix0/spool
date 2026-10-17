@@ -1,21 +1,25 @@
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "format/encoder.h"
 #include "format/opus_writer.h"
 #include "io/fault_file_system.h"
+#include "io/file_system.h"
 #include "test.h"
 
 using namespace sl;
 
 namespace {
 
-const std::wstring kDir = L"D:\rec";
-const std::wstring kPath = L"D:\rec\a.opus";
+const std::wstring kDir = L"D:\\rec";
+const std::wstring kPath = L"D:\\rec\\a.opus";
 
 std::unique_ptr<IEncoderFile> open(FaultFileSystem& fs, uint32_t rate, uint16_t ch,
                                    std::wstring* err = nullptr) {
@@ -186,7 +190,7 @@ TEST(opus_never_overwrites) {
 
 TEST(opus_write_failure_is_sticky) {
   FaultFileSystem fs;
-  fs.add_rule({L"D:\rec", FaultFileSystem::Kind::FailWrite, 20000, 0});
+  fs.add_rule({kDir, FaultFileSystem::Kind::FailWrite, 20000, 0});
   auto w = open(fs, 48000, 2);
   CHECK(w != nullptr);
   if (!w) return;
@@ -196,13 +200,10 @@ TEST(opus_write_failure_is_sticky) {
   CHECK(!ok);
   CHECK(!w->write(std::vector<float>(2048).data(), 1024));
   CHECK(!w->flush());
-  const uint64_t confirmed = w->confirmed_frames();
-  CHECK(!w->flush());
-  CHECK_EQ(w->confirmed_frames(), confirmed);
   CHECK(!w->finalize({}, std::nullopt));  // must return, not hang
 }
 
-TEST(opus_abandon_does_not_close_or_write) {
+TEST(opus_flush_failure_is_sticky) {
   FaultFileSystem fs;
   auto w = open(fs, 48000, 2);
   CHECK(w != nullptr);
@@ -210,12 +211,111 @@ TEST(opus_abandon_does_not_close_or_write) {
   uint64_t pos = 0;
   CHECK(feed(*w, 48000, 2, 96000, pos));
   CHECK(w->flush());
-  const auto before = fs.contents(kPath);
-  w->abandon();
+  const uint64_t confirmed = w->confirmed_frames();
+  CHECK(confirmed > 0);
+  fs.add_rule({kDir, FaultFileSystem::Kind::FailFlush, 0, 0});
+  CHECK(feed(*w, 48000, 2, 96000, pos));
+  CHECK(!w->flush());
+  fs.clear_rules();  // the device recovers, but the data's durability is unknown
+  CHECK(!w->flush());
   CHECK(!w->write(std::vector<float>(2048).data(), 1024));
+  CHECK_EQ(w->confirmed_frames(), confirmed);
+  CHECK(!w->finalize({}, std::nullopt));
+}
+
+namespace {
+
+// Counts the calls that reach the file after a mark; delegates everything.
+struct Counts {
+  std::atomic<int> flushes{0}, closes{0}, writes_started{0}, writes_done{0};
+};
+
+class CountingFile : public IFile {
+ public:
+  CountingFile(std::unique_ptr<IFile> f, Counts& c) : f_(std::move(f)), c_(c) {}
+  bool write(const void* p, size_t n) override {
+    ++c_.writes_started;
+    const bool ok = f_->write(p, n);
+    ++c_.writes_done;
+    return ok;
+  }
+  bool write_at(uint64_t o, const void* p, size_t n) override { return f_->write_at(o, p, n); }
+  bool read_at(uint64_t o, void* p, size_t n) override { return f_->read_at(o, p, n); }
+  bool flush() override {
+    ++c_.flushes;
+    return f_->flush();
+  }
+  uint64_t size() const override { return f_->size(); }
+  void close() override {
+    ++c_.closes;
+    f_->close();
+  }
+
+ private:
+  std::unique_ptr<IFile> f_;
+  Counts& c_;
+};
+
+class CountingFs : public IFileSystem {
+ public:
+  CountingFs(FaultFileSystem& in, Counts& c) : in_(in), c_(c) {}
+  std::unique_ptr<IFile> create_new(const std::wstring& p, std::wstring* e) override {
+    auto f = in_.create_new(p, e);
+    return f ? std::make_unique<CountingFile>(std::move(f), c_) : nullptr;
+  }
+  std::unique_ptr<IFile> open_existing(const std::wstring& p, std::wstring* e) override {
+    return in_.open_existing(p, e);
+  }
+  bool exists(const std::wstring& p) override { return in_.exists(p); }
+  bool ensure_dir(const std::wstring& d, std::wstring* e) override { return in_.ensure_dir(d, e); }
+  bool remove(const std::wstring& p) override { return in_.remove(p); }
+  std::vector<std::wstring> list(const std::wstring& d, const std::wstring& s) override {
+    return in_.list(d, s);
+  }
+  std::optional<uint64_t> free_bytes(const std::wstring& d) override { return in_.free_bytes(d); }
+  std::wstring volume_id(const std::wstring& d) override { return in_.volume_id(d); }
+
+ private:
+  FaultFileSystem& in_;
+  Counts& c_;
+};
+
+}  // namespace
+
+TEST(opus_abandon_does_not_close_or_flush_a_stalled_file) {
+  FaultFileSystem fs;
+  std::wstring err;
+  fs.ensure_dir(kDir, &err);
+  fs.add_rule({kDir, FaultFileSystem::Kind::HangWrite, 20000, 0});
+  Counts counts;
+  CountingFs cfs(fs, counts);
+  auto w = open_opus(cfs, kPath, OpusParams{48000, 2}, &err);
+  CHECK(w != nullptr);
+  if (!w) return;
+
+  std::atomic<bool> wrote_ok{true};
+  std::thread writer([&] {
+    uint64_t pos = 0;
+    for (int i = 0; i < 100 && wrote_ok; ++i) wrote_ok = feed(*w, 48000, 2, 48000, pos);
+  });
+  // Wait until the writer thread is stuck inside a file write.
+  for (int i = 0; i < 5000 && counts.writes_started == counts.writes_done; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  CHECK(counts.writes_started > counts.writes_done);
+
+  const int flushes = counts.flushes, closes = counts.closes;
+  w->abandon();  // from another thread, while the writer is inside the callback
+  fs.release_hangs();
+  writer.join();
+
+  CHECK(!wrote_ok);  // the released write failed
+  CHECK_EQ(counts.flushes.load(), flushes);
+  CHECK_EQ(counts.closes.load(), closes);
+  CHECK_EQ(counts.closes.load(), 0);
   CHECK(!w->flush());
   CHECK(!w->finalize({}, std::nullopt));
   w->abandon();
   w.reset();
-  CHECK(fs.contents(kPath) == before);
+  CHECK_EQ(counts.flushes.load(), flushes);
+  CHECK_EQ(counts.closes.load(), 0);
 }
