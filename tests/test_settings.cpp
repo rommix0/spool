@@ -360,14 +360,19 @@ TEST(text_summary) {
 }
 
 TEST(text_input_line) {
-  CHECK(format_input_line(L"USB mic", StreamFormat{48000, 2}, CaptureMode::Raw) ==
+  CHECK(format_input_line(L"USB mic", StreamFormat{48000, 2}, CaptureMode::Raw, true) ==
         L"USB mic · 48 kHz · 2 ch · Raw");
-  CHECK(format_input_line(L"Interface", StreamFormat{44100, 8}, CaptureMode::Exclusive) ==
+  CHECK(format_input_line(L"Interface", StreamFormat{44100, 8}, CaptureMode::Exclusive, true) ==
         L"Interface · 44.1 kHz · 8 ch · Exclusive");
-  CHECK(format_input_line(L"X", StreamFormat{176400, 1}, CaptureMode::Raw) ==
+  CHECK(format_input_line(L"X", StreamFormat{176400, 1}, CaptureMode::Raw, true) ==
         L"X · 176.4 kHz · 1 ch · Raw");
-  CHECK(format_input_line(L"X", StreamFormat{192000, 2}, CaptureMode::Raw) ==
+  CHECK(format_input_line(L"X", StreamFormat{192000, 2}, CaptureMode::Raw, true) ==
         L"X · 192 kHz · 2 ch · Raw");
+  // The active mode: shared without raw (Windows processing may be on) never claims "Raw".
+  CHECK(format_input_line(L"USB mic", StreamFormat{48000, 2}, CaptureMode::Raw, false) ==
+        L"USB mic · 48 kHz · 2 ch · Shared");
+  CHECK(format_input_line(L"Interface", StreamFormat{48000, 2}, CaptureMode::Exclusive, false) ==
+        L"Interface · 48 kHz · 2 ch · Exclusive");
 }
 
 TEST(text_buffer_line) {

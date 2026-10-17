@@ -1,6 +1,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <thread>
 
 #include "audio/wasapi_source.h"
@@ -107,6 +108,8 @@ TEST(wasapi_raw_capture_one_second) {
   CHECK(f.channels >= 1 && f.channels <= 8);
   // The source is bound to the endpoint that was default at open() (not to "whatever is default").
   CHECK(src.device_id() == def);
+  CHECK(!src.exclusive());
+  std::printf("  raw active: %s\n", src.raw_active() ? "yes" : "no (endpoint reports no raw support)");
   for (const auto& d : sl::list_capture_devices())
     if (d.id == def && d.mix_format.channels != 0) CHECK_EQ(f.channels, d.mix_format.channels);
   check_capture(src, 1000);
@@ -125,6 +128,7 @@ TEST(wasapi_exclusive_capture_one_second) {
   if (!src.open(cfg, &err)) SKIP("exclusive open failed (device busy or not allowed)");
   CHECK_EQ(src.format().sample_rate, rates[0]);
   CHECK(src.raw_active());
+  CHECK(src.exclusive());
   CHECK(src.device_id() == def);
   check_capture(src, 1000);
 }
@@ -138,5 +142,6 @@ TEST(wasapi_failed_open_clears_state) {
   CHECK(!src.open(cfg, &err));
   CHECK(src.format() == sl::StreamFormat{});
   CHECK(!src.raw_active());
+  CHECK(!src.exclusive());
   CHECK(src.device_id().empty());
 }

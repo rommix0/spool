@@ -65,11 +65,11 @@ std::wstring format_summary(const DestinationConfig& d, uint16_t input_channels)
   return fmt + kDot + L"ch " + channel_text(chs);
 }
 
-std::wstring format_input_line(const std::wstring& device, StreamFormat fmt, CaptureMode mode) {
+std::wstring format_input_line(const std::wstring& device, StreamFormat fmt, CaptureMode mode, bool raw_active) {
   std::wstring khz = std::to_wstring(fmt.sample_rate / 1000);
   if (const uint32_t tenths = fmt.sample_rate % 1000 / 100) khz += L"." + std::to_wstring(tenths);
   return device + kDot + khz + L" kHz" + kDot + std::to_wstring(fmt.channels) + L" ch" + kDot +
-         (mode == CaptureMode::Exclusive ? L"Exclusive" : L"Raw");
+         (mode == CaptureMode::Exclusive ? L"Exclusive" : raw_active ? L"Raw" : L"Shared");
 }
 
 std::wstring format_buffer_line(double fill, uint64_t gaps, uint64_t discontinuities) {

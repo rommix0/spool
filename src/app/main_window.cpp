@@ -652,8 +652,13 @@ void MainWindow::refresh_slow() {
   const StreamFormat fmt = rec && st.fmt.sample_rate ? st.fmt : ctx_.source.format();
 
   set_text(clock_, clock_text_, format_elapsed(st.elapsed_s));
+  // The mode the input is open in (a test source has no Windows processing).
+  const CaptureMode mode = !ctx_.wasapi              ? ctx_.settings.input.mode
+                           : ctx_.wasapi->exclusive() ? CaptureMode::Exclusive
+                                                      : CaptureMode::Raw;
+  const bool raw = !ctx_.wasapi || ctx_.wasapi->raw_active();
   set_text(device_, device_text_,
-           fmt.sample_rate ? format_input_line(device_name_, fmt, ctx_.settings.input.mode) : L"No input device");
+           fmt.sample_rate ? format_input_line(device_name_, fmt, mode, raw) : L"No input device");
   set_text(buffer_, buffer_text_, format_buffer_line(st.ring_fill, st.gaps, st.discontinuities));
   // Enable the partner first and hand it the focus, so disabling never strands the keyboard.
   HWND on = rec ? stop_ : record_, off = rec ? record_ : stop_;

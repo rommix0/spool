@@ -41,17 +41,20 @@ class WasapiSource : public ICaptureSource {
   WasapiSource(const WasapiSource&) = delete;
   WasapiSource& operator=(const WasapiSource&) = delete;
 
-  // Raw mode with an endpoint that lacks raw support falls back to normal shared mode
-  // (see raw_active()). Fails for more than 8 channels. An empty device id means the
-  // default capture device.
+  // Raw mode with an endpoint that lacks raw support (or refuses the RAW option) falls back
+  // to normal shared mode (see raw_active()). Fails for more than 8 channels. An empty
+  // device id means the default capture device.
   bool open(const CaptureConfig&, std::wstring* err) override;
   StreamFormat format() const override;
   bool start(CaptureCallbacks*) override;  // false while lost or not open
   void stop() override;
 
-  // True when the stream is unprocessed: RAW shared mode took effect, or exclusive mode.
+  // True when the stream is unprocessed: exclusive mode, or RAW shared mode on an endpoint
+  // that reports raw processing support (PKEY_Devices_AudioDevice_RawProcessingSupported).
   // False after a fallback to normal shared mode (the app should warn).
   bool raw_active() const;
+  // True when the stream is open in exclusive mode.
+  bool exclusive() const;
 
   // The endpoint this source is bound to: resolved at open() (so an empty config id becomes
   // the then-default device) and kept across loss and return; empty when not open. It never

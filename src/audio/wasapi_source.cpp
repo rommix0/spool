@@ -170,6 +170,18 @@ HRESULT activate_client(IMMDevice* dev, ComPtr<IAudioClient>* c) {
                        reinterpret_cast<void**>(c->GetAddressOf()));
 }
 
+// The endpoint's System.Devices.AudioDevice.RawProcessingSupported; false if unknown.
+bool raw_supported(IMMDevice* dev) {
+  ComPtr<IPropertyStore> props;
+  if (FAILED(dev->OpenPropertyStore(STGM_READ, &props))) return false;
+  PROPVARIANT pv;
+  PropVariantInit(&pv);
+  const bool yes = SUCCEEDED(props->GetValue(PKEY_Devices_AudioDevice_RawProcessingSupported, &pv)) &&
+                   pv.vt == VT_BOOL && pv.boolVal == VARIANT_TRUE;
+  PropVariantClear(&pv);
+  return yes;
+}
+
 }  // namespace
 
 // ---- free functions ----
@@ -304,6 +316,7 @@ class WasapiImpl {
         fmt_ = {};
         pinned_id_.clear();
         raw_active_.store(false);
+        exclusive_.store(false);
       }
     });
     return ok;
@@ -327,6 +340,7 @@ class WasapiImpl {
   }
 
   bool raw_active() const { return raw_active_.load(); }
+  bool exclusive() const { return exclusive_.load(); }
 
   // The endpoint id the source is bound to (resolved at open(); empty when not open).
   std::wstring device_id() const {
@@ -408,6 +422,7 @@ class WasapiImpl {
   StreamFormat fmt_;
   std::wstring pinned_id_;
   std::atomic<bool> raw_active_{false};
+  std::atomic<bool> exclusive_{false};
   std::atomic<bool> lost_{false};
   std::atomic<CaptureCallbacks*> cb_{nullptr};
   std::atomic<bool> run_{false};
@@ -595,9 +610,12 @@ bool WasapiImpl::open_client(const CaptureConfig& cfg, std::wstring* err) {
     ok = open_exclusive(dev.Get(), cfg.sample_rate, err);
     if (ok) raw_active_.store(true);
   } else {
-    ok = open_shared(dev.Get(), true, err);
-    if (!ok) ok = open_shared(dev.Get(), false, err);  // endpoint without raw support
+    // RAW only where the endpoint says it bypasses the processing; otherwise the option may
+    // be accepted and silently ignored.
+    ok = raw_supported(dev.Get()) && open_shared(dev.Get(), true, err);
+    if (!ok) ok = open_shared(dev.Get(), false, err);  // no raw support, or RAW refused
   }
+  if (ok) exclusive_.store(cfg.mode == CaptureMode::Exclusive);
   if (!ok) close_client();
   return ok;
 }
@@ -859,6 +877,7 @@ StreamFormat WasapiSource::format() const { return p_->format(); }
 bool WasapiSource::start(CaptureCallbacks* cb) { return p_->start(cb); }
 void WasapiSource::stop() { p_->stop(); }
 bool WasapiSource::raw_active() const { return p_->raw_active(); }
+bool WasapiSource::exclusive() const { return p_->exclusive(); }
 std::wstring WasapiSource::device_id() const { return p_->device_id(); }
 
 }  // namespace sl
