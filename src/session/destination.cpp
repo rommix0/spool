@@ -620,6 +620,8 @@ class Destination::Writer {
         std::lock_guard<std::mutex> lk(k_.m);
         if (stale()) return false;
         if (k_.quarantined.count(i)) continue;
+        // R14 per folder: each folder's I/O gets its own 2 s before it counts as a hang.
+        if (k_.busy_folder != i) k_.io_since_ms = k_.clock.steady_ms();
         k_.busy_folder = i;
         dir = k_.st.config.folders[i];
       }

@@ -1023,3 +1023,34 @@ TEST(failover_stall_before_first_file) {
     CHECK_EQ(recs[1]["old_path"], std::string());
   }
 }
+
+// R14 per folder: the 2 s idle-stall rule counts from the start of the current folder's
+// I/O, not from the start of the walk. D: takes 1.5 s to fail its probe, then E:'s probe
+// runs 1.5 s: neither is a hang, so neither may be quarantined.
+TEST(failover_stall_clock_restarts_per_folder) {
+  FoRig rig;
+  rig.fs.add_rule({L"D:\\", Kind::HangWrite});
+  rig.fs.add_rule({L"E:\\", Kind::HangWrite});
+  Destination d(rig.cfg, rig.sp, rig.ring, rig.fs, rig.clock, rig.log);
+  d.start(0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));  // in D:'s probe
+  rig.clock.advance_ms(1500);
+  d.declare_stalled();
+  rig.fs.release_hangs();  // D:'s probe fails after 1.5 s; E:'s starts and blocks
+  CHECK(poll([&] { return d.status().folders[0].health == FolderHealth::Failed; }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));  // in E:'s probe
+  for (int i = 0; i < 15; ++i) {  // 1.5 s in E:, 3 s since the walk began
+    rig.clock.advance_ms(100);
+    d.declare_stalled();
+  }
+  CHECK_EQ(stall_log_entries(rig.log), size_t(0));
+  rig.fs.clear_rules();
+  rig.fs.add_rule({L"D:\\", Kind::FailOpen});
+  rig.fs.release_hangs();  // E:'s probe fails as well: LastResort, nothing quarantined
+  CHECK(poll([&] { return d.status().state == DestState::LastResort; }));
+  rig.clock.advance_ms(30100);
+  CHECK(poll([&] { return on_folder(d.status(), 1); }));  // E: is probed again and used
+  CHECK(rig.pump(d, 0, kRate));
+  d.stop(kRate);
+  CHECK_EQ(stall_log_entries(rig.log), size_t(0));
+}
