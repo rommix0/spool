@@ -2,10 +2,10 @@
 // One output stream (§4.2): a writer thread that reads the capture ring through its
 // own cursor, extracts its channels, writes WAV or Opus files with wall-clock aligned
 // rotation, confirms data to disk every flush_ms and keeps a JSON Lines manifest.
-#include <atomic>
+// Failures (§4.3, §8.2) fail over along the folder chain from the last confirmed
+// sample; with no folder left the destination waits in LastResort and retries.
 #include <cstdint>
-#include <deque>
-#include <mutex>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>
@@ -23,13 +23,13 @@ namespace sl {
 
 struct CmdMarker { SampleIndex at; std::wstring name; };
 struct CmdSplit { SampleIndex at; };
-struct CmdAppendFolder { std::wstring path; };
+struct CmdAppendFolder { std::wstring path; };  // in LastResort it is tried at once
 struct CmdGapStart { SampleIndex at; std::string reason; };
 struct CmdGapEnd { SampleIndex at; std::string reason; };
 struct CmdCloseForGap { SampleIndex at; };  // write through `at`, close, no file until CmdResumeAt
 struct CmdResumeAt { SampleIndex at; };     // open the next file at `at` and resume writing
 struct CmdClockPair { SampleIndex at; WallTime wall; };
-struct CmdAcknowledge {};
+struct CmdAcknowledge {};                   // clears needs_ack
 using DestCommand = std::variant<CmdMarker, CmdSplit, CmdAppendFolder, CmdGapStart, CmdGapEnd,
                                  CmdCloseForGap, CmdResumeAt, CmdClockPair, CmdAcknowledge>;
 
@@ -47,7 +47,7 @@ struct DestStatus {
   std::wstring name, current_file;
   DestinationConfig config;
   DestState state;
-  bool needs_ack;
+  bool needs_ack;  // set by a failover or LastResort, cleared by CmdAcknowledge
   std::vector<FolderStatus> folders;
   uint64_t gaps;
   SampleIndex cursor, confirmed;
@@ -60,6 +60,10 @@ struct DestResumeSeed {
   std::wstring prev_manifest;  // appended to instead of creating a new manifest
 };
 
+// start, stop and declare_stalled are called from one controlling thread; post, status,
+// progress and disable from any thread. The ring, file system, clock and event log must
+// outlive the Destination; a writer abandoned on a hung drive never touches the ring,
+// clock or log again, and touches the file system only from inside the call that hung.
 class Destination {
  public:
   Destination(DestinationConfig, const SessionParams&, SampleRing&, IFileSystem&, IClock&, EventLog&,
@@ -69,44 +73,34 @@ class Destination {
   Destination& operator=(const Destination&) = delete;
 
   void start(SampleIndex at);
-  void post(DestCommand);      // any thread; mutex-protected deque drained by the worker
-  void stop(SampleIndex end);  // writes through end, finalizes, waits <= 3 s, else abandons the worker
-  SampleIndex progress() const { return cursor_.load(std::memory_order_acquire); }
-  void declare_stalled();             // Task 10
+  void post(DestCommand);      // mutex-protected deque drained by the worker
+  // Writes through end and finalizes; returns within 3 s even if a drive hangs (the stuck
+  // worker is then abandoned).
+  void stop(SampleIndex end);
+  SampleIndex progress() const;
+  // The stall watchdog fired (see is_stalled): the worker is abandoned where it hangs and a
+  // new one continues from the last confirmed sample in the next healthy folder.
+  void declare_stalled();
   void disable(std::wstring reason);  // state Disabled, nothing (more) written
   DestStatus status() const;
   uint64_t data_rate() const;  // bytes/s: WAV rate*ch*bytes; Opus bitrate/8
 
  private:
+  struct Core;   // state shared with the worker generations; outlives the Destination
   class Writer;  // one generation of the writer thread; see destination.cpp
 
   void log(Severity, std::wstring text);
   void set_state(DestState);  // Disabled is sticky
 
-  // Immutable after construction.
-  const SessionParams sp_;
-  SampleRing& ring_;
-  IFileSystem& fs_;
-  IClock& clock_;
-  EventLog& log_;
-  const DestResumeSeed seed_;
-  const std::wstring name_;
-  std::vector<uint16_t> map_;  // ring channel per destination channel
-
-  // Shared with the writer. m_ is never held across file I/O.
-  mutable std::mutex m_;
-  std::deque<DestCommand> cmds_;
-  DestStatus st_;
-  bool stop_requested_ = false;
-  SampleIndex stop_end_ = 0;
-  std::string stop_reason_;
-  std::atomic<SampleIndex> cursor_{0};
-
-  // Owned by the controlling thread. An abandoned writer (and its encoder) is leaked,
-  // never destroyed: its thread may still be inside a stalled write.
+  std::shared_ptr<Core> core_;
+  // A replaced or abandoned Writer is leaked, never destroyed: its thread may still be
+  // inside a stalled write. Written under core_->m (disable() reads it from any thread).
   Writer* writer_ = nullptr;
-  std::thread thread_;
+  std::thread thread_;  // controlling thread only
 };
+
+// Bytes per second written by a destination with `channels` channels at `rate`.
+uint64_t data_rate(const DestinationConfig&, uint32_t rate, size_t channels);
 
 // The stall watchdog condition: the cursor lags the capture position by more than
 // stall_percent of the ring.

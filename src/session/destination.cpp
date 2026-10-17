@@ -3,9 +3,18 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <cwctype>
+#include <deque>
+#include <functional>
+#include <mutex>
 #include <set>
+#include <shared_mutex>
+#include <string_view>
+#include <system_error>
 #include <utility>
 
 #include "core/sample_convert.h"
@@ -13,6 +22,7 @@
 #include "format/wav_writer.h"
 #include "session/manifest.h"
 #include "session/naming.h"
+#include "session/preflight.h"
 
 namespace sl {
 
@@ -22,6 +32,10 @@ constexpr size_t kChunkFrames = 4096;
 constexpr int kIdleMs = 5;
 constexpr int kNameAttempts = 100;
 constexpr int64_t kDayMs = 86400000;
+constexpr uint64_t kSpaceCheckMs = 10000;  // low-water check interval (§8.2)
+constexpr uint64_t kRetryMs = 30000;       // LastResort retry interval (§4.3)
+constexpr DWORD kStopBudgetMs = 3000;
+constexpr size_t kNone = SIZE_MAX;
 
 uint32_t bytes_per_sample(WavDepth d) {
   switch (d) {
@@ -56,205 +70,583 @@ std::wstring hms(WallTime w) {
   return buf;
 }
 
+std::wstring widen(std::string_view s) { return std::wstring(s.begin(), s.end()); }  // ASCII
+
+// Case-insensitive folder identity, ignoring trailing separators.
+std::wstring folder_key(std::wstring p) {
+  while (!p.empty() && (p.back() == L'\\' || p.back() == L'/')) p.pop_back();
+  for (wchar_t& c : p) c = c == L'/' ? L'\\' : wchar_t(std::towlower(c));
+  return p;
+}
+
+// The size of the file an encoder writes, kept after the encoder closed it, so file_close
+// can report the byte length without reopening the file on a failing drive.
+using SizeTap = std::shared_ptr<std::atomic<uint64_t>>;
+
+class TappedFile final : public IFile {
+ public:
+  TappedFile(std::unique_ptr<IFile> f, SizeTap tap) : f_(std::move(f)), tap_(std::move(tap)) {}
+  bool write(const void* p, size_t n) override {
+    const bool ok = f_->write(p, n);
+    note();
+    return ok;
+  }
+  bool write_at(uint64_t off, const void* p, size_t n) override {
+    const bool ok = f_->write_at(off, p, n);
+    note();
+    return ok;
+  }
+  bool read_at(uint64_t off, void* p, size_t n) override { return f_->read_at(off, p, n); }
+  bool flush() override { return f_->flush(); }
+  uint64_t size() const override { return f_->size(); }
+  void close() override {
+    note();
+    f_->close();
+  }
+
+ private:
+  void note() { tap_->store(f_->size(), std::memory_order_relaxed); }
+  std::unique_ptr<IFile> f_;
+  SizeTap tap_;
+};
+
+// Hands out TappedFiles; everything else goes straight to the real file system.
+class TappingFs final : public IFileSystem {
+ public:
+  TappingFs(IFileSystem& fs, SizeTap tap) : fs_(fs), tap_(std::move(tap)) {}
+  std::unique_ptr<IFile> create_new(const std::wstring& p, std::wstring* err) override {
+    auto f = fs_.create_new(p, err);
+    if (!f) return f;
+    tap_->store(0, std::memory_order_relaxed);
+    return std::make_unique<TappedFile>(std::move(f), tap_);
+  }
+  std::unique_ptr<IFile> open_existing(const std::wstring& p, std::wstring* err) override {
+    return fs_.open_existing(p, err);
+  }
+  bool exists(const std::wstring& p) override { return fs_.exists(p); }
+  bool ensure_dir(const std::wstring& d, std::wstring* err) override { return fs_.ensure_dir(d, err); }
+  bool remove(const std::wstring& p) override { return fs_.remove(p); }
+  std::vector<std::wstring> list(const std::wstring& d, const std::wstring& s) override { return fs_.list(d, s); }
+  std::optional<uint64_t> free_bytes(const std::wstring& d) override { return fs_.free_bytes(d); }
+  std::wstring volume_id(const std::wstring& d) override { return fs_.volume_id(d); }
+
+ private:
+  IFileSystem& fs_;
+  SizeTap tap_;
+};
+
+enum class Mode { Writing, GapClosed, LastResort };
+
+// Writer state that a new generation takes over after a stall. The writer publishes it
+// with every status change, under the status mutex.
+struct Carry {
+  bool started = false;  // begin() ran
+  Mode mode = Mode::Writing;
+  uint32_t n = 1, seg = 0;
+  size_t folder = kNone;  // folder of the open (or last) file
+  SampleIndex session_start = 0, file_start = 0;
+  SampleIndex next_boundary = kNoRotation;
+  std::set<SampleIndex> splits;
+  std::vector<std::pair<SampleIndex, std::wstring>> markers;  // not yet in a finalized file
+  std::wstring manifest_path;     // the current (or last) manifest: the next one's prev_manifest
+  std::vector<JsonLine> backlog;  // events waiting for a manifest
+  SampleIndex gap_from = 0;       // LastResort: where the gap started
+  bool gap_in_manifest = false;   // ... and its gap_start went to a manifest, not the backlog
+};
+
+// A file and/or manifest handed off by a failover or a manifest move. It is finished on a
+// detached thread, so a failing drive never blocks the writer.
+struct Retired {
+  IEncoderFile* enc = nullptr;
+  std::unique_ptr<Manifest> man;
+  std::wstring path;
+  SampleIndex start = 0;
+  std::optional<uint64_t> truncate_to;
+  std::vector<Marker> markers;
+  SizeTap bytes;
+  std::vector<JsonLine> after;  // appended to `man` after the file_close
+};
+
 }  // namespace
 
-// One generation of the writer thread. Everything the thread touches while it may be
-// stuck in file I/O lives here, so an abandoned generation (Task 10) can be leaked whole:
-// the encoder is a raw pointer that is deleted only after a normal finalize.
+// Everything a writer generation shares with the Destination and with later generations.
+// Writers hold it by shared_ptr, so an abandoned one never touches freed memory.
+struct Destination::Core {
+  Core(const SessionParams& p, SampleRing& r, IFileSystem& f, IClock& c, EventLog& l, DestResumeSeed s,
+       std::wstring n)
+      : sp(p),
+        ring(r),
+        fs(f),
+        clock(c),
+        log(l),
+        seed(std::move(s)),
+        name(std::move(n)),
+        ring_channels(r.channels()),
+        ring_capacity(r.capacity()) {}
+
+  void set_state_locked(DestState s) {
+    if (st.state != DestState::Disabled) st.state = s;  // Disabled is sticky
+  }
+  void finish(Retired r);  // runs on a detached thread
+
+  const SessionParams sp;
+  SampleRing& ring;
+  IFileSystem& fs;
+  IClock& clock;
+  EventLog& log;
+  const DestResumeSeed seed;
+  const std::wstring name;
+  const uint32_t ring_channels;
+  const size_t ring_capacity;
+  std::vector<uint16_t> map;               // ring channel per destination channel; fixed before start
+  uint64_t rate_bytes = 0, low_water = 0;  // fixed before start
+
+  // The current writer generation. Changed only with `live` held exclusively and `m` held,
+  // so a writer that checked it under a shared `live` (ring, clock, log, cursor) or under
+  // `m` (status, commands, carry) cannot be replaced halfway through that step.
+  std::atomic<uint64_t> generation{0};
+  std::shared_mutex live;
+
+  mutable std::mutex m;  // guards everything below; never held across file I/O
+  std::deque<DestCommand> cmds;
+  DestStatus st;
+  bool stop_requested = false;
+  SampleIndex stop_end = 0;
+  std::string stop_reason;
+  Carry carry;
+  size_t busy_folder = kNone;     // folder of the writer's current file I/O
+  std::set<size_t> quarantined;   // a writer hung there: never probed again this session
+  int finalizers = 0;             // Retired items still being finished
+  std::condition_variable fin_cv;
+
+  std::atomic<SampleIndex> cursor{0};
+};
+
+// Best effort: finalize the old file (its header never claims more than was confirmed),
+// then record the close and the failover in the old manifest. Touches only `r` and `sp`.
+void Destination::Core::finish(Retired r) {
+  if (r.enc) {
+    r.enc->finalize(r.markers, r.truncate_to);
+    const SampleIndex end = r.start + SampleIndex(r.enc->confirmed_frames());
+    delete r.enc;
+    if (r.man) {
+      JsonLine l("file_close", end, wall_for(sp, end));
+      l.str("path", r.path).num("start", r.start).num("end", end).num("bytes", int64_t(r.bytes ? r.bytes->load() : 0));
+      r.man->append(l);
+    }
+  }
+  if (r.man) {
+    for (const auto& l : r.after) r.man->append(l);
+    r.man->flush();
+    r.man.reset();
+  }
+  std::lock_guard<std::mutex> lk(m);
+  --finalizers;
+  fin_cv.notify_all();
+}
+
+// One generation of the writer thread. Everything it touches while it may be stuck in
+// file I/O lives here or in Core, so an abandoned generation can be leaked whole: the
+// encoder is a raw pointer that is deleted only after a normal finalize. Once a newer
+// generation exists (stale()), this one writes nothing shared and exits at its next check.
 class Destination::Writer {
  public:
-  Writer(Destination& d, SampleIndex at)
-      : d_(d),
-        cfg_(d.st_.config),
-        out_ch_(uint32_t(d.map_.size())),
-        cursor_(at),
-        start_(at),
-        n_(d.seed_.first_n),
-        in_(kChunkFrames * d.ring_.channels()),
-        out_(kChunkFrames * d.map_.size()) {}
+  // A fresh start (carry.started false) or a generation taking over after a stall on
+  // stalled_folder. Constructed with k.m held.
+  Writer(std::shared_ptr<Core> core, uint64_t gen, SampleIndex cursor, Carry carry, size_t stalled_folder)
+      : core_(std::move(core)),
+        k_(*core_),
+        gen_(gen),
+        cfg_(k_.st.config),
+        out_ch_(uint32_t(k_.map.size())),
+        stalled_(stalled_folder),
+        c_(std::move(carry)),
+        cursor_(cursor),
+        in_(kChunkFrames * k_.ring_channels),
+        out_(kChunkFrames * k_.map.size()) {}
   ~Writer() { delete enc_; }  // null after a normal stop; never runs for an abandoned writer
-
-  std::atomic<bool> abandoned{false};
 
   void run() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
-    last_flush_ms_ = d_.clock_.steady_ms();
-    if (!begin()) mode_ = Mode::Failed;
-    while (!abandoned) {
-      bool stop;
-      SampleIndex stop_end;
+    last_flush_ms_ = last_space_ms_ = now_ms();
+    next_retry_ms_ = last_flush_ms_ + kRetryMs;
+    if (!c_.started) {
+      begin();
+    } else {
+      take_over();
+    }
+    while (!gone()) {
+      std::optional<DestCommand> front;
+      bool stop = false;
+      SampleIndex stop_end = 0;
       std::string stop_reason;
       {
-        std::lock_guard<std::mutex> lk(d_.m_);
-        while (!d_.cmds_.empty()) {
-          cmds_.push_back(std::move(d_.cmds_.front()));
-          d_.cmds_.pop_front();
-        }
-        stop = d_.stop_requested_;
-        stop_end = d_.stop_end_;
-        stop_reason = d_.stop_reason_;
+        std::lock_guard<std::mutex> lk(k_.m);
+        if (stale()) continue;
+        if (!k_.cmds.empty()) front = k_.cmds.front();
+        stop = k_.stop_requested;
+        stop_end = k_.stop_end;
+        stop_reason = k_.stop_reason;
       }
-      while (!cmds_.empty() && ready(cmds_.front())) {
-        std::visit([this](const auto& c) { on(c); }, cmds_.front());
-        cmds_.pop_front();
-        if (abandoned) return;
+      // A command leaves the queue only once handled, so a generation that takes over
+      // after a stall handles one this generation did not finish.
+      if (front && ready(*front)) {
+        redo_front_ = false;
+        std::visit([this](const auto& c) { on(c); }, *front);
+        if (gone()) return;
+        std::lock_guard<std::mutex> lk(k_.m);
+        if (!stale() && !redo_front_) {
+          k_.cmds.pop_front();
+          k_.carry = c_;
+        }
+        continue;
       }
       if (stop && (!enc_ || cursor_ >= stop_end)) {
-        end_session(stop_end, stop_reason);
-        return;
+        if (end_session(stop_end, stop_reason)) return;
+        continue;  // failed over: write through stop_end in the next folder
       }
-      maybe_flush();
-      if (abandoned) return;
+      housekeeping();
+      if (gone()) return;
       if (!enc_) {
+        if (c_.mode == Mode::LastResort) follow_capture();
         idle();
         continue;
       }
 
       // Write up to the next cut: rotation boundary, split point, a pending close-for-gap
       // (the only command that waits for the cursor) or the stop sample.
-      const SampleIndex cut = std::min(next_boundary_, splits_.empty() ? kNoRotation : *splits_.begin());
+      const SampleIndex cut = std::min(c_.next_boundary, c_.splits.empty() ? kNoRotation : *c_.splits.begin());
       if (cut <= cursor_) {
         rotate(cut);
         continue;
       }
       SampleIndex limit = stop ? stop_end : kNoRotation;
-      if (!cmds_.empty()) limit = std::min(limit, std::get<CmdCloseForGap>(cmds_.front()).at);
+      if (front)
+        if (const auto* g = std::get_if<CmdCloseForGap>(&*front)) limit = std::min(limit, g->at);
       const SampleIndex want = std::min({SampleIndex(kChunkFrames), cut - cursor_, limit - cursor_});
       if (want <= 0) {
         idle();
         continue;
       }
-      const auto r = d_.ring_.read(cursor_, in_.data(), size_t(want));
+      SampleRing::ReadResult r{0, false};
+      if (!live([&] { r = k_.ring.read(cursor_, in_.data(), size_t(want)); })) continue;
       if (r.frames == 0) {
-        // Overrun recovery (resync, gap) is Task 10; here the writer just must not spin.
-        if (r.overrun && !overrun_logged_) {
-          d_.log(Severity::Error, L"Fell behind the capture ring (overrun)");
-          overrun_logged_ = true;
+        if (r.overrun) {
+          on_overrun();
+        } else {
+          idle();
         }
-        idle();
         continue;
       }
-      overrun_logged_ = false;
-      extract_channels(in_.data(), d_.ring_.channels(), d_.map_.data(), out_ch_, out_.data(), r.frames);
+      extract_channels(in_.data(), k_.ring_channels, k_.map.data(), out_ch_, out_.data(), r.frames);
       const bool ok = enc_->write(out_.data(), r.frames);
-      if (abandoned) return;
+      if (gone()) return;
       if (!ok) {
-        fail(L"Write failed: " + path_);
+        failover("write_error", L"Write failed: " + path_);
         continue;
       }
       cursor_ += SampleIndex(r.frames);
-      d_.cursor_.store(cursor_, std::memory_order_release);
+      publish_cursor();
     }
   }
 
  private:
-  enum class Mode { Writing, GapClosed, Failed };
+  using LeadFn = std::function<std::vector<JsonLine>(const std::wstring& to)>;
 
-  WallTime wall(SampleIndex s) const { return wall_for(d_.sp_, s); }
-  JsonLine line(std::string_view ev, SampleIndex s) const { return JsonLine(ev, s, wall(s)); }
-  void event(const JsonLine& l) {
-    if (man_) man_->append(l);
+  // ---- generation guard ----
+
+  bool stale() const { return k_.generation.load(std::memory_order_acquire) != gen_; }
+  // True once a newer generation exists. The encoder is then abandoned (never finalized
+  // or closed: a newer generation owns the destination, and the handle may be stuck).
+  bool gone() {
+    if (!dead_ && stale()) {
+      dead_ = true;
+      if (enc_) enc_->abandon();
+    }
+    return dead_;
   }
-  std::wstring folder_path(size_t i) const {
-    std::lock_guard<std::mutex> lk(d_.m_);
-    return i < d_.st_.config.folders.size() ? d_.st_.config.folders[i] : std::wstring();
+  // Runs f (ring, clock, log, cursor: non-blocking uses) unless this generation is stale.
+  template <class F>
+  bool live(F f) {
+    std::shared_lock<std::shared_mutex> lk(k_.live);
+    if (stale()) return false;
+    f();
+    return true;
+  }
+  // Applies a status change and publishes the carry, unless this generation is stale.
+  template <class F>
+  bool commit(F f) {
+    std::lock_guard<std::mutex> lk(k_.m);
+    if (stale()) return false;
+    f(k_.st);
+    k_.carry = c_;
+    return true;
+  }
+
+  void log(Severity s, std::wstring text) {
+    live([&] { k_.log.add(s, k_.clock.now(), k_.name, std::move(text)); });
+  }
+  uint64_t now_ms() {
+    uint64_t t = 0;
+    live([&] { t = k_.clock.steady_ms(); });
+    return t;
+  }
+  void publish_cursor() {
+    live([&] { k_.cursor.store(cursor_, std::memory_order_release); });
   }
   static void idle() { std::this_thread::sleep_for(std::chrono::milliseconds(kIdleMs)); }
 
-  bool begin() {
-    const std::wstring dir = folder_path(0);
-    std::wstring err;
-    if (!d_.fs_.ensure_dir(dir, &err)) {
-      fail(L"Cannot create folder " + dir + L": " + err);
-      return false;
+  // ---- manifest lines ----
+
+  WallTime wall(SampleIndex s) const { return wall_for(k_.sp, s); }
+  JsonLine line(std::string_view ev, SampleIndex s) const { return JsonLine(ev, s, wall(s)); }
+  void event(const JsonLine& l) {
+    if (man_) {
+      man_->append(l);
+    } else {
+      c_.backlog.push_back(l);
     }
-    std::wstring path;
-    if (!d_.seed_.prev_manifest.empty()) {
-      path = d_.seed_.prev_manifest;
-      man_ = Manifest::open_append(d_.fs_, path, &err);
-    }
-    if (!man_) {
-      const std::wstring stem = sanitize_component(d_.sp_.session_name) + L"_" + sanitize_component(cfg_.name);
-      man_ = create_unique(d_.fs_, dir, stem, L".jsonl", path,
-                           [&](const std::wstring& p) { return Manifest::create(d_.fs_, p, &err); });
-    }
-    if (!man_) {
-      fail(L"Cannot create manifest " + path + L": " + err);
-      return false;
-    }
-    {
-      std::lock_guard<std::mutex> lk(d_.m_);
-      d_.st_.manifest_path = path;
-    }
+  }
+  JsonLine gap_line(std::string_view ev, SampleIndex at, std::string_view reason) const {
+    JsonLine l = line(ev, at);
+    l.str("reason", widen(reason));
+    return l;
+  }
+  JsonLine failover_line(SampleIndex at, const std::wstring& from, const std::wstring& to,
+                         std::string_view trigger) const {
+    JsonLine l = line("failover", at);
+    l.str("from", from).str("to", to).str("trigger", widen(trigger)).num("confirmed", at);
+    return l;
+  }
+  JsonLine session_start_line(SampleIndex at, const std::wstring& prev_manifest) const {
     std::wstring map;
-    for (uint16_t c : d_.map_) map += (map.empty() ? L"" : L",") + std::to_wstring(c);
-    JsonLine l = line("session_start", start_);
-    l.str("session", d_.sp_.session_name)
-        .str("session_id", d_.sp_.session_id)
+    for (uint16_t c : k_.map) map += (map.empty() ? L"" : L",") + std::to_wstring(c);
+    JsonLine l = line("session_start", at);
+    l.str("session", k_.sp.session_name)
+        .str("session_id", k_.sp.session_id)
         .str("dest", cfg_.name)
         .str("format", cfg_.format == OutFormat::Wav ? L"wav" : L"opus")
-        .num("rate", d_.sp_.rate)
+        .num("rate", k_.sp.rate)
         .num("channels", out_ch_)
         .str("channel_map", map);
-    if (!d_.sp_.prev_session.empty()) l.str("prev_session", d_.sp_.prev_session);
-    event(l);
-    next_boundary_ = first_rotation_boundary(start_, wall(start_), d_.sp_.rate, cfg_.rotation_minutes);
-    return open_file(0, start_, d_.seed_.first_n, 0);
+    if (!k_.sp.prev_session.empty()) l.str("prev_session", k_.sp.prev_session);
+    if (!prev_manifest.empty()) l.str("prev_manifest", prev_manifest);
+    return l;
   }
 
-  // The reusable step: open file {n}{seg} in folders[folder] whose first sample is `at`.
-  // Task 10 failover calls it with the next folder, the confirmed sample and seg + 1.
-  bool open_file(size_t folder, SampleIndex at, uint32_t n, uint32_t seg) {
-    const std::wstring dir = folder_path(folder);
-    std::wstring err;
-    if (dir.empty() || !d_.fs_.ensure_dir(dir, &err)) {
-      fail(L"Cannot create folder " + dir + L": " + err);
+  // ---- folders ----
+
+  size_t folder_count() const {
+    std::lock_guard<std::mutex> lk(k_.m);
+    return k_.st.config.folders.size();
+  }
+  std::wstring folder_path(size_t i) const {
+    std::lock_guard<std::mutex> lk(k_.m);
+    return i < k_.st.config.folders.size() ? k_.st.config.folders[i] : std::wstring();
+  }
+  size_t folder_of(const std::wstring& file) const {
+    const size_t cut = file.find_last_of(L"\\/");
+    if (cut == std::wstring::npos) return kNone;
+    const std::wstring dir = folder_key(file.substr(0, cut));
+    std::lock_guard<std::mutex> lk(k_.m);
+    for (size_t i = 0; i < k_.st.config.folders.size(); ++i)
+      if (folder_key(k_.st.config.folders[i]) == dir) return i;
+    return kNone;
+  }
+  // True if folder i's health changed.
+  bool set_health(size_t i, FolderHealth h) {
+    bool changed = false;
+    commit([&](DestStatus& st) {
+      if (i < st.folders.size() && st.folders[i].health != h) {
+        st.folders[i].health = h;
+        changed = true;
+      }
+    });
+    return changed;
+  }
+  void note_space(const std::optional<uint64_t>& free) {
+    const uint64_t rate = k_.rate_bytes;
+    commit([&](DestStatus& st) {
+      if (c_.folder >= st.folders.size()) return;
+      auto& f = st.folders[c_.folder];
+      f.free_bytes = free;
+      f.hours_left = free && rate ? double(*free) / double(rate) / 3600.0 : 0.0;
+    });
+  }
+
+  // ---- opening and closing ----
+
+  void begin() {
+    const SampleIndex at = c_.session_start;
+    if (!k_.seed.prev_manifest.empty()) {
+      c_.manifest_path = k_.seed.prev_manifest;  // linked from a new manifest if it cannot be reused
+      std::wstring err;
+      auto m = Manifest::open_append(k_.fs, k_.seed.prev_manifest, &err);
+      if (gone()) {
+        (void)m.release();
+        return;
+      }
+      if (m) {
+        man_ = std::move(m);
+        man_folder_ = folder_of(k_.seed.prev_manifest);
+        man_->append(session_start_line(at, L""));
+        if (!commit([&](DestStatus& st) { st.manifest_path = c_.manifest_path; })) return;
+      } else {
+        log(Severity::Warning, L"Cannot reopen manifest " + k_.seed.prev_manifest + L": " + err);
+      }
+    }
+    c_.next_boundary = first_rotation_boundary(at, wall(at), k_.sp.rate, cfg_.rotation_minutes);
+    c_.started = true;
+    if (open_at(at, c_.n, 0, kNone, nullptr, kNone)) return;
+    if (!gone()) enter_last_resort(at);
+  }
+
+  // This generation replaces one that hung in file I/O on folder stalled_. That one keeps
+  // its encoder and manifest (never finalized); everything after the last confirmed sample
+  // (this generation's cursor) is written again here.
+  void take_over() {
+    const std::wstring from = folder_path(stalled_);
+    publish_cursor();
+    if (c_.mode == Mode::LastResort) {
+      follow_capture();
+      return;
+    }
+    if (c_.mode == Mode::GapClosed) {
+      event(failover_line(cursor_, from, L"", "stall"));
+      commit([&](DestStatus&) { k_.set_state_locked(DestState::GapClosed); });
+      return;
+    }
+    const SampleIndex at = cursor_;
+    const LeadFn lead = [&](const std::wstring& to) {
+      return std::vector<JsonLine>{failover_line(at, from, to, "stall")};
+    };
+    if (open_at(at, c_.n, c_.seg + 1, stalled_, lead, kNone)) {
+      log(Severity::Warning, L"Failed over from " + from + L" to " + folder_path(c_.folder) + L" (stall)");
+      return;
+    }
+    if (gone()) return;
+    event(failover_line(at, from, L"", "stall"));
+    enter_last_resort(at);
+  }
+
+  // Opens file {n}{seg} at `at` in the first folder that passes the health check: `first`
+  // if given, then the chain in order, never `skip` or a quarantined folder. The manifest
+  // moves along if it lives elsewhere; `lead` gives the events that follow session_start
+  // in a new manifest.
+  bool open_at(SampleIndex at, uint32_t n, uint32_t seg, size_t skip, const LeadFn& lead, size_t first) {
+    const size_t count = folder_count();
+    std::vector<size_t> order;
+    if (first < count) order.push_back(first);
+    for (size_t i = 0; i < count; ++i)
+      if (i != first) order.push_back(i);
+    for (size_t i : order) {
+      if (i == skip) continue;
+      std::wstring dir;
+      {
+        std::lock_guard<std::mutex> lk(k_.m);
+        if (stale()) return false;
+        if (k_.quarantined.count(i)) continue;
+        k_.busy_folder = i;
+        dir = k_.st.config.folders[i];
+      }
+      const bool healthy = folder_healthy(k_.fs, dir, k_.low_water);
+      if (gone()) return false;
+      if (healthy && (man_folder_ == i || move_manifest(i, at, lead)) && open_file(i, at, n, seg)) return true;
+      if (gone()) return false;
+      if (set_health(i, FolderHealth::Failed)) log(Severity::Warning, L"Folder unavailable: " + dir);
+    }
+    return false;
+  }
+
+  // A new manifest in folders[i]: session_start (naming the previous manifest), the lead
+  // events, then whatever waited for a manifest. The old one is finished off the thread.
+  bool move_manifest(size_t i, SampleIndex at, const LeadFn& lead) {
+    const std::wstring dir = folder_path(i);
+    const std::wstring stem = sanitize_component(k_.sp.session_name) + L"_" + sanitize_component(cfg_.name);
+    std::wstring path, err;
+    auto man = create_unique(k_.fs, dir, stem, L".jsonl", path,
+                             [&](const std::wstring& p) { return Manifest::create(k_.fs, p, &err); });
+    if (gone()) {
+      (void)man.release();
       return false;
     }
+    if (!man) {
+      log(Severity::Error, L"Cannot create manifest " + path + L": " + err);
+      return false;
+    }
+    if (man_) {
+      Retired r;
+      r.man = std::move(man_);
+      retire(std::move(r));
+    }
+    const std::wstring prev = c_.manifest_path;
+    man_ = std::move(man);
+    man_folder_ = i;
+    c_.manifest_path = path;
+    man_->append(session_start_line(at, prev));
+    if (lead)
+      for (const auto& l : lead(dir)) man_->append(l);
+    for (const auto& l : c_.backlog) man_->append(l);
+    c_.backlog.clear();
+    return commit([&](DestStatus& st) { st.manifest_path = path; });
+  }
+
+  // Opens file {n}{seg} in folders[folder] whose first sample is `at`.
+  bool open_file(size_t folder, SampleIndex at, uint32_t n, uint32_t seg) {
+    const std::wstring dir = folder_path(folder);
     const WallTime first = wall(at);
     const std::wstring stem =
-        expand_name(cfg_.name_template, NameInputs{d_.sp_.session_name, cfg_.name, first, n, seg});
-    std::wstring path;
+        expand_name(cfg_.name_template, NameInputs{k_.sp.session_name, cfg_.name, first, n, seg});
+    std::wstring path, err;
+    SizeTap bytes = std::make_shared<std::atomic<uint64_t>>(0);
+    TappingFs fs(k_.fs, bytes);
     std::unique_ptr<IEncoderFile> enc;
     if (cfg_.format == OutFormat::Wav) {
-      WavParams wp{d_.sp_.rate, uint16_t(out_ch_), cfg_.wav_depth, bext_for(first)};
-      enc = create_unique(d_.fs_, dir, stem, L".wav", path,
-                          [&](const std::wstring& p) { return open_wav(d_.fs_, p, wp, &err); });
+      WavParams wp{k_.sp.rate, uint16_t(out_ch_), cfg_.wav_depth, bext_for(first)};
+      enc = create_unique(fs, dir, stem, L".wav", path,
+                          [&](const std::wstring& p) { return open_wav(fs, p, wp, &err); });
     } else {
-      const OpusParams op{d_.sp_.rate, uint16_t(out_ch_), opus_bitrate(cfg_.opus_bitrate, out_ch_)};
-      enc = create_unique(d_.fs_, dir, stem, L".opus", path,
-                          [&](const std::wstring& p) { return open_opus(d_.fs_, p, op, &err); });
+      const OpusParams op{k_.sp.rate, uint16_t(out_ch_), opus_bitrate(cfg_.opus_bitrate, out_ch_)};
+      enc = create_unique(fs, dir, stem, L".opus", path,
+                          [&](const std::wstring& p) { return open_opus(fs, p, op, &err); });
     }
-    if (abandoned) {
+    if (gone()) {
       (void)enc.release();  // leaked with this generation
       return false;
     }
     if (!enc) {
-      fail(L"Cannot create " + path + L": " + err);
+      log(Severity::Error, L"Cannot create " + path + L": " + err);
       return false;
     }
     enc_ = enc.release();
     path_ = path;
-    file_start_ = at;
-    n_ = n;
-    seg_ = seg;
-    folder_ = folder;
+    bytes_ = bytes;
+    c_.mode = Mode::Writing;
+    c_.file_start = at;
+    c_.n = n;
+    c_.seg = seg;
+    c_.folder = folder;
     // Markers that fell before this file (a gap) stay in the manifest only.
-    markers_.erase(std::remove_if(markers_.begin(), markers_.end(),
-                                  [&](const auto& m) { return m.first < at; }),
-                   markers_.end());
+    c_.markers.erase(std::remove_if(c_.markers.begin(), c_.markers.end(),
+                                    [&](const auto& m) { return m.first < at; }),
+                     c_.markers.end());
     event(line("file_open", at).str("path", path).num("n", n).num("seg", seg).num("folder", int64_t(folder)));
-    {
-      std::lock_guard<std::mutex> lk(d_.m_);
-      d_.st_.current_file = path;
-      d_.st_.n = n;
-      d_.st_.confirmed = at;
-      if (d_.st_.state != DestState::Disabled) d_.st_.state = DestState::Writing;
-      for (size_t i = 0; i < d_.st_.folders.size(); ++i)
-        if (d_.st_.folders[i].health != FolderHealth::Failed)
-          d_.st_.folders[i].health = i == folder ? FolderHealth::Active : FolderHealth::Standby;
-    }
-    d_.log(Severity::Info, L"Recording to " + path);
+    if (!commit([&](DestStatus& st) {
+          st.current_file = path;
+          st.n = n;
+          st.confirmed = at;
+          k_.set_state_locked(DestState::Writing);
+          for (size_t i = 0; i < st.folders.size(); ++i) {
+            if (i == folder) {
+              st.folders[i].health = FolderHealth::Active;
+            } else if (st.folders[i].health == FolderHealth::Active) {
+              st.folders[i].health = FolderHealth::Standby;
+            }
+          }
+          k_.busy_folder = folder;
+        }))
+      return false;
+    log(Severity::Info, L"Recording to " + path);
     return true;
   }
 
@@ -264,13 +656,25 @@ class Destination::Writer {
     std::snprintf(date, sizeof date, "%04d-%02d-%02d", p.year, p.month, p.day);
     std::snprintf(time, sizeof time, "%02d:%02d:%02d", p.hour, p.minute, p.second);
     BextInfo b;
-    b.originator_reference = utf8_from_wide(d_.sp_.session_id);
+    b.originator_reference = utf8_from_wide(k_.sp.session_id);
     b.date = date;
     b.time = time;
     int64_t since_midnight = (first.utc_ms + int64_t(first.local_offset_min) * 60000) % kDayMs;
     if (since_midnight < 0) since_midnight += kDayMs;
-    b.time_reference = uint64_t(since_midnight) * d_.sp_.rate / 1000;
+    b.time_reference = uint64_t(since_midnight) * k_.sp.rate / 1000;
     return b;
+  }
+
+  // The open file's markers in [file_start, end), relative to the file; every marker
+  // before `end` leaves the pending list.
+  std::vector<Marker> take_markers(SampleIndex end) {
+    std::vector<Marker> ms;
+    for (const auto& [s, name] : c_.markers)
+      if (s >= c_.file_start && s < end) ms.push_back(Marker{uint64_t(s - c_.file_start), name});
+    c_.markers.erase(std::remove_if(c_.markers.begin(), c_.markers.end(),
+                                    [&](const auto& m) { return m.first < end; }),
+                     c_.markers.end());
+    return ms;
   }
 
   // Finalizes the open file so that it ends at `end` (<= cursor_). A WAV file is
@@ -279,107 +683,270 @@ class Destination::Writer {
   SampleIndex close_file(SampleIndex end) {
     std::optional<uint64_t> truncate_to;
     if (end < cursor_ && cfg_.format == OutFormat::Wav) {
-      end = std::max(end, file_start_);
-      truncate_to = uint64_t(end - file_start_);
+      end = std::max(end, c_.file_start);
+      truncate_to = uint64_t(end - c_.file_start);
     } else {
       end = cursor_;
     }
-    std::vector<Marker> ms;
-    for (const auto& [s, name] : markers_)
-      if (s >= file_start_ && s < end) ms.push_back(Marker{uint64_t(s - file_start_), name});
-    markers_.erase(std::remove_if(markers_.begin(), markers_.end(),
-                                  [&](const auto& m) { return m.first < end; }),
-                   markers_.end());
+    const std::vector<Marker> ms = take_markers(end);
     const bool ok = enc_->finalize(ms, truncate_to);
-    if (abandoned) return end;  // the encoder is leaked with this generation
+    if (gone()) return end;
     delete enc_;
     enc_ = nullptr;
     event(line("file_close", end)
               .str("path", path_)
-              .num("start", file_start_)
+              .num("start", c_.file_start)
               .num("end", end)
-              .num("bytes", int64_t(file_bytes(path_))));
-    {
-      std::lock_guard<std::mutex> lk(d_.m_);
-      d_.st_.current_file.clear();
-      if (ok) d_.st_.confirmed = end;
-    }
-    if (!ok) d_.log(Severity::Error, L"Could not finalize " + path_);
+              .num("bytes", int64_t(bytes_->load())));
+    commit([&](DestStatus& st) {
+      st.current_file.clear();
+      if (ok) st.confirmed = end;
+    });
+    if (!ok) log(Severity::Error, L"Could not finalize " + path_);
     return end;
   }
 
-  uint64_t file_bytes(const std::wstring& path) {
-    std::wstring err;
-    auto f = d_.fs_.open_existing(path, &err);
-    if (!f) return 0;
-    const uint64_t n = f->size();
-    f->close();
-    return n;
+  // Flushes the open file and publishes what it confirmed; a failure fails over.
+  bool confirm_all() {
+    const bool ok = enc_->flush();
+    if (gone()) return false;
+    if (!ok) {
+      failover("flush_error", L"Flush failed: " + path_);
+      return false;
+    }
+    const SampleIndex confirmed = c_.file_start + SampleIndex(enc_->confirmed_frames());
+    return commit([&](DestStatus& st) { st.confirmed = confirmed; });
   }
 
   void rotate(SampleIndex at) {
-    const bool timed = at == next_boundary_;
-    while (!splits_.empty() && *splits_.begin() <= at) splits_.erase(splits_.begin());
-    if (timed) next_boundary_ = next_rotation_boundary(next_boundary_, d_.sp_.rate, cfg_.rotation_minutes);
+    // Confirm the tail first: if the drive died, fail over from what is really on disk
+    // (the boundary then comes round again in the next folder).
+    if (!confirm_all()) return;
+    const bool timed = at == c_.next_boundary;
+    while (!c_.splits.empty() && *c_.splits.begin() <= at) c_.splits.erase(c_.splits.begin());
+    if (timed) c_.next_boundary = next_rotation_boundary(c_.next_boundary, k_.sp.rate, cfg_.rotation_minutes);
     event(line("rotation", at).str("reason", timed ? L"time" : L"split"));
     close_file(at);
-    if (abandoned) return;
-    open_file(0, at, n_ + 1, 0);  // Task 10: return to the highest-priority healthy folder
+    if (gone()) return;
+    // Back to the highest-priority healthy folder (no flapping in between, §4.3).
+    if (open_at(at, c_.n + 1, 0, kNone, nullptr, kNone)) return;
+    if (!gone()) enter_last_resort(at);
   }
 
-  void maybe_flush() {
-    const uint64_t now = d_.clock_.steady_ms();
-    if (now - last_flush_ms_ < d_.sp_.flush_ms) return;
-    last_flush_ms_ = now;
-    SampleIndex confirmed = -1;
-    if (enc_) {
-      const bool ok = enc_->flush();
-      if (abandoned) return;
-      if (!ok) {
-        fail(L"Flush failed: " + path_);
-        return;
-      }
-      confirmed = file_start_ + SampleIndex(enc_->confirmed_frames());
+  // Keeps the session's rotation grid after the cursor jumped forward. The boundary is
+  // never recomputed from wall time, which is rounded to milliseconds.
+  void advance_grid() {
+    while (c_.next_boundary <= cursor_)
+      c_.next_boundary = next_rotation_boundary(c_.next_boundary, k_.sp.rate, cfg_.rotation_minutes);
+    while (!c_.splits.empty() && *c_.splits.begin() <= cursor_) c_.splits.erase(c_.splits.begin());
+  }
+
+  // ---- failure handling ----
+
+  // §4.3: a new generation; the open file ends at the last confirmed sample and is
+  // finalized on a detached thread; the next healthy folder continues from there with
+  // seg + 1. No healthy folder -> LastResort.
+  void failover(std::string_view trigger, const std::wstring& what) {
+    if (!enc_) return;
+    log(Severity::Error, what);
+    const size_t from = c_.folder;
+    const std::wstring from_dir = folder_path(from);
+    SampleIndex confirmed = c_.file_start;
+    {
+      std::unique_lock<std::shared_mutex> lv(k_.live);
+      std::lock_guard<std::mutex> lk(k_.m);
+      if (stale()) return;
+      gen_ = ++k_.generation;
+      confirmed = std::clamp(k_.st.confirmed, c_.file_start, cursor_);
+      k_.set_state_locked(DestState::FailingOver);
+      k_.st.needs_ack = true;
+      k_.st.current_file.clear();
+      if (from < k_.st.folders.size()) k_.st.folders[from].health = FolderHealth::Failed;
+      k_.carry = c_;
     }
-    if (man_ && !man_->flush()) {
-      fail(L"Manifest flush failed");
+    Retired old;
+    old.enc = enc_;
+    enc_ = nullptr;
+    old.man = std::move(man_);
+    man_folder_ = kNone;
+    old.path = path_;
+    old.start = c_.file_start;
+    old.bytes = bytes_;
+    if (cfg_.format == OutFormat::Wav) old.truncate_to = uint64_t(confirmed - c_.file_start);
+    old.markers = take_markers(confirmed);
+    cursor_ = confirmed;
+    publish_cursor();
+
+    const LeadFn lead = [&](const std::wstring& to) {
+      return std::vector<JsonLine>{failover_line(confirmed, from_dir, to, trigger)};
+    };
+    const bool opened = open_at(confirmed, c_.n, c_.seg + 1, from, lead, kNone);
+    if (gone()) {
+      (void)old.man.release();  // leaked with this generation, like old.enc
       return;
     }
-    const std::optional<uint64_t> free = d_.fs_.free_bytes(folder_path(folder_));
-    const uint64_t rate = d_.data_rate();
-    std::lock_guard<std::mutex> lk(d_.m_);
-    if (confirmed >= 0) d_.st_.confirmed = confirmed;
-    if (folder_ < d_.st_.folders.size()) {
-      auto& f = d_.st_.folders[folder_];
-      f.free_bytes = free;
-      f.hours_left = free && rate ? double(*free) / double(rate) / 3600.0 : 0.0;
+    const std::wstring to_dir = opened ? folder_path(c_.folder) : std::wstring();
+    old.after.push_back(failover_line(confirmed, from_dir, to_dir, trigger));
+    retire(std::move(old));
+    if (opened) {
+      log(Severity::Warning, L"Failed over from " + from_dir + L" to " + to_dir + L" (" + widen(trigger) + L")");
+      return;
+    }
+    event(failover_line(confirmed, from_dir, L"", trigger));
+    enter_last_resort(confirmed);
+  }
+
+  // Hands r to a detached thread. Nobody waits for it, except stop() within its budget.
+  void retire(Retired r) {
+    {
+      std::lock_guard<std::mutex> lk(k_.m);
+      if (stale()) {
+        (void)r.man.release();  // r.enc is a raw pointer: leaked as well
+        return;
+      }
+      ++k_.finalizers;
+    }
+    try {
+      std::thread([core = core_, r = std::move(r)]() mutable { core->finish(std::move(r)); }).detach();
+    } catch (const std::system_error&) {
+      std::lock_guard<std::mutex> lk(k_.m);
+      --k_.finalizers;
     }
   }
 
-  void end_session(SampleIndex stop_end, const std::string& reason) {
+  void check_space() {
+    const std::wstring dir = folder_path(c_.folder);
+    const std::optional<uint64_t> free = k_.fs.free_bytes(dir);
+    if (gone()) return;
+    note_space(free);
+    if (!free) {
+      failover("low_space", L"Folder unavailable: " + dir);
+    } else if (*free < k_.low_water) {
+      failover("low_space", L"Free space below the low-water mark in " + dir);
+    }
+  }
+
+  // No folder can be written: keep the cursor on the live position and retry every 30 s.
+  void enter_last_resort(SampleIndex from) {
+    c_.mode = Mode::LastResort;
+    c_.gap_from = from;
+    c_.gap_in_manifest = man_ != nullptr;
+    event(gap_line("gap_start", from, "last_resort"));
+    next_retry_ms_ = now_ms() + kRetryMs;
+    if (!commit([&](DestStatus& st) {
+          k_.set_state_locked(DestState::LastResort);
+          st.needs_ack = true;
+          st.current_file.clear();
+          ++st.gaps;
+        }))
+      return;
+    log(Severity::Error, L"No folder can be written: recording stopped, retrying every 30 s");
+    follow_capture();
+  }
+
+  void retry_last_resort() {
+    follow_capture();
+    if (gone()) return;
+    const SampleIndex at = cursor_;
+    advance_grid();
+    const bool repeat_start = c_.gap_in_manifest;  // that manifest is not the one we resume in
+    const SampleIndex from = c_.gap_from;
+    const LeadFn lead = [&](const std::wstring&) {
+      std::vector<JsonLine> v;
+      if (repeat_start) v.push_back(gap_line("gap_start", from, "last_resort"));
+      return v;
+    };
+    if (!open_at(at, c_.n + 1, 0, kNone, lead, kNone)) return;
+    c_.gap_in_manifest = false;
+    event(gap_line("gap_end", at, "last_resort"));
+    log(Severity::Info, L"Recording again after last resort: " + path_);
+  }
+
+  void follow_capture() {
+    SampleIndex wi = cursor_;
+    live([&] { wi = k_.ring.write_index(); });
+    if (wi > cursor_) {
+      cursor_ = wi;
+      publish_cursor();
+    }
+  }
+
+  // §8.4: the writer fell out of the ring. The file ends at the cursor, the cursor jumps
+  // to half a ring behind the capture position and a new file starts there.
+  void on_overrun() {
+    if (!confirm_all()) return;
+    SampleIndex wi = cursor_;
+    if (!live([&] { wi = k_.ring.write_index(); })) return;
+    const SampleIndex from = cursor_;
+    const SampleIndex to = std::max(from + 1, wi - SampleIndex(k_.ring_capacity / 2));
+    event(gap_line("gap_start", from, "overrun"));
+    if (!commit([](DestStatus& st) { ++st.gaps; })) return;
+    wchar_t secs[32];
+    std::swprintf(secs, 32, L"%.1f s", double(to - from) / double(k_.sp.rate));
+    log(Severity::Error, L"Fell behind the capture ring (overrun): " + std::wstring(secs) + L" skipped");
+    close_file(from);
+    if (gone()) return;
+    cursor_ = to;
+    publish_cursor();
+    advance_grid();
+    event(gap_line("gap_end", to, "overrun"));
+    if (open_at(to, c_.n + 1, 0, kNone, nullptr, c_.folder)) return;
+    if (!gone()) enter_last_resort(to);
+  }
+
+  // ---- periodic work ----
+
+  void housekeeping() {
+    const uint64_t now = now_ms();
+    if (gone()) return;
+    if (now - last_flush_ms_ >= k_.sp.flush_ms) {
+      last_flush_ms_ = now;
+      flush();
+      if (gone()) return;
+    }
+    if (enc_ && now - last_space_ms_ >= kSpaceCheckMs) {
+      last_space_ms_ = now;
+      check_space();
+      if (gone()) return;
+    }
+    if (c_.mode == Mode::LastResort && (retry_now_ || now >= next_retry_ms_)) {
+      retry_now_ = false;
+      next_retry_ms_ = now + kRetryMs;
+      retry_last_resort();
+    }
+  }
+
+  void flush() {
+    if (enc_ && !confirm_all()) return;
+    if (man_) {
+      const bool ok = man_->flush();
+      if (gone()) return;
+      if (!ok && enc_ && man_folder_ == c_.folder) {
+        failover("flush_error", L"Manifest flush failed: " + c_.manifest_path);
+        return;
+      }
+      if (!ok && !manifest_warned_) log(Severity::Warning, L"Cannot write the manifest " + c_.manifest_path);
+      manifest_warned_ = !ok;
+    }
+    if (!enc_) return;
+    const std::optional<uint64_t> free = k_.fs.free_bytes(folder_path(c_.folder));
+    if (gone()) return;
+    note_space(free);
+  }
+
+  // False if the last flush failed and the writer failed over instead.
+  bool end_session(SampleIndex stop_end, const std::string& reason) {
+    if (enc_ && !confirm_all()) return gone();
     SampleIndex end = stop_end;
     if (enc_) end = close_file(stop_end);
-    if (abandoned) return;
-    event(line("session_end", end).str("reason", std::wstring(reason.begin(), reason.end())));
+    if (gone()) return true;
+    event(line("session_end", end).str("reason", widen(reason)));
     if (man_) man_->flush();
-    d_.set_state(DestState::Stopped);
+    if (!gone()) commit([&](DestStatus&) { k_.set_state_locked(DestState::Stopped); });
+    return true;
   }
 
-  // Task 9: an I/O failure disables the destination. Task 10 replaces this with failover.
-  void fail(const std::wstring& what) {
-    d_.log(Severity::Error, what);
-    event(line("warning", cursor_).str("text", what));
-    if (enc_) {
-      SampleIndex confirmed;
-      {
-        std::lock_guard<std::mutex> lk(d_.m_);
-        confirmed = d_.st_.confirmed;
-      }
-      close_file(confirmed);  // best effort
-    }
-    mode_ = Mode::Failed;
-    d_.set_state(DestState::Disabled);
-  }
+  // ---- commands ----
 
   // Only a close-for-gap waits: for the cursor to reach its sample.
   bool ready(const DestCommand& c) const {
@@ -389,99 +956,109 @@ class Destination::Writer {
 
   void on(const CmdMarker& c) {
     event(line("marker", c.at).str("name", c.name));
-    d_.log(Severity::Info, L"Marker \"" + c.name + L"\" at " + hms(wall(c.at)));
-    if (!enc_ || c.at >= file_start_) markers_.emplace_back(c.at, c.name);  // else manifest only
+    log(Severity::Info, L"Marker \"" + c.name + L"\" at " + hms(wall(c.at)));
+    if (!enc_ || c.at >= c_.file_start) c_.markers.emplace_back(c.at, c.name);  // else manifest only
   }
   void on(const CmdSplit& c) {
     if (!enc_) return;
     const SampleIndex s = std::max(c.at, cursor_);  // never retroactive
-    if (s > file_start_) splits_.insert(s);
+    if (s > c_.file_start) c_.splits.insert(s);
   }
   void on(const CmdAppendFolder& c) {
-    {
-      std::lock_guard<std::mutex> lk(d_.m_);
-      d_.st_.config.folders.push_back(c.path);
-      d_.st_.folders.push_back(FolderStatus{c.path, FolderHealth::Standby, std::nullopt, 0.0});
-    }
-    d_.log(Severity::Info, L"Folder added: " + c.path);
+    bool added = false;
+    commit([&](DestStatus& st) {
+      for (const auto& f : st.config.folders)
+        if (folder_key(f) == folder_key(c.path)) return;
+      st.config.folders.push_back(c.path);
+      st.folders.push_back(FolderStatus{c.path, FolderHealth::Standby, std::nullopt, 0.0});
+      added = true;
+    });
+    if (!added) return;
+    log(Severity::Info, L"Folder added: " + c.path);
+    if (c_.mode == Mode::LastResort) retry_now_ = true;  // tried at once (§4.3)
   }
   void on(const CmdGapStart& c) {
-    event(line("gap_start", c.at).str("reason", std::wstring(c.reason.begin(), c.reason.end())));
-    std::lock_guard<std::mutex> lk(d_.m_);
-    ++d_.st_.gaps;
+    event(gap_line("gap_start", c.at, c.reason));
+    commit([](DestStatus& st) { ++st.gaps; });
   }
-  void on(const CmdGapEnd& c) {
-    event(line("gap_end", c.at).str("reason", std::wstring(c.reason.begin(), c.reason.end())));
-  }
+  void on(const CmdGapEnd& c) { event(gap_line("gap_end", c.at, c.reason)); }
   void on(const CmdCloseForGap& c) {
     if (!enc_) return;
+    if (!confirm_all()) {
+      redo_front_ = !gone();  // failed over to an earlier sample: close there once it gets to c.at
+      return;
+    }
     close_file(c.at);
-    if (abandoned) return;
-    splits_.clear();
-    mode_ = Mode::GapClosed;
-    d_.set_state(DestState::GapClosed);
+    if (gone()) return;
+    c_.splits.clear();
+    c_.mode = Mode::GapClosed;
+    commit([&](DestStatus&) { k_.set_state_locked(DestState::GapClosed); });
   }
   void on(const CmdResumeAt& c) {
-    if (mode_ == Mode::Failed) return;
+    if (c_.mode == Mode::LastResort) return;  // the retry reopens at the live position
     if (enc_) close_file(cursor_);
-    if (abandoned) return;
+    if (gone()) return;
     cursor_ = std::max(c.at, cursor_);
-    d_.cursor_.store(cursor_, std::memory_order_release);
-    splits_.clear();
-    next_boundary_ = first_rotation_boundary(cursor_, wall(cursor_), d_.sp_.rate, cfg_.rotation_minutes);
-    if (open_file(0, cursor_, n_ + 1, 0)) mode_ = Mode::Writing;
+    publish_cursor();
+    c_.splits.clear();
+    advance_grid();
+    if (open_at(cursor_, c_.n + 1, 0, kNone, nullptr, c_.folder)) return;
+    if (!gone()) enter_last_resort(cursor_);
   }
   void on(const CmdClockPair& c) { event(JsonLine("clock_pair", c.at, c.wall)); }
   void on(const CmdAcknowledge&) {
-    std::lock_guard<std::mutex> lk(d_.m_);
-    d_.st_.needs_ack = false;
+    commit([](DestStatus& st) { st.needs_ack = false; });
   }
 
-  Destination& d_;
-  const DestinationConfig cfg_;  // folders are read live from d_.st_.config (CmdAppendFolder)
-  const uint32_t out_ch_;
-  Mode mode_ = Mode::Writing;
-  std::deque<DestCommand> cmds_;  // drained from d_.cmds_; the front may wait (close-for-gap)
+  // ---- state ----
 
-  SampleIndex cursor_, start_;
-  SampleIndex next_boundary_ = kNoRotation;
-  std::set<SampleIndex> splits_;
-  std::vector<std::pair<SampleIndex, std::wstring>> markers_;  // not yet in a finalized file
+  std::shared_ptr<Core> core_;  // keeps the shared state alive for an abandoned generation
+  Core& k_;
+  uint64_t gen_;
+  const DestinationConfig cfg_;  // folders are read live from k_.st.config (CmdAppendFolder)
+  const uint32_t out_ch_;
+  const size_t stalled_;  // take_over only
+  Carry c_;
+  SampleIndex cursor_;
+  bool dead_ = false;
 
   std::unique_ptr<Manifest> man_;
+  size_t man_folder_ = kNone;
   IEncoderFile* enc_ = nullptr;  // the open file, if any
   std::wstring path_;
-  SampleIndex file_start_ = 0;
-  uint32_t n_, seg_ = 0;
-  size_t folder_ = 0;
+  SizeTap bytes_;
 
-  uint64_t last_flush_ms_ = 0;
-  bool overrun_logged_ = false;
+  uint64_t last_flush_ms_ = 0, last_space_ms_ = 0, next_retry_ms_ = 0;
+  bool retry_now_ = false, manifest_warned_ = false;
+  bool redo_front_ = false;  // the command being handled stays queued (it must wait again)
   std::vector<float> in_, out_;
 };
 
 Destination::Destination(DestinationConfig cfg, const SessionParams& sp, SampleRing& ring, IFileSystem& fs,
                          IClock& clock, EventLog& log, DestResumeSeed seed)
-    : sp_(sp), ring_(ring), fs_(fs), clock_(clock), log_(log), seed_(std::move(seed)), name_(cfg.name) {
+    : core_(std::make_shared<Core>(sp, ring, fs, clock, log, std::move(seed), cfg.name)) {
+  Core& k = *core_;
   if (cfg.channels.empty()) {
-    for (uint32_t c = 0; c < ring.channels(); ++c) map_.push_back(uint16_t(c));
+    for (uint32_t c = 0; c < ring.channels(); ++c) k.map.push_back(uint16_t(c));
   } else {
-    map_ = cfg.channels;
+    k.map = cfg.channels;
   }
-  st_.name = cfg.name;
-  st_.state = DestState::Idle;
-  st_.needs_ack = false;
-  for (const auto& f : cfg.folders) st_.folders.push_back(FolderStatus{f, FolderHealth::Standby, std::nullopt, 0.0});
-  st_.gaps = 0;
-  st_.cursor = st_.confirmed = 0;
-  st_.n = 0;
-  st_.config = std::move(cfg);
+  k.rate_bytes = sl::data_rate(cfg, sp.rate, k.map.size());
+  k.low_water = low_water_bytes(sp, k.rate_bytes);
+  k.st.name = cfg.name;
+  k.st.state = DestState::Idle;
+  k.st.needs_ack = false;
+  for (const auto& f : cfg.folders) k.st.folders.push_back(FolderStatus{f, FolderHealth::Standby, std::nullopt, 0.0});
+  k.st.gaps = 0;
+  k.st.cursor = k.st.confirmed = 0;
+  k.st.n = 0;
+  k.st.config = std::move(cfg);
 
   std::wstring problem;
-  if (st_.config.folders.empty()) problem = L"no folder configured";
-  for (uint16_t c : map_)
+  if (k.st.config.folders.empty()) problem = L"no folder configured";
+  for (uint16_t c : k.map)
     if (problem.empty() && c >= ring.channels()) problem = L"channel " + std::to_wstring(c + 1) + L" is not an input channel";
-  if (problem.empty() && st_.config.format == OutFormat::Opus && map_.size() > 2)
+  if (problem.empty() && k.st.config.format == OutFormat::Opus && k.map.size() > 2)
     problem = L"Opus records 1 or 2 channels per destination";
   if (!problem.empty()) disable(problem);
 }
@@ -491,81 +1068,137 @@ Destination::~Destination() {
 }
 
 void Destination::start(SampleIndex at) {
+  Core& k = *core_;
+  Writer* w = nullptr;
   {
-    std::lock_guard<std::mutex> lk(m_);
-    if (st_.state != DestState::Idle || writer_) return;  // disabled, or already started
+    std::lock_guard<std::mutex> lk(k.m);
+    if (k.st.state != DestState::Idle || writer_) return;  // disabled, or already started
+    k.st.confirmed = at;
+    k.cursor.store(at, std::memory_order_release);
+    Carry c;
+    c.n = k.seed.first_n;
+    c.session_start = at;
+    w = new Writer(core_, k.generation.load(), at, std::move(c), kNone);
+    writer_ = w;
   }
-  cursor_.store(at, std::memory_order_release);
-  writer_ = new Writer(*this, at);
-  thread_ = std::thread([w = writer_] { w->run(); });
+  thread_ = std::thread([w] { w->run(); });
 }
 
 void Destination::post(DestCommand c) {
-  std::lock_guard<std::mutex> lk(m_);
-  cmds_.push_back(std::move(c));
+  std::lock_guard<std::mutex> lk(core_->m);
+  core_->cmds.push_back(std::move(c));
 }
 
 void Destination::stop(SampleIndex end) {
+  Core& k = *core_;
   if (!thread_.joinable()) {
     set_state(DestState::Stopped);
     return;
   }
   {
-    std::lock_guard<std::mutex> lk(m_);
-    if (!stop_requested_) {  // disable() may have asked first
-      stop_requested_ = true;
-      stop_end_ = end;
-      stop_reason_ = "stop";
+    std::lock_guard<std::mutex> lk(k.m);
+    if (!k.stop_requested) {  // disable() may have asked first
+      k.stop_requested = true;
+      k.stop_end = end;
+      k.stop_reason = "stop";
     }
   }
-  if (WaitForSingleObject(thread_.native_handle(), 3000) == WAIT_OBJECT_0) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kStopBudgetMs);
+  if (WaitForSingleObject(thread_.native_handle(), kStopBudgetMs) == WAIT_OBJECT_0) {
     thread_.join();
-    delete writer_;
-  } else {
-    // Stuck in file I/O: leak the writer, its encoder and its thread (Task 10 completes this).
-    writer_->abandoned = true;
-    thread_.detach();
-    log(Severity::Error, L"Writer did not stop within 3 s and was abandoned");
-    set_state(DestState::Stopped);
+    Writer* w = nullptr;
+    {
+      std::lock_guard<std::mutex> lk(k.m);
+      std::swap(w, writer_);
+    }
+    delete w;
+    // Files handed off by a failover finish on their own threads: give them what is left
+    // of the budget, so a healthy one is complete when stop() returns.
+    std::unique_lock<std::mutex> lk(k.m);
+    k.fin_cv.wait_until(lk, deadline, [&] { return k.finalizers == 0; });
+    return;
   }
-  writer_ = nullptr;
+  // Stuck in file I/O: leak the writer, its encoder and its thread.
+  {
+    std::unique_lock<std::shared_mutex> lv(k.live);
+    std::lock_guard<std::mutex> lk(k.m);
+    ++k.generation;
+    writer_ = nullptr;
+    k.set_state_locked(DestState::Stopped);
+  }
+  CancelSynchronousIo(thread_.native_handle());  // best effort
+  thread_.detach();
+  log(Severity::Error, L"Writer did not stop within 3 s and was abandoned");
 }
 
 void Destination::declare_stalled() {
-  // Task 10: fail over away from a stalled writer.
+  Core& k = *core_;
+  Writer* w = nullptr;
+  std::wstring dir;
+  {
+    std::unique_lock<std::shared_mutex> lv(k.live);
+    std::lock_guard<std::mutex> lk(k.m);
+    if (!writer_ || !thread_.joinable() || k.st.state == DestState::Stopped) return;
+    const uint64_t gen = ++k.generation;  // from here on the stuck writer touches nothing shared
+    const size_t stalled = k.busy_folder;
+    if (stalled < k.st.folders.size()) {
+      k.quarantined.insert(stalled);  // a probe there could hang the next writer too
+      k.st.folders[stalled].health = FolderHealth::Failed;
+      dir = k.st.config.folders[stalled];
+    }
+    if (k.carry.started && k.carry.mode == Mode::Writing) {
+      k.set_state_locked(DestState::FailingOver);
+      k.st.current_file.clear();
+    }
+    k.st.needs_ack = true;
+    // The new generation continues from the last confirmed sample with the published carry.
+    w = new Writer(core_, gen, k.st.confirmed, k.carry, stalled);
+    writer_ = w;  // the old one is leaked: its thread may be stuck in the call that hung
+  }
+  CancelSynchronousIo(thread_.native_handle());  // best effort: fails a blocked call on a real device
+  thread_.detach();
+  thread_ = std::thread([w] { w->run(); });
+  log(Severity::Error, L"Writer stalled" + (dir.empty() ? std::wstring() : L" on " + dir) +
+                           L"; continuing from the last confirmed sample");
 }
 
 void Destination::disable(std::wstring reason) {
   {
-    std::lock_guard<std::mutex> lk(m_);
-    if (st_.state == DestState::Disabled) return;
-    st_.state = DestState::Disabled;
-    if (writer_ && !stop_requested_) {  // running: close at the current position
-      stop_requested_ = true;
-      stop_end_ = cursor_.load(std::memory_order_acquire);
-      stop_reason_ = "disabled";
+    std::lock_guard<std::mutex> lk(core_->m);
+    if (core_->st.state == DestState::Disabled) return;
+    core_->st.state = DestState::Disabled;
+    if (writer_ && !core_->stop_requested) {  // running: close at the current position
+      core_->stop_requested = true;
+      core_->stop_end = progress();
+      core_->stop_reason = "disabled";
     }
   }
   log(Severity::Error, L"Destination disabled: " + reason);
 }
 
 DestStatus Destination::status() const {
-  std::lock_guard<std::mutex> lk(m_);
-  DestStatus s = st_;
+  std::lock_guard<std::mutex> lk(core_->m);
+  DestStatus s = core_->st;
   s.cursor = progress();
   return s;
 }
 
-uint64_t Destination::data_rate() const {
-  if (st_.config.format == OutFormat::Opus) return opus_bitrate(st_.config.opus_bitrate, map_.size()) / 8;
-  return uint64_t(sp_.rate) * map_.size() * bytes_per_sample(st_.config.wav_depth);
+SampleIndex Destination::progress() const { return core_->cursor.load(std::memory_order_acquire); }
+
+uint64_t Destination::data_rate() const { return core_->rate_bytes; }
+
+void Destination::log(Severity s, std::wstring text) {
+  core_->log.add(s, core_->clock.now(), core_->name, std::move(text));
 }
 
-void Destination::log(Severity s, std::wstring text) { log_.add(s, clock_.now(), name_, std::move(text)); }
-
 void Destination::set_state(DestState s) {
-  std::lock_guard<std::mutex> lk(m_);
-  if (st_.state != DestState::Disabled) st_.state = s;
+  std::lock_guard<std::mutex> lk(core_->m);
+  core_->set_state_locked(s);
+}
+
+uint64_t data_rate(const DestinationConfig& c, uint32_t rate, size_t channels) {
+  if (c.format == OutFormat::Opus) return opus_bitrate(c.opus_bitrate, channels) / 8;
+  return uint64_t(rate) * channels * bytes_per_sample(c.wav_depth);
 }
 
 bool is_stalled(SampleIndex write_index, SampleIndex progress, size_t capacity, uint32_t stall_percent) {

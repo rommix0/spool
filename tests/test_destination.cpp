@@ -14,9 +14,11 @@
 #include "session/destination.h"
 #include "session/event_log.h"
 #include "session/manifest.h"
+#include "dest_helpers.h"
 #include "test.h"
 
 using namespace sl;
+using namespace dest_test;
 
 namespace {
 
@@ -25,32 +27,6 @@ WallTime start_wall() { return WallTime{1792175398000LL, -240}; }
 
 const std::wstring kDir = L"D:\\rec";
 const std::wstring kManifest = L"D:\\rec\\gig_main.jsonl";
-
-void feed(SampleRing& ring, SampleIndex from, size_t frames) {
-  const uint32_t ch = ring.channels();
-  std::vector<float> buf(4096 * ch);
-  for (size_t done = 0; done < frames;) {
-    const size_t n = std::min<size_t>(4096, frames - done);
-    for (size_t i = 0; i < n; ++i)
-      for (uint32_t c = 0; c < ch; ++c) buf[i * ch + c] = ramp_value(from + SampleIndex(done + i), c);
-    ring.write(buf.data(), n);
-    done += n;
-  }
-}
-
-template <class Pred>
-bool poll(Pred p) {
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  while (!p()) {
-    if (std::chrono::steady_clock::now() > deadline) return false;
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-  return true;
-}
-
-bool wait_progress(const Destination& d, SampleIndex target) {
-  return poll([&] { return d.progress() >= target; });
-}
 
 struct Rig {
   explicit Rig(uint32_t rate = 8000, OutFormat fmt = OutFormat::Wav)
@@ -94,31 +70,6 @@ struct Rig {
   SessionParams sp;
   DestinationConfig cfg;
 };
-
-std::optional<WavInfo> wav_info(FaultFileSystem& fs, const std::wstring& path) {
-  std::wstring err;
-  auto f = fs.open_existing(path, &err);
-  if (!f) return std::nullopt;
-  auto info = read_wav_info(*f);
-  f->close();
-  return info;
-}
-
-std::vector<float> wav_samples(FaultFileSystem& fs, const std::wstring& path) {
-  std::wstring err;
-  auto f = fs.open_existing(path, &err);
-  if (!f) return {};
-  auto info = read_wav_info(*f);
-  std::vector<float> out;
-  if (info && info->bits == 32) {
-    out.resize(size_t(info->frames) * info->channels);
-    if (!f->read_at(info->data_offset, out.data(), out.size() * 4)) out.clear();
-  }
-  f->close();
-  return out;
-}
-
-int64_t num(ManifestRecord& r, const char* key) { return std::stoll(r[key]); }
 
 }  // namespace
 
@@ -356,5 +307,29 @@ TEST(dest_gap_close_and_resume) {
     const auto v = wav_samples(rig.fs, files[1]);
     CHECK_EQ(v.size(), size_t(5 * 8000));
     if (!v.empty()) CHECK(v[0] == ramp_value(10 * 8000, 0));
+  }
+}
+
+// CmdResumeAt keeps the session's rotation grid. At 44100 Hz a sample does not fall on
+// a whole millisecond, so a boundary recomputed from the resume point's wall time
+// would land up to 44 samples late.
+TEST(dest_resume_keeps_rotation_grid_44100) {
+  Rig rig(44100);
+  Destination d(rig.cfg, rig.sp, rig.ring, rig.fs, rig.clock, rig.log);
+  d.start(0);
+  d.post(CmdCloseForGap{5 * 44100});
+  CHECK(rig.pump(d, 0, 5 * 44100));
+  CHECK(poll([&] { return d.status().state == DestState::GapClosed; }));
+  const SampleIndex resume = 10 * 44100 + 43;
+  rig.ring.jump_to(resume);
+  d.post(CmdResumeAt{resume});
+  CHECK(rig.pump(d, resume, 63 * 44100));
+  d.stop(63 * 44100);
+
+  auto rots = rig.events("rotation");
+  CHECK_EQ(rots.size(), size_t(2));
+  if (rots.size() == 2) {
+    CHECK_EQ(num(rots[0], "sample"), int64_t(2 * 44100));
+    CHECK_EQ(num(rots[1], "sample"), int64_t(2 * 44100 + 60 * 44100));  // 14:31:00 on the grid
   }
 }
