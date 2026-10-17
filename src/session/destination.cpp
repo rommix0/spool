@@ -36,6 +36,7 @@ constexpr uint64_t kSpaceCheckMs = 10000;  // low-water check interval (§8.2)
 constexpr uint64_t kRetryMs = 30000;       // LastResort retry interval (§4.3)
 constexpr DWORD kStopBudgetMs = 3000;
 constexpr size_t kNone = SIZE_MAX;
+constexpr uint64_t kMinStallGraceMs = 5000;
 
 uint32_t bytes_per_sample(WavDepth d) {
   switch (d) {
@@ -47,6 +48,13 @@ uint32_t bytes_per_sample(WavDepth d) {
 
 uint32_t opus_bitrate(uint32_t configured, size_t channels) {
   return configured ? configured : (channels == 1 ? 64000u : 128000u);
+}
+
+// R13: how long a stall takeover may take to catch up before the watchdog may fire again:
+// the time the stall threshold (stall_percent of the ring) spans, at least 5 s.
+uint64_t stall_grace_ms(const SessionParams& sp, size_t ring_capacity) {
+  const uint64_t frames = uint64_t(ring_capacity) * sp.stall_percent / 100;
+  return std::max(kMinStallGraceMs, sp.rate ? frames * 1000 / sp.rate : 0);
 }
 
 // Creates dir\stem.ext (or stem_1.ext, ...) through `open`, which must fail rather than
@@ -218,6 +226,7 @@ struct Destination::Core {
   size_t busy_folder = kNone;     // folder of the writer's current file I/O
   std::set<size_t> quarantined;   // a writer hung there: never probed again this session
   SampleIndex stall_grace_until = -1;  // declare_stalled() ignored until the cursor gets here
+  uint64_t stall_grace_deadline_ms = 0;  // ... or until this steady time (R13)
   int finalizers = 0;             // Retired items still being finished
   std::condition_variable fin_cv;
 
@@ -1149,9 +1158,11 @@ void Destination::declare_stalled() {
     // idle on purpose and must not cost a healthy folder.
     if (k.st.state != DestState::Writing && k.st.state != DestState::FailingOver) return;
     // A generation that took over after a stall starts at least half a ring behind: it is
-    // given until it reaches the capture position recorded at the takeover.
+    // given until it reaches the capture position recorded at the takeover, or until the
+    // grace deadline if it hangs too (R13).
     if (k.stall_grace_until >= 0) {
-      if (k.cursor.load(std::memory_order_acquire) < k.stall_grace_until) return;
+      const bool caught_up = k.cursor.load(std::memory_order_acquire) >= k.stall_grace_until;
+      if (!caught_up && k.clock.steady_ms() < k.stall_grace_deadline_ms) return;
       k.stall_grace_until = -1;
     }
     const uint64_t gen = ++k.generation;  // from here on the stuck writer touches nothing shared
@@ -1167,6 +1178,7 @@ void Destination::declare_stalled() {
     }
     k.st.needs_ack = true;
     k.stall_grace_until = k.ring.write_index();
+    k.stall_grace_deadline_ms = k.clock.steady_ms() + stall_grace_ms(k.sp, k.ring_capacity);
     // The new generation continues from the last confirmed sample with the published carry.
     w = new Writer(core_, gen, k.st.confirmed, k.carry, stalled);
     writer_ = w;  // the old one is leaked: its thread may be stuck in the call that hung

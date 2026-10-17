@@ -615,3 +615,56 @@ TEST(failover_stall_ignored_when_idle) {
     CHECK_EQ(rig.wavs(kP).size(), size_t(2));
   }
 }
+
+// R13: the grace after a takeover ends at a deadline too, so a takeover writer that hangs
+// as well is still rescued: the next declare_stalled() after the deadline fails over.
+TEST(failover_stall_grace_deadline_rescues_hung_takeover) {
+  FoRig rig;
+  rig.cfg.folders = {kP, kS, L"F:\f"};
+  Destination d(rig.cfg, rig.sp, rig.ring, rig.fs, rig.clock, rig.log);
+  d.start(0);
+  CHECK(rig.confirm_first_2s(d));
+  rig.fs.add_rule({L"D:\\", Kind::HangWrite});
+  rig.fs.add_rule({L"E:\\", Kind::HangWrite});
+  feed(rig.ring, 2 * kRate, size_t(kRate));
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  CHECK_EQ(d.progress(), SampleIndex(2 * kRate));
+  d.declare_stalled();  // takes over towards E:, which hangs too (in its probe)
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  d.declare_stalled();  // within the grace: ignored
+  CHECK_EQ(stall_log_entries(rig.log), size_t(1));
+  // Grace = 2^20 frames * 50 % / 8000 Hz = 65.536 s of steady time.
+  rig.clock.advance_ms(65000);
+  d.declare_stalled();  // still within it
+  CHECK_EQ(stall_log_entries(rig.log), size_t(1));
+  rig.clock.advance_ms(1000);
+  d.declare_stalled();  // past the deadline: honored
+  CHECK(poll([&] { return on_folder(d.status(), 2); }));
+  CHECK_EQ(stall_log_entries(rig.log), size_t(2));
+  const DestStatus st = d.status();
+  CHECK(st.folders[0].health == FolderHealth::Failed);
+  CHECK(st.folders[1].health == FolderHealth::Failed);
+  CHECK(rig.pump(d, 3 * kRate, 6 * kRate));
+  d.stop(6 * kRate);
+  rig.fs.release_hangs();
+
+  const auto dp = rig.wavs(kP), ff = rig.wavs(L"F:\f");
+  CHECK_EQ(rig.wavs(kS).size(), size_t(0));  // E: never got further than its probe
+  CHECK_EQ(dp.size(), size_t(1));
+  CHECK_EQ(ff.size(), size_t(1));
+  if (dp.size() != 1 || ff.size() != 1) return;
+  const auto a = wav_samples(rig.fs, dp[0]);
+  const auto c = wav_samples(rig.fs, ff[0]);
+  CHECK_EQ(a.size(), size_t(2 * kRate));
+  CHECK_EQ(a.size() + c.size(), size_t(6 * kRate));
+  CHECK_EQ(ramp_errors(a, 0) + ramp_errors(c, 2 * kRate), size_t(0));
+  auto recs = rig.only_manifest(L"F:\f");
+  CHECK(recs.size() >= 2);
+  if (recs.size() >= 2) {
+    CHECK_EQ(recs[1]["ev"], std::string("failover"));
+    CHECK_EQ(recs[1]["from"], narrow(kS));
+    CHECK_EQ(recs[1]["trigger"], std::string("stall"));
+    CHECK_EQ(num(recs[1], "confirmed"), int64_t(2 * kRate));
+    CHECK_EQ(recs[1]["old_path"], narrow(dp[0]));  // still the file that holds the data
+  }
+}

@@ -83,7 +83,11 @@ class Destination {
   // next healthy folder. The watchdog may call this whenever is_stalled() holds; it is a
   // no-op unless the state is Writing or FailingOver (GapClosed and LastResort idle on
   // purpose), and after a stall takeover it is ignored until progress() reaches the
-  // capture position recorded at the takeover (the new writer starts that far behind).
+  // capture position recorded at the takeover (the new writer starts that far behind) or
+  // a grace deadline passes, whichever comes first. The deadline is the takeover's steady
+  // time plus the time the stall threshold spans (capacity * stall_percent / 100 / rate
+  // seconds, at least 5 s); after it a call is honored normally, so a takeover writer
+  // that hangs as well fails over to the next healthy folder.
   void declare_stalled();
   void disable(std::wstring reason);  // state Disabled, nothing (more) written
   DestStatus status() const;
