@@ -958,10 +958,16 @@ class Destination::Writer {
   // to half a ring behind the capture position and a new file starts there.
   void on_overrun() {
     if (!confirm_all()) return;
-    SampleIndex wi = cursor_;
-    if (!live([&] { wi = k_.ring.write_index(); })) return;
+    SampleIndex wi = cursor_, oldest = cursor_;
+    if (!live([&] {
+          wi = k_.ring.write_index();
+          oldest = k_.ring.oldest_valid();
+        }))
+      return;
     const SampleIndex from = cursor_;
-    const SampleIndex to = std::max(from + 1, wi - SampleIndex(k_.ring_capacity / 2));
+    // Never before the oldest valid frame: after a jump_to that floor lies past
+    // write_index - capacity/2, and resyncing below it would overrun again.
+    const SampleIndex to = std::max({from + 1, wi - SampleIndex(k_.ring_capacity / 2), oldest});
     event(gap_line("gap_start", from, "overrun"));
     if (!commit([](DestStatus& st) { ++st.gaps; })) return;
     wchar_t secs[32];
@@ -1180,7 +1186,7 @@ void Destination::post(DestCommand c) {
   core_->cmds.push_back(std::move(c));
 }
 
-void Destination::stop(SampleIndex end) {
+void Destination::stop(SampleIndex end, std::string reason) {
   Core& k = *core_;
   if (!thread_.joinable()) {
     set_state(DestState::Stopped);
@@ -1191,7 +1197,7 @@ void Destination::stop(SampleIndex end) {
     if (!k.stop_requested) {  // disable() may have asked first
       k.stop_requested = true;
       k.stop_end = end;
-      k.stop_reason = "stop";
+      k.stop_reason = std::move(reason);
     }
   }
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kStopBudgetMs);

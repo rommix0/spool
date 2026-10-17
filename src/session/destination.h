@@ -74,9 +74,9 @@ class Destination {
 
   void start(SampleIndex at);
   void post(DestCommand);      // mutex-protected deque drained by the worker
-  // Writes through end and finalizes; returns within 3 s even if a drive hangs (the stuck
-  // worker is then abandoned).
-  void stop(SampleIndex end);
+  // Writes through end and finalizes, with session_end reason `reason`; returns within 3 s
+  // even if a drive hangs (the stuck worker is then abandoned).
+  void stop(SampleIndex end, std::string reason = "stop");
   SampleIndex progress() const;
   // The stall watchdog fired (see is_stalled): the worker is abandoned where it hangs, its
   // folder is quarantined, and a new one continues from the last confirmed sample in the

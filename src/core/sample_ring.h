@@ -23,6 +23,9 @@ class SampleRing {
 
   uint32_t channels() const { return channels_; }
   size_t capacity() const { return capacity_; }
+  // False if VirtualLock failed (the working-set quota): pages may then be trimmed, and
+  // the capture thread could take a page fault on them.
+  bool locked() const { return locked_; }
 
   // Single producer; no allocation, locks or syscalls. Overwrites the oldest frames.
   void write(const float* interleaved, size_t frames);
@@ -47,6 +50,7 @@ class SampleRing {
   size_t capacity_;
   size_t mask_;
   float* data_ = nullptr;
+  bool locked_ = false;
   alignas(64) std::atomic<int64_t> write_index_;  // published after the data is copied
   // Index the producer is about to publish; stored before any slot is overwritten.
   // Readers use it after copying to detect slots overwritten while they were reading.

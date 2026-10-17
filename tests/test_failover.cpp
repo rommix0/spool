@@ -383,6 +383,32 @@ TEST(overrun_records_gap) {
   }
 }
 
+// After a jump_to (input gap, §5.3) the resync target must be at least the jump floor:
+// write_index - capacity/2 lies before it and would overrun again, creeping one frame
+// (and one file) at a time.
+TEST(overrun_after_jump_resumes_at_jump_target) {
+  FoRig rig{size_t(1) << 16};
+  Destination d(rig.cfg, rig.sp, rig.ring, rig.fs, rig.clock, rig.log);
+  d.start(0);
+  CHECK(rig.pump(d, 0, kRate));
+  const SampleIndex j = kRate + 4 * SampleIndex(rig.ring.capacity());
+  rig.ring.jump_to(j);
+  feed(rig.ring, j, size_t(kRate));
+  CHECK(wait_progress(d, j + kRate));
+  d.stop(j + kRate);
+
+  const auto w = rig.wavs(kP);
+  CHECK_EQ(w.size(), size_t(2));
+  if (w.size() == 2) {
+    const auto b = wav_samples(rig.fs, w[1]);
+    CHECK_EQ(b.size(), size_t(kRate));
+    CHECK_EQ(ramp_errors(b, j), size_t(0));
+  }
+  auto ends = events(rig.records(kPManifest), "gap_end");
+  CHECK_EQ(ends.size(), size_t(1));
+  if (ends.size() == 1) CHECK_EQ(num(ends[0], "sample"), int64_t(j));
+}
+
 TEST(is_stalled_threshold) {
   CHECK(!is_stalled(1000, 500, 1024, 50));
   CHECK(is_stalled(1000, 400, 1024, 50));

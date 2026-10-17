@@ -113,6 +113,18 @@ TEST(ring_start_index) {
   CHECK_EQ(count_bad(buf, 1'000'000, 4, 1), size_t(0));
 }
 
+// VirtualLock is limited by the working-set minimum (default ~200 KB): a page fits, 64 MB
+// does not. The ring works either way; locked() lets the session warn.
+TEST(ring_reports_lock) {
+  SampleRing small(1, 1024);
+  CHECK(small.locked());
+  SampleRing big(1, size_t(1) << 24);
+  CHECK(!big.locked());
+  write_ramp(big, 0, 4);
+  std::vector<float> buf(4);
+  CHECK_EQ(big.read(0, buf.data(), 4).frames, size_t(4));
+}
+
 TEST(ring_threaded_no_tearing) {
   constexpr SampleIndex kTotal = 5'000'000;
   constexpr uint32_t kCh = 2;
