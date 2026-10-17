@@ -55,8 +55,9 @@ struct RepairReport {
 };
 
 // For each destination, follows its manifest's prev_manifest chain. Every file_open
-// without a file_close is repaired (WAV: repair_wav, capped at the failover's confirmed
-// sample if the file failed over; Opus: nothing to repair) and closed with a file_close in
+// without a file_close (or whose file_close has "ok":0: its finalize failed) is repaired
+// (WAV: repair_wav, capped at the failover's confirmed sample if the file failed over and
+// at the failed close's end; Opus: nothing to repair) and closed with a file_close in
 // the manifest that opened it (or the current one if that cannot be written). The current
 // manifest then gets gap_start(crash) at last_sample, or where the repaired audio ends if
 // that is later (the state is saved every flush_ms, so up to that much may follow it).

@@ -246,12 +246,13 @@ struct Destination::Core {
 // then record the close and the failover in the old manifest. Touches only `r` and `sp`.
 void Destination::Core::finish(Retired r) {
   if (r.enc) {
-    r.enc->finalize(r.markers, r.truncate_to);
+    const bool ok = r.enc->finalize(r.markers, r.truncate_to);
     const SampleIndex end = r.start + SampleIndex(r.enc->confirmed_frames());
     delete r.enc;
     if (r.man) {
       JsonLine l("file_close", end, wall_for(sp, end));
       l.str("path", r.path).num("start", r.start).num("end", end).num("bytes", int64_t(r.bytes ? r.bytes->load() : 0));
+      if (!ok) l.num("ok", 0);  // a crash scan repairs it
       r.man->append(l);
     }
   }
@@ -784,11 +785,10 @@ class Destination::Writer {
     if (gone()) return end;
     delete enc_;
     enc_ = nullptr;
-    event(line("file_close", end)
-              .str("path", c_.path)
-              .num("start", c_.file_start)
-              .num("end", end)
-              .num("bytes", int64_t(bytes_->load())));
+    JsonLine l = line("file_close", end);
+    l.str("path", c_.path).num("start", c_.file_start).num("end", end).num("bytes", int64_t(bytes_->load()));
+    if (!ok) l.num("ok", 0);  // the header may be stale: a crash scan repairs it
+    event(l);
     commit([&](DestStatus& st) {
       st.current_file.clear();
       if (ok) st.confirmed = end;

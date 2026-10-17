@@ -136,6 +136,10 @@ TEST(failover_on_write_error_no_loss_no_dup) {
     CHECK_EQ(old[0]["to"], narrow(kS));
     CHECK_EQ(old[0]["old_path"], narrow(dp[0]));
   }
+  // The small finalize writes still went through: a clean close carries no "ok".
+  auto closes = events(rig.records(kPManifest), "file_close");
+  CHECK_EQ(closes.size(), size_t(1));
+  if (closes.size() == 1) CHECK_EQ(num(closes[0], "ok"), int64_t(-1));
 }
 
 TEST(failover_on_low_space) {
@@ -1053,4 +1057,54 @@ TEST(failover_stall_clock_restarts_per_folder) {
   CHECK(rig.pump(d, 0, kRate));
   d.stop(kRate);
   CHECK_EQ(stall_log_entries(rig.log), size_t(0));
+}
+
+// A finalize that fails after the last good flush: the file_close says so ("ok":0), so a
+// later crash scan repairs that file instead of trusting its header.
+TEST(file_close_records_failed_finalize) {
+  FoRig rig;
+  Destination d(rig.cfg, rig.sp, rig.ring, rig.fs, rig.clock, rig.log);
+  d.start(0);
+  CHECK(rig.confirm_first_2s(d));
+  const std::wstring path = d.status().current_file;
+  const auto info = wav_info(rig.fs, path);
+  CHECK(info.has_value());
+  if (!info) return;
+  // The stop's flush rewrites the header once more; the finalize's own header write fails.
+  rig.fs.add_rule({path, Kind::FailWrite, info->data_offset});
+  d.stop(2 * kRate);
+  CHECK(d.status().state == DestState::Stopped);
+  const auto closes = events(rig.records(kPManifest), "file_close");
+  CHECK_EQ(closes.size(), size_t(1));
+  if (closes.size() != 1) return;
+  auto c = closes[0];
+  CHECK_EQ(num(c, "ok"), int64_t(0));
+  CHECK_EQ(num(c, "end"), int64_t(2 * kRate));
+}
+
+// The same for a file handed off by a failover: it failed over because its flushes fail,
+// so its finalize (which flushes) fails as well.
+TEST(file_close_records_failed_finalize_after_failover) {
+  FoRig rig;
+  Destination d(rig.cfg, rig.sp, rig.ring, rig.fs, rig.clock, rig.log);
+  d.start(0);
+  CHECK(rig.confirm_first_2s(d));
+  const std::wstring path = d.status().current_file;
+  rig.fs.add_rule({path, Kind::FailFlush});
+  feed(rig.ring, 2 * kRate, size_t(kRate));
+  CHECK(wait_progress(d, 3 * kRate));
+  rig.clock.advance_ms(2100);  // the next flush fails: failover to E:
+  CHECK(poll([&] { return on_folder(d.status(), 1); }));
+  CHECK(rig.pump(d, 3 * kRate, 4 * kRate));
+  d.stop(4 * kRate);
+  const auto closes = events(rig.records(kPManifest), "file_close");
+  CHECK_EQ(closes.size(), size_t(1));
+  if (closes.size() == 1) {
+    auto c = closes[0];
+    CHECK_EQ(num(c, "ok"), int64_t(0));
+    CHECK_EQ(num(c, "end"), int64_t(2 * kRate));  // what was confirmed
+  }
+  auto good = events(rig.only_manifest(kS), "file_close");
+  CHECK_EQ(good.size(), size_t(1));
+  if (good.size() == 1) CHECK_EQ(num(good[0], "ok"), int64_t(-1));
 }

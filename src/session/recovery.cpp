@@ -157,6 +157,7 @@ HeadState repair_dest(IFileSystem& fs, const RecordingState& st, const DestResum
   std::vector<OpenFile> opens;
   std::set<std::wstring> closed;
   std::map<std::wstring, SampleIndex> failed_over;  // old_path -> confirmed (absolute sample)
+  std::map<std::wstring, SampleIndex> bad_close;    // closed with "ok":0 (finalize failed) -> its end
   for (size_t i = 0; i < chain.size(); ++i)
     for (const auto& r : chain[i].recs) {
       const std::string ev = field(r, "ev");
@@ -164,7 +165,11 @@ HeadState repair_dest(IFileSystem& fs, const RecordingState& st, const DestResum
       if (ev == "file_open" && !path.empty()) {
         opens.push_back(OpenFile{path, number(r, "sample").value_or(0), i});
       } else if (ev == "file_close" && !path.empty()) {
-        closed.insert(path_key(path));
+        if (number(r, "ok") == 0) {
+          if (const auto e = number(r, "end")) bad_close[path_key(path)] = *e;  // its header may be stale
+        } else {
+          closed.insert(path_key(path));
+        }
       } else if (ev == "failover") {
         const std::wstring old = wide(field(r, "old_path"));
         if (const auto c = number(r, "confirmed"); c && !old.empty()) failed_over[path_key(old)] = *c;
@@ -187,8 +192,13 @@ HeadState repair_dest(IFileSystem& fs, const RecordingState& st, const DestResum
       if (fo != failed_over.end()) end = std::max(o.start, fo->second);
     } else {
       // A file that failed over ends at the confirmed sample: the rest is in the next file.
+      // One whose finalize failed ends where its file_close said, at most.
       std::optional<uint64_t> cap;
       if (fo != failed_over.end()) cap = uint64_t(std::max<SampleIndex>(0, fo->second - o.start));
+      if (const auto bc = bad_close.find(k); bc != bad_close.end()) {
+        const uint64_t c = uint64_t(std::max<SampleIndex>(0, bc->second - o.start));
+        cap = cap ? std::min(*cap, c) : c;
+      }
       std::wstring err;
       const auto frames = repair_wav(fs, o.path, &err, cap);
       if (!frames) {

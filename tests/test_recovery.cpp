@@ -891,3 +891,52 @@ TEST(recovery_end_session_only_live_heads) {
     CHECK_EQ(num_of(b.back(), "sample"), int64_t(rep.audio_end));
   }
 }
+
+// A file_close with "ok":0 (the finalize failed) does not close the file for the crash
+// scan: its header is repaired, capped at the close's end, and a clean file_close follows.
+TEST(recovery_repairs_file_closed_with_failed_finalize) {
+  FaultFileSystem fs;
+  std::wstring err;
+  fs.ensure_dir(kP, &err);
+  const std::wstring man = kP + L"\\gig_main.jsonl", wav = kP + L"\\gig_001.wav";
+  const WallTime w = r_wall();
+  {
+    auto enc = open_wav(fs, wav, WavParams{uint32_t(kRate), 1, WavDepth::Float32}, &err);
+    CHECK(enc != nullptr);
+    if (!enc) return;
+    std::vector<float> v(500);
+    for (size_t i = 0; i < v.size(); ++i) v[i] = ramp_value(SampleIndex(i), 0);
+    CHECK(enc->write(v.data(), 200));
+    CHECK(enc->flush());  // the header claims 200 frames
+    CHECK(enc->write(v.data() + 200, 300));
+    enc->abandon();  // the finalize never got its header out
+  }
+  put_line(fs, man, JsonLine("session_start", 0, w).str("session_id", L"x").str("dest", L"main"));
+  put_line(fs, man, JsonLine("file_open", 0, w).str("path", wav).num("n", 1).num("seg", 0));
+  put_line(fs, man,
+           JsonLine("file_close", 400, w).str("path", wav).num("start", 0).num("end", 400).num("bytes", 0).num("ok", 0));
+  CHECK_EQ(wav_info(fs, wav)->frames, uint64_t(200));
+  RecordingState st;
+  st.recording = true;
+  st.session_id = L"x";
+  st.rate = uint32_t(kRate);
+  st.channels = 1;
+  st.start_utc_ms = w.utc_ms;
+  st.last_utc_ms = w.utc_ms + 1000;
+  st.last_sample = kRate;
+  st.dests = {{L"main", man, 2}};
+  const RepairReport r = repair_open_files(fs, st);
+  CHECK_EQ(r.repaired.size(), size_t(1));
+  CHECK_EQ(r.failed.size(), size_t(0));
+  const auto v = wav_samples(fs, wav);
+  CHECK_EQ(v.size(), size_t(400));  // capped at the close's end
+  CHECK_EQ(ramp_errors(v, 0), size_t(0));
+  const auto closes = events(read_manifest(fs, man), "file_close");
+  CHECK_EQ(closes.size(), size_t(2));
+  if (closes.size() == 2) {
+    CHECK_EQ(num_of(closes[1], "end"), int64_t(400));
+    CHECK_EQ(num_of(closes[1], "ok"), int64_t(-1));
+  }
+  // Closed for good now: a second scan repairs nothing.
+  CHECK_EQ(repair_open_files(fs, st).repaired.size(), size_t(0));
+}
