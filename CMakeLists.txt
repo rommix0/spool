@@ -34,7 +34,7 @@ endforeach()
 
 add_library(sl_core STATIC ${SL_CORE_SOURCES} src/core/types.h)
 target_include_directories(sl_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(sl_core PUBLIC Opus::opus opusenc)
+target_link_libraries(sl_core PUBLIC Opus::opus opusenc ole32 avrt uuid)
 
 # ---- sl_tests ----
 file(GLOB SL_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/*.cpp)
