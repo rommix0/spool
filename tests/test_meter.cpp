@@ -9,10 +9,10 @@
 #include "session/meter.h"
 #include "test.h"
 
-using sl::ChannelMeter;
-using sl::FakeClock;
-using sl::MeterReader;
-using sl::SampleRing;
+using spool::ChannelMeter;
+using spool::FakeClock;
+using spool::MeterReader;
+using spool::SampleRing;
 
 namespace {
 constexpr uint32_t kRate = 48000;

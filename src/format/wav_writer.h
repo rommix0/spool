@@ -9,12 +9,12 @@
 #include "format/encoder.h"
 #include "io/file_system.h"
 
-namespace sl {
+namespace spool {
 
 enum class WavDepth { Int16, Int24, Float32 };
 
 struct BextInfo {
-  std::string description, originator = "SoundLogger", originator_reference;
+  std::string description, originator = "Spool", originator_reference;
   std::string date /*yyyy-mm-dd*/, time /*hh:mm:ss*/;
   uint64_t time_reference = 0;
 };
@@ -38,4 +38,4 @@ std::unique_ptr<IEncoderFile> open_wav(IFileSystem&, const std::wstring& path, c
 bool wav_patch_header(std::vector<uint8_t>& hdr, uint64_t data_bytes, uint64_t frames,
                       uint64_t file_bytes, bool rf64);
 
-}  // namespace sl
+}  // namespace spool

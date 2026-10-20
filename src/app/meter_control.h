@@ -9,7 +9,7 @@
 
 #include "session/meter.h"
 
-namespace sl {
+namespace spool {
 
 class MeterControl {
  public:
@@ -49,4 +49,4 @@ class MeterControl {
   SIZE mem_size_{};
 };
 
-}  // namespace sl
+}  // namespace spool

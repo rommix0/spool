@@ -4,9 +4,9 @@
 #include "core/sample_ring.h"
 #include "test.h"
 
-using namespace sl;
-using sl::CaptureConfig;
-using sl::CaptureMode;
+using namespace spool;
+using spool::CaptureConfig;
+using spool::CaptureMode;
 
 namespace {
 constexpr size_t kMiB = size_t(1) << 20;

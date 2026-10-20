@@ -10,7 +10,7 @@
 #include "core/types.h"
 #include "session/config.h"
 
-namespace sl {
+namespace spool {
 
 // Rotation periods in minutes: Off, 5, 10, 15, 30, 60, plus `current` (in order) when it is
 // another value, such as one from a hand-edited INI.
@@ -57,4 +57,4 @@ std::vector<std::wstring> destination_problems(const DestinationConfig&, uint16_
 // Raw mode's read-only rate: "48000 Hz, set in Windows sound settings" (rate unknown: no number).
 std::wstring raw_rate_note(uint32_t rate);
 
-}  // namespace sl
+}  // namespace spool

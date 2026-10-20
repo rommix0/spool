@@ -7,7 +7,7 @@
 #include "core/clock.h"
 #include "core/sample_ring.h"
 
-namespace sl {
+namespace spool {
 
 struct ChannelMeter {
   float peak_db;  // max |x| over the frames seen by the latest update(), floor -60;
@@ -53,4 +53,4 @@ class MeterReader {
   std::vector<ChannelMeter> out_;
 };
 
-}  // namespace sl
+}  // namespace spool

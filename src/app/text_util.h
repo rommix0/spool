@@ -3,10 +3,10 @@
 #include <string>
 #include <vector>
 
-namespace sl {
+namespace spool {
 
 std::wstring trim(const std::wstring& s);                       // surrounding spaces and tabs removed
 bool eq_nocase(const std::wstring& a, const std::wstring& b);   // ordinal, case-insensitive
 std::wstring join_lines(const std::vector<std::wstring>& lines);  // joined with "\n"
 
-}  // namespace sl
+}  // namespace spool

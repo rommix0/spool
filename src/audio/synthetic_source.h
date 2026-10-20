@@ -9,7 +9,7 @@
 
 #include "audio/capture_source.h"
 
-namespace sl {
+namespace spool {
 
 class SyntheticSource : public ICaptureSource {
  public:
@@ -55,4 +55,4 @@ class SyntheticSource : public ICaptureSource {
   std::thread thread_;
 };
 
-}  // namespace sl
+}  // namespace spool

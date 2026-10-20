@@ -7,7 +7,7 @@
 #include "core/types.h"
 #include "io/file_system.h"
 
-namespace sl {
+namespace spool {
 
 // <>:"/\|?* and chars < 0x20 -> '_'; trailing '.' and ' ' trimmed; empty -> "_".
 // A reserved device name before the first '.' (CON, PRN, AUX, NUL, COM1-9, LPT1-9, any
@@ -38,4 +38,4 @@ SampleIndex first_rotation_boundary(SampleIndex now, WallTime now_wall, uint32_t
 // prev_boundary + period_min * 60 * rate.
 SampleIndex next_rotation_boundary(SampleIndex prev_boundary, uint32_t rate, uint32_t period_min);
 
-}  // namespace sl
+}  // namespace spool

@@ -26,7 +26,7 @@
 #include "session/preflight.h"
 #include "session/recovery.h"
 
-namespace sl {
+namespace spool {
 
 struct SessionConfig {
   SessionParams params;  // start() sets session_id, start_wall, rate and input_channels (from the source)
@@ -190,4 +190,4 @@ class SessionManager : CaptureCallbacks {
   std::thread thread_;
 };
 
-}  // namespace sl
+}  // namespace spool

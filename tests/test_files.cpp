@@ -11,10 +11,10 @@
 #include "io/file_system.h"
 #include "test.h"
 
-using sl::FaultFileSystem;
-using sl::IFile;
-using sl::IFileSystem;
-using Kind = sl::FaultFileSystem::Kind;
+using spool::FaultFileSystem;
+using spool::IFile;
+using spool::IFileSystem;
+using Kind = spool::FaultFileSystem::Kind;
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -70,7 +70,7 @@ struct TempDir {
     const DWORD n = GetTempPathW(MAX_PATH, tmp);
     std::wstring base(tmp, n);
     if (!base.empty() && base.back() == L'\\') base.pop_back();
-    path = base + L"\\sl_test_" + std::to_wstring(GetCurrentProcessId()) + L"_" +
+    path = base + L"\\spool_test_" + std::to_wstring(GetCurrentProcessId()) + L"_" +
            std::to_wstring(GetTickCount64()) + L"_" + std::to_wstring(counter++);
     CreateDirectoryW(path.c_str(), nullptr);
   }
@@ -330,7 +330,7 @@ TEST(fault_concurrent_writers) {
 
 TEST(win_create_new_refuses_existing) {
   TempDir td;
-  sl::IFileSystem& fs = sl::real_fs();
+  spool::IFileSystem& fs = spool::real_fs();
   std::wstring err;
   const std::wstring p = td.path + L"\\a.bin";
   auto f = fs.create_new(p, &err);
@@ -351,7 +351,7 @@ TEST(win_create_new_refuses_existing) {
 
 TEST(win_write_at_flush_size) {
   TempDir td;
-  sl::IFileSystem& fs = sl::real_fs();
+  spool::IFileSystem& fs = spool::real_fs();
   std::wstring err;
   const std::wstring p = td.path + L"\\a.bin";
   auto f = fs.create_new(p, &err);
@@ -382,7 +382,7 @@ TEST(win_write_at_flush_size) {
 
 TEST(win_free_bytes_and_volume) {
   TempDir td;
-  sl::IFileSystem& fs = sl::real_fs();
+  spool::IFileSystem& fs = spool::real_fs();
   auto fb = fs.free_bytes(td.path);
   CHECK(fb.has_value());
   if (fb) CHECK(*fb > 0);
@@ -393,7 +393,7 @@ TEST(win_free_bytes_and_volume) {
 
 TEST(win_ensure_dir_and_list) {
   TempDir td;
-  sl::IFileSystem& fs = sl::real_fs();
+  spool::IFileSystem& fs = spool::real_fs();
   std::wstring err;
   const std::wstring d = td.path + L"\\a\\b\\c";
   CHECK(fs.ensure_dir(d, &err));
@@ -419,7 +419,7 @@ TEST(win_ensure_dir_and_list) {
 
 TEST(win_long_path) {
   TempDir td;
-  sl::IFileSystem& fs = sl::real_fs();
+  spool::IFileSystem& fs = spool::real_fs();
   std::wstring err;
   std::wstring d = td.path;
   while (d.size() < 330) d += L"\\long_directory_name_segment";
@@ -485,7 +485,7 @@ TEST(fault_list_order_matches_win32) {
 
 TEST(win_list_order_matches_fault_fs) {
   TempDir td;
-  sl::IFileSystem& fs = sl::real_fs();
+  spool::IFileSystem& fs = spool::real_fs();
   std::wstring err;
   for (const wchar_t* n : {L"\\a_1.wav", L"\\ab.wav", L"\\Aa.wav"})
     CHECK(fs.create_new(td.path + n, &err) != nullptr);
@@ -500,7 +500,7 @@ TEST(win_list_order_matches_fault_fs) {
 
 TEST(win_free_bytes_of_nonexistent_dir_uses_ancestor) {
   TempDir td;
-  sl::IFileSystem& fs = sl::real_fs();
+  spool::IFileSystem& fs = spool::real_fs();
   auto existing = fs.free_bytes(td.path);
   auto missing = fs.free_bytes(td.path + L"\\nonexistent\\deeper");
   auto trailing = fs.free_bytes(td.path + L"\\nonexistent\\deeper\\");
@@ -514,7 +514,7 @@ TEST(win_free_bytes_of_nonexistent_dir_uses_ancestor) {
 
 TEST(win_size_is_tracked_without_syscalls) {
   TempDir td;
-  sl::IFileSystem& fs = sl::real_fs();
+  spool::IFileSystem& fs = spool::real_fs();
   std::wstring err;
   const std::wstring p = td.path + L"\\a.bin";
   auto f = fs.create_new(p, &err);

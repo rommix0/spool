@@ -102,11 +102,11 @@ BEGIN
   BEGIN
     BLOCK "040904B0"
     BEGIN
-      VALUE "FileDescription", "Sound logger"
+      VALUE "FileDescription", "Spool"
       VALUE "FileVersion", "1.0.0.0"
-      VALUE "InternalName", "sound_logger"
-      VALUE "OriginalFilename", "sound_logger.exe"
-      VALUE "ProductName", "Sound logger"
+      VALUE "InternalName", "spool"
+      VALUE "OriginalFilename", "spool.exe"
+      VALUE "ProductName", "Spool"
       VALUE "ProductVersion", "1.0.0.0"
     END
   END

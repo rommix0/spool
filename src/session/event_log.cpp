@@ -5,7 +5,7 @@
 #include "core/clock.h"
 #include "session/manifest.h"  // utf8_from_wide
 
-namespace sl {
+namespace spool {
 
 namespace {
 std::unique_ptr<IFile> open_log(IFileSystem& fs, const std::wstring& path) {
@@ -61,4 +61,4 @@ std::vector<LogEntry> EventLog::recent(size_t max) const {
   return out;
 }
 
-}  // namespace sl
+}  // namespace spool

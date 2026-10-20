@@ -17,13 +17,13 @@
 namespace dest_test {
 
 // Writes ramp frames [from, from + frames) into the ring.
-inline void feed(sl::SampleRing& ring, sl::SampleIndex from, size_t frames) {
+inline void feed(spool::SampleRing& ring, spool::SampleIndex from, size_t frames) {
   const uint32_t ch = ring.channels();
   std::vector<float> buf(4096 * ch);
   for (size_t done = 0; done < frames;) {
     const size_t n = std::min<size_t>(4096, frames - done);
     for (size_t i = 0; i < n; ++i)
-      for (uint32_t c = 0; c < ch; ++c) buf[i * ch + c] = sl::ramp_value(from + sl::SampleIndex(done + i), c);
+      for (uint32_t c = 0; c < ch; ++c) buf[i * ch + c] = spool::ramp_value(from + spool::SampleIndex(done + i), c);
     ring.write(buf.data(), n);
     done += n;
   }
@@ -40,25 +40,25 @@ bool poll(Pred p) {
   return true;
 }
 
-inline bool wait_progress(const sl::Destination& d, sl::SampleIndex target) {
+inline bool wait_progress(const spool::Destination& d, spool::SampleIndex target) {
   return poll([&] { return d.progress() >= target; });
 }
 
-inline std::optional<sl::WavInfo> wav_info(sl::FaultFileSystem& fs, const std::wstring& path) {
+inline std::optional<spool::WavInfo> wav_info(spool::FaultFileSystem& fs, const std::wstring& path) {
   std::wstring err;
   auto f = fs.open_existing(path, &err);
   if (!f) return std::nullopt;
-  auto info = sl::read_wav_info(*f);
+  auto info = spool::read_wav_info(*f);
   f->close();
   return info;
 }
 
 // The frames the header claims (32-bit float files only).
-inline std::vector<float> wav_samples(sl::FaultFileSystem& fs, const std::wstring& path) {
+inline std::vector<float> wav_samples(spool::FaultFileSystem& fs, const std::wstring& path) {
   std::wstring err;
   auto f = fs.open_existing(path, &err);
   if (!f) return {};
-  auto info = sl::read_wav_info(*f);
+  auto info = spool::read_wav_info(*f);
   std::vector<float> out;
   if (info && info->bits == 32) {
     out.resize(size_t(info->frames) * info->channels);
@@ -69,19 +69,19 @@ inline std::vector<float> wav_samples(sl::FaultFileSystem& fs, const std::wstrin
 }
 
 // Mono: number of samples that differ from the ramp starting at `first`.
-inline size_t ramp_errors(const std::vector<float>& v, sl::SampleIndex first) {
+inline size_t ramp_errors(const std::vector<float>& v, spool::SampleIndex first) {
   size_t bad = 0;
-  for (size_t i = 0; i < v.size(); ++i) bad += (v[i] != sl::ramp_value(first + sl::SampleIndex(i), 0));
+  for (size_t i = 0; i < v.size(); ++i) bad += (v[i] != spool::ramp_value(first + spool::SampleIndex(i), 0));
   return bad;
 }
 
-inline int64_t num(sl::ManifestRecord& r, const char* key) {
+inline int64_t num(spool::ManifestRecord& r, const char* key) {
   const auto it = r.find(key);
   return it == r.end() ? -1 : std::stoll(it->second);
 }
 
-inline std::vector<sl::ManifestRecord> events(const std::vector<sl::ManifestRecord>& recs, const std::string& ev) {
-  std::vector<sl::ManifestRecord> out;
+inline std::vector<spool::ManifestRecord> events(const std::vector<spool::ManifestRecord>& recs, const std::string& ev) {
+  std::vector<spool::ManifestRecord> out;
   for (const auto& r : recs)
     if (r.count("ev") && r.at("ev") == ev) out.push_back(r);
   return out;

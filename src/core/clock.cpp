@@ -4,7 +4,7 @@
 
 #include <cstdio>
 
-namespace sl {
+namespace spool {
 namespace {
 
 int64_t floor_div(int64_t a, int64_t b) {
@@ -112,4 +112,4 @@ std::string iso_utc(WallTime t) {
   return buf;
 }
 
-}  // namespace sl
+}  // namespace spool

@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace sl {
+namespace spool {
 
 void int16_to_float(const int16_t* in, float* out, size_t n);
 void int24_packed_to_float(const uint8_t* in, float* out, size_t n);  // 3-byte little-endian
@@ -34,4 +34,4 @@ void float_to_int24_packed(const float* in, uint8_t* out, size_t n);
 void extract_channels(const float* in, uint32_t in_ch, const uint16_t* map, uint32_t out_ch,
                       float* out, size_t frames);
 
-}  // namespace sl
+}  // namespace spool

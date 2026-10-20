@@ -12,7 +12,7 @@
 #include "io/fault_file_system.h"
 #include "test.h"
 
-using namespace sl;
+using namespace spool;
 
 namespace {
 
@@ -74,7 +74,7 @@ TEST(wav_16bit_stereo_basic) {
   CHECK_EQ(info->sample_rate, 48000u);
   CHECK_EQ(info->frames, 48000u);
   CHECK_EQ(info->data_bytes, 192000u);
-  CHECK_EQ(info->bext.originator, std::string("SoundLogger"));
+  CHECK_EQ(info->bext.originator, std::string("Spool"));
   CHECK_EQ(info->bext.description, std::string("unit test"));
   CHECK_EQ(info->bext.date, std::string("2026-10-16"));
   CHECK_EQ(info->bext.time, std::string("12:34:56"));

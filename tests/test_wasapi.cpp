@@ -7,13 +7,13 @@
 #include "audio/wasapi_source.h"
 #include "test.h"
 
-using sl::CaptureConfig;
-using sl::CaptureMode;
-using sl::WasapiSource;
+using spool::CaptureConfig;
+using spool::CaptureMode;
+using spool::WasapiSource;
 
 namespace {
 
-struct Counter : sl::CaptureCallbacks {
+struct Counter : spool::CaptureCallbacks {
   std::atomic<uint64_t> frames{0};
   std::atomic<int> lost{0}, returned{0}, disc{0};
   std::atomic<bool> bad{false};
@@ -25,7 +25,7 @@ struct Counter : sl::CaptureCallbacks {
     if (discontinuity) ++disc;
   }
   void on_device_lost() override { ++lost; }
-  void on_device_returned(sl::StreamFormat) override { ++returned; }
+  void on_device_returned(spool::StreamFormat) override { ++returned; }
 };
 
 void sleep_ms(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
@@ -33,7 +33,7 @@ void sleep_ms(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms
 }  // namespace
 
 TEST(wasapi_list_devices_does_not_throw) {
-  auto d = sl::list_capture_devices();
+  auto d = spool::list_capture_devices();
   CHECK(d.size() < 64);
   for (const auto& i : d) CHECK(!i.id.empty());
 }
@@ -41,12 +41,12 @@ TEST(wasapi_list_devices_does_not_throw) {
 // A running stream that delivers no packet for 5 s (silent without an error) counts as
 // device loss: the worker closes it, reports the loss and reopens it.
 TEST(wasapi_capture_silence_timeout) {
-  CHECK_EQ(sl::kCaptureSilenceTimeoutMs, uint64_t(5000));
-  CHECK(!sl::capture_timed_out(1000, 1000));
-  CHECK(!sl::capture_timed_out(1000, 5999));
-  CHECK(sl::capture_timed_out(1000, 6000));
-  CHECK(sl::capture_timed_out(1000, 60000));
-  CHECK(!sl::capture_timed_out(1000, 500));  // never on a clock that reads earlier
+  CHECK_EQ(spool::kCaptureSilenceTimeoutMs, uint64_t(5000));
+  CHECK(!spool::capture_timed_out(1000, 1000));
+  CHECK(!spool::capture_timed_out(1000, 5999));
+  CHECK(spool::capture_timed_out(1000, 6000));
+  CHECK(spool::capture_timed_out(1000, 60000));
+  CHECK(!spool::capture_timed_out(1000, 500));  // never on a clock that reads earlier
 }
 
 TEST(wasapi_open_unknown_device_fails_cleanly) {
@@ -59,14 +59,14 @@ TEST(wasapi_open_unknown_device_fails_cleanly) {
   Counter cb;
   CHECK(!src.start(&cb));
   src.stop();
-  CHECK(sl::exclusive_rates(cfg.device_id).empty());
+  CHECK(spool::exclusive_rates(cfg.device_id).empty());
 }
 
 namespace {
 
 // Captures `ms` of audio from an already opened source and checks the frame count.
 void check_capture(WasapiSource& src, int ms) {
-  const sl::StreamFormat f = src.format();
+  const spool::StreamFormat f = src.format();
   Counter cb;
   cb.channels = f.channels;
   CHECK(src.start(&cb));
@@ -97,28 +97,28 @@ void check_capture(WasapiSource& src, int ms) {
 }  // namespace
 
 TEST(wasapi_raw_capture_one_second) {
-  const std::wstring def = sl::default_capture_device_id();
+  const std::wstring def = spool::default_capture_device_id();
   if (def.empty()) SKIP("no capture device");
   WasapiSource src;
   CaptureConfig cfg;  // default device, raw
   std::wstring err;
   if (!src.open(cfg, &err)) SKIP("default capture device cannot be opened");
-  const sl::StreamFormat f = src.format();
+  const spool::StreamFormat f = src.format();
   CHECK(f.sample_rate >= 8000);
   CHECK(f.channels >= 1 && f.channels <= 8);
   // The source is bound to the endpoint that was default at open() (not to "whatever is default").
   CHECK(src.device_id() == def);
   CHECK(!src.exclusive());
   std::printf("  raw active: %s\n", src.raw_active() ? "yes" : "no (endpoint reports no raw support)");
-  for (const auto& d : sl::list_capture_devices())
+  for (const auto& d : spool::list_capture_devices())
     if (d.id == def && d.mix_format.channels != 0) CHECK_EQ(f.channels, d.mix_format.channels);
   check_capture(src, 1000);
 }
 
 TEST(wasapi_exclusive_capture_one_second) {
-  const std::wstring def = sl::default_capture_device_id();
+  const std::wstring def = spool::default_capture_device_id();
   if (def.empty()) SKIP("no capture device");
-  const auto rates = sl::exclusive_rates(def);
+  const auto rates = spool::exclusive_rates(def);
   if (rates.empty()) SKIP("exclusive mode not available");
   WasapiSource src;
   CaptureConfig cfg;
@@ -140,7 +140,7 @@ TEST(wasapi_failed_open_clears_state) {
   CaptureConfig cfg;
   cfg.device_id = L"{0.0.1.00000000}.{00000000-0000-0000-0000-000000000000}";
   CHECK(!src.open(cfg, &err));
-  CHECK(src.format() == sl::StreamFormat{});
+  CHECK(src.format() == spool::StreamFormat{});
   CHECK(!src.raw_active());
   CHECK(!src.exclusive());
   CHECK(src.device_id().empty());

@@ -6,7 +6,7 @@
 
 #include "core/sample_ring.h"
 
-namespace sl {
+namespace spool {
 
 namespace {
 constexpr size_t kMiB = size_t(1) << 20;
@@ -104,4 +104,4 @@ bool auto_start_after(LaunchRecovery r, bool start_on_launch) {
          (r == LaunchRecovery::EndedCleanly || r == LaunchRecovery::Failed || r == LaunchRecovery::GaveUp);
 }
 
-}  // namespace sl
+}  // namespace spool

@@ -6,7 +6,7 @@
 
 #include "core/types.h"
 
-namespace sl {
+namespace spool {
 
 class IClock {
  public:
@@ -44,4 +44,4 @@ struct LocalParts {
 // Local civil time from utc_ms + local_offset_min, pure arithmetic (no OS calls).
 LocalParts local_parts(WallTime t);
 
-}  // namespace sl
+}  // namespace spool

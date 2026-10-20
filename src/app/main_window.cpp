@@ -13,11 +13,11 @@
 #include "audio/wasapi_source.h"
 #include "core/clock.h"
 
-namespace sl {
+namespace spool {
 
 namespace {
 
-constexpr wchar_t kTitle[] = L"Sound logger";
+constexpr wchar_t kTitle[] = L"Spool";
 constexpr wchar_t kCantStart[] = L"Can't start recording";
 constexpr wchar_t kAppLog[] = L"app";  // app.log: events outside a session
 constexpr UINT kLaunchMsg = WM_APP + 1;
@@ -841,4 +841,4 @@ void MainWindow::layout() {
   ListView_SetColumnWidth(events_, 2, std::max(px(120), event_w));
 }
 
-}  // namespace sl
+}  // namespace spool

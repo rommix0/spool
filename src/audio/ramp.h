@@ -4,8 +4,8 @@
 
 #include "core/types.h"
 
-namespace sl {
+namespace spool {
 inline float ramp_value(SampleIndex frame, uint32_t ch) {
   return float(((uint64_t(frame) * 8u) + ch) & 0xFFFFFu) / 1048576.0f;
 }
-}  // namespace sl
+}  // namespace spool

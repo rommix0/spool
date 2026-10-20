@@ -1,4 +1,4 @@
-// Sound logger: the dashboard app.
+// Spool: the dashboard app.
 // Command line:
 //   --synthetic        record a 48 kHz stereo sine from SyntheticSource instead of a WASAPI
 //                      device, so the UI runs without audio hardware.
@@ -37,7 +37,7 @@
 
 namespace {
 
-constexpr wchar_t kMutexName[] = L"Local\\SoundLogger.SingleInstance";
+constexpr wchar_t kMutexName[] = L"Local\\Spool.SingleInstance";
 
 constexpr DWORD kRecoverWaitMs = 60000;  // for the crashed instance to let go of the mutex
 
@@ -78,7 +78,7 @@ Args parse_args() {
 
 // A second launch: show the running instance's window and leave.
 void activate_running_instance() {
-  HWND h = FindWindowW(sl::MainWindow::kClassName, nullptr);
+  HWND h = FindWindowW(spool::MainWindow::kClassName, nullptr);
   if (!h) return;
   if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
   SetForegroundWindow(h);
@@ -87,11 +87,11 @@ void activate_running_instance() {
 #ifdef _DEBUG
 // --synthetic-unavailable-for: a source that can't be opened (and has no format) until the
 // deadline, like an interface that is not back yet.
-class LateSource : public sl::ICaptureSource {
+class LateSource : public spool::ICaptureSource {
  public:
-  LateSource(std::unique_ptr<sl::ICaptureSource> inner, unsigned seconds)
+  LateSource(std::unique_ptr<spool::ICaptureSource> inner, unsigned seconds)
       : inner_(std::move(inner)), until_(GetTickCount64() + uint64_t(seconds) * 1000) {}
-  bool open(const sl::CaptureConfig& c, std::wstring* err) override {
+  bool open(const spool::CaptureConfig& c, std::wstring* err) override {
     if (GetTickCount64() < until_) {
       if (err) *err = L"The synthetic input is unavailable (test).";
       return false;
@@ -99,12 +99,12 @@ class LateSource : public sl::ICaptureSource {
     open_ = true;
     return inner_->open(c, err);
   }
-  sl::StreamFormat format() const override { return open_ ? inner_->format() : sl::StreamFormat{}; }
-  bool start(sl::CaptureCallbacks* cb) override { return open_ && inner_->start(cb); }
+  spool::StreamFormat format() const override { return open_ ? inner_->format() : spool::StreamFormat{}; }
+  bool start(spool::CaptureCallbacks* cb) override { return open_ && inner_->start(cb); }
   void stop() override { inner_->stop(); }
 
  private:
-  std::unique_ptr<sl::ICaptureSource> inner_;
+  std::unique_ptr<spool::ICaptureSource> inner_;
   uint64_t until_;
   bool open_ = false;
 };
@@ -120,7 +120,7 @@ class LateSource : public sl::ICaptureSource {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
-  using namespace sl;
+  using namespace spool;
   const Args args = parse_args();
   IFileSystem& fs = real_fs();
   std::wstring err;

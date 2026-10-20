@@ -3,7 +3,7 @@
 #include <shobjidl.h>
 #include <wrl/client.h>
 
-namespace sl {
+namespace spool {
 
 std::wstring pick_folder(HWND owner) {
   Microsoft::WRL::ComPtr<IFileOpenDialog> dlg;
@@ -22,4 +22,4 @@ std::wstring pick_folder(HWND owner) {
   return out;
 }
 
-}  // namespace sl
+}  // namespace spool

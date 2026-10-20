@@ -5,7 +5,7 @@
 
 #include "core/clock.h"
 
-namespace sl {
+namespace spool {
 
 namespace {
 // CON, PRN, AUX, NUL, COM1-COM9, LPT1-LPT9 (any case): Windows device names.
@@ -94,4 +94,4 @@ SampleIndex next_rotation_boundary(SampleIndex prev_boundary, uint32_t rate, uin
   return prev_boundary + static_cast<int64_t>(period_min) * 60 * static_cast<int64_t>(rate);
 }
 
-}  // namespace sl
+}  // namespace spool

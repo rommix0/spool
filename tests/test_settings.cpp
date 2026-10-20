@@ -9,7 +9,7 @@
 #include "app/settings.h"
 #include "test.h"
 
-using namespace sl;
+using namespace spool;
 
 namespace {
 
@@ -19,7 +19,7 @@ struct SettingsTempDir {
     static int counter = 0;
     wchar_t tmp[MAX_PATH + 1];
     const DWORD n = GetTempPathW(MAX_PATH + 1, tmp);
-    path = std::wstring(tmp, n) + L"sl_settings_" + std::to_wstring(GetCurrentProcessId()) + L"_" +
+    path = std::wstring(tmp, n) + L"spool_settings_" + std::to_wstring(GetCurrentProcessId()) + L"_" +
            std::to_wstring(++counter);
     CreateDirectoryW(path.c_str(), nullptr);
   }
@@ -62,7 +62,7 @@ AppSettings with(const DestinationConfig& d) {
 
 TEST(settings_roundtrip_unicode) {
   SettingsTempDir td;
-  const std::wstring ini = td.path + L"\\SoundLogger\\settings.ini";  // parent does not exist yet
+  const std::wstring ini = td.path + L"\\Spool\\settings.ini";  // parent does not exist yet
 
   AppSettings s;
   s.input.device_id = L"{0.0.1.00000000}.{abc-\u00FC}";
@@ -154,7 +154,7 @@ TEST(settings_defaults_when_missing) {
   CHECK_EQ(s.dests[0].folders.size(), size_t(1));
   if (s.dests[0].folders.size() == 1) {
     const std::wstring& f = s.dests[0].folders[0];
-    const std::wstring tail = L"\\Music\\SoundLogger";
+    const std::wstring tail = L"\\Music\\Spool";
     CHECK(f.size() > tail.size() && f.compare(f.size() - tail.size(), tail.size(), tail) == 0);
   }
   CHECK_EQ(s.ring_seconds, 30u);
@@ -230,10 +230,10 @@ TEST(settings_app_paths) {
   const auto app = get(L"APPDATA"), local = get(L"LOCALAPPDATA");
   put(L"APPDATA", L"C:\\R");
   put(L"LOCALAPPDATA", L"C:\\L");
-  CHECK(settings_path() == L"C:\\R\\SoundLogger\\settings.ini");
-  CHECK(state_path() == L"C:\\R\\SoundLogger\\state.ini");
-  CHECK(logs_dir() == L"C:\\L\\SoundLogger\\logs");
-  CHECK(log_file(L"20261016-143000") == L"C:\\L\\SoundLogger\\logs\\20261016-143000.log");
+  CHECK(settings_path() == L"C:\\R\\Spool\\settings.ini");
+  CHECK(state_path() == L"C:\\R\\Spool\\state.ini");
+  CHECK(logs_dir() == L"C:\\L\\Spool\\logs");
+  CHECK(log_file(L"20261016-143000") == L"C:\\L\\Spool\\logs\\20261016-143000.log");
   put(L"LOCALAPPDATA", std::nullopt);
   CHECK(log_file(L"app").empty());  // memory-only log
   put(L"APPDATA", app);

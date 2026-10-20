@@ -6,7 +6,7 @@
 #include <cstring>
 #include <new>
 
-namespace sl {
+namespace spool {
 
 size_t SampleRing::capacity_for(size_t min_frames) {
   size_t p = 1;
@@ -100,4 +100,4 @@ SampleRing::ReadResult SampleRing::read(SampleIndex from, float* out, size_t max
   return {n, false};
 }
 
-}  // namespace sl
+}  // namespace spool

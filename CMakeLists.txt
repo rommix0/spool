@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(SoundLogger LANGUAGES C CXX)
+project(Spool LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,34 +19,34 @@ include(cmake/deps.cmake)
 add_compile_options(/W4 /permissive- /utf-8)
 add_compile_definitions(UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 
-# ---- sl_core: everything except app window code ----
-file(GLOB_RECURSE SL_CORE_SOURCES CONFIGURE_DEPENDS
+# ---- spool_core: everything except app window code ----
+file(GLOB_RECURSE SPOOL_CORE_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_SOURCE_DIR}/src/core/*.cpp
   ${CMAKE_SOURCE_DIR}/src/io/*.cpp
   ${CMAKE_SOURCE_DIR}/src/format/*.cpp
   ${CMAKE_SOURCE_DIR}/src/session/*.cpp
   ${CMAKE_SOURCE_DIR}/src/audio/*.cpp)
-file(GLOB SL_APP_CORE_SOURCES CONFIGURE_DEPENDS
+file(GLOB SPOOL_APP_CORE_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_SOURCE_DIR}/src/app/settings.cpp
   ${CMAKE_SOURCE_DIR}/src/app/format_text.cpp
   ${CMAKE_SOURCE_DIR}/src/app/settings_model.cpp
   ${CMAKE_SOURCE_DIR}/src/app/text_util.cpp
   ${CMAKE_SOURCE_DIR}/src/app/lifecycle.cpp)
-list(APPEND SL_CORE_SOURCES ${SL_APP_CORE_SOURCES})
+list(APPEND SPOOL_CORE_SOURCES ${SPOOL_APP_CORE_SOURCES})
 
-add_library(sl_core STATIC ${SL_CORE_SOURCES} src/core/types.h)
-target_include_directories(sl_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(sl_core PUBLIC Opus::opus opusenc ole32 avrt uuid)
+add_library(spool_core STATIC ${SPOOL_CORE_SOURCES} src/core/types.h)
+target_include_directories(spool_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(spool_core PUBLIC Opus::opus opusenc ole32 avrt uuid)
 
-# ---- sl_tests ----
-file(GLOB SL_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/*.cpp)
-add_executable(sl_tests ${SL_TEST_SOURCES})
-target_link_libraries(sl_tests PRIVATE sl_core)
+# ---- spool_tests ----
+file(GLOB SPOOL_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/*.cpp)
+add_executable(spool_tests ${SPOOL_TEST_SOURCES})
+target_link_libraries(spool_tests PRIVATE spool_core)
 
-# ---- sound_logger: the dashboard app (window code only; settings, format_text, settings_model, text_util and lifecycle are in sl_core) ----
-file(GLOB SL_APP_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/app/*.cpp)
-list(REMOVE_ITEM SL_APP_SOURCES ${SL_APP_CORE_SOURCES})
-add_executable(sound_logger WIN32 ${SL_APP_SOURCES}
-  src/app/sound_logger.rc
+# ---- spool: the dashboard app (window code only; settings, format_text, settings_model, text_util and lifecycle are in spool_core) ----
+file(GLOB SPOOL_APP_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/app/*.cpp)
+list(REMOVE_ITEM SPOOL_APP_SOURCES ${SPOOL_APP_CORE_SOURCES})
+add_executable(spool WIN32 ${SPOOL_APP_SOURCES}
+  src/app/spool.rc
   src/app/app.manifest)
-target_link_libraries(sound_logger PRIVATE sl_core comctl32 ole32 avrt uuid shell32)
+target_link_libraries(spool PRIVATE spool_core comctl32 ole32 avrt uuid shell32)

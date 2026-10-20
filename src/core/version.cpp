@@ -1,4 +1,4 @@
 #include "core/version.h"
-namespace sl {
+namespace spool {
 const char* const kVersion = "0.1.0";
 }

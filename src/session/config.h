@@ -7,7 +7,7 @@
 #include "core/types.h"
 #include "format/wav_writer.h"
 
-namespace sl {
+namespace spool {
 
 enum class OutFormat { Wav, Opus };
 
@@ -40,4 +40,4 @@ inline WallTime wall_for(const SessionParams& p, SampleIndex s) {
                   p.start_wall.local_offset_min};
 }
 
-}  // namespace sl
+}  // namespace spool

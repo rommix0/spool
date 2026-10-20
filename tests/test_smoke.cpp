@@ -13,8 +13,8 @@ TEST(smoke_opus_links) {
 }
 
 TEST(types_and_version) {
-  sl::StreamFormat a{48000, 2}, b{48000, 2}, c{44100, 2};
+  spool::StreamFormat a{48000, 2}, b{48000, 2}, c{44100, 2};
   CHECK(a == b);
   CHECK(!(a == c));
-  CHECK_EQ(std::string(sl::kVersion), std::string("0.1.0"));
+  CHECK_EQ(std::string(spool::kVersion), std::string("0.1.0"));
 }

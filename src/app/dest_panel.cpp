@@ -8,11 +8,11 @@
 #include "app/format_text.h"
 #include "app/resource.h"
 
-namespace sl {
+namespace spool {
 
 namespace {
 
-constexpr wchar_t kClass[] = L"SLDestPanel";
+constexpr wchar_t kClass[] = L"SpoolDestPanel";
 
 // Layout in 96-dpi pixels.
 constexpr int kPad = 8, kBlockGap = 8, kHealthW = 72, kLeftW = 110, kLineExtra = 4;
@@ -361,4 +361,4 @@ void DestPanel::paint(HDC dc, const RECT& c) const {
   SelectObject(dc, old_font);
 }
 
-}  // namespace sl
+}  // namespace spool

@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-namespace sl {
+namespace spool {
 
 struct Marker {
   uint64_t frame_in_file;
@@ -26,4 +26,4 @@ class IEncoderFile {
   virtual void abandon() = 0;
 };
 
-}  // namespace sl
+}  // namespace spool

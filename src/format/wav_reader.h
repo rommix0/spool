@@ -8,7 +8,7 @@
 #include "format/wav_writer.h"
 #include "io/file_system.h"
 
-namespace sl {
+namespace spool {
 
 struct WavInfo {
   std::string riff_id;  // "RIFF" or "RF64"
@@ -22,4 +22,4 @@ struct WavInfo {
 // nullopt if the file is not a WAV with a fmt and data chunk.
 std::optional<WavInfo> read_wav_info(IFile&);
 
-}  // namespace sl
+}  // namespace spool

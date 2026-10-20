@@ -12,7 +12,7 @@
 #include "session/destination.h"
 #include "session/naming.h"
 
-namespace sl {
+namespace spool {
 
 namespace {
 
@@ -41,7 +41,7 @@ bool folder_healthy(IFileSystem& fs, const std::wstring& dir, uint64_t low_water
   // A name of its own per probe (R12): two destinations sharing a folder, or a leftover
   // from a crash, never make each other fail.
   static std::atomic<uint64_t> counter{0};
-  const std::wstring name = L".sl_probe_" + sanitize_component(prober) + L"_" + std::to_wstring(GetCurrentProcessId()) +
+  const std::wstring name = L".spool_probe_" + sanitize_component(prober) + L"_" + std::to_wstring(GetCurrentProcessId()) +
                             L"_" + std::to_wstring(++counter) + L".tmp";
   const std::wstring probe = join(dir, name);
   std::unique_ptr<IFile> f = fs.create_new(probe, &err);
@@ -95,4 +95,4 @@ PreflightResult preflight(const std::vector<DestinationConfig>& dests, const Ses
   return r;
 }
 
-}  // namespace sl
+}  // namespace spool

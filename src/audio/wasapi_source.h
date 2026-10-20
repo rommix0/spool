@@ -11,7 +11,7 @@
 
 #include "audio/capture_source.h"
 
-namespace sl {
+namespace spool {
 
 struct DeviceInfo {
   std::wstring id, name;
@@ -65,4 +65,4 @@ class WasapiSource : public ICaptureSource {
   std::unique_ptr<WasapiImpl> p_;
 };
 
-}  // namespace sl
+}  // namespace spool

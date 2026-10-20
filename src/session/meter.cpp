@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
-namespace sl {
+namespace spool {
 namespace {
 constexpr float kFloorDb = -60.0f;
 constexpr float kClipLevel = 0.988553f;  // -0.1 dBFS
@@ -120,4 +120,4 @@ void MeterReader::reset_clips() {
   for (auto& o : out_) o.clips = 0;
 }
 
-}  // namespace sl
+}  // namespace spool

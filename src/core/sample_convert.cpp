@@ -2,7 +2,7 @@
 
 #include <cmath>
 
-namespace sl {
+namespace spool {
 
 namespace {
 constexpr float kInv16 = 1.0f / 32768.0f;
@@ -65,4 +65,4 @@ void extract_channels(const float* in, uint32_t in_ch, const uint16_t* map, uint
   }
 }
 
-}  // namespace sl
+}  // namespace spool

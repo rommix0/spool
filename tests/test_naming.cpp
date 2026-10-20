@@ -6,7 +6,7 @@
 #include "session/naming.h"
 #include "test.h"
 
-using namespace sl;
+using namespace spool;
 
 namespace {
 // Build a WallTime whose local time is the given civil time (UTC + offset).

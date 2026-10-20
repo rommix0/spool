@@ -13,7 +13,7 @@
 #include "session/recovery.h"
 #include "session/session_manager.h"
 
-namespace sl {
+namespace spool {
 
 struct WorkingSetSize {
   size_t min_bytes, max_bytes;
@@ -73,4 +73,4 @@ CaptureConfig resume_input(const CaptureConfig& settings_input, const RecordingS
 // on another device than the pinned one.
 bool resume_needs_open(const std::wstring& open_device_id, bool open, const std::wstring& pinned_id);
 
-}  // namespace sl
+}  // namespace spool

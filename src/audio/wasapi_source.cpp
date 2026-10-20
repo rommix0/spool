@@ -27,7 +27,7 @@
 
 #include "core/sample_convert.h"
 
-namespace sl {
+namespace spool {
 
 using Microsoft::WRL::ComPtr;
 
@@ -880,4 +880,4 @@ bool WasapiSource::raw_active() const { return p_->raw_active(); }
 bool WasapiSource::exclusive() const { return p_->exclusive(); }
 std::wstring WasapiSource::device_id() const { return p_->device_id(); }
 
-}  // namespace sl
+}  // namespace spool

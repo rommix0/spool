@@ -9,7 +9,7 @@
 #include "core/types.h"
 #include "io/file_system.h"
 
-namespace sl {
+namespace spool {
 
 struct DestResume {
   std::wstring name, manifest_path;  // the destination's current manifest
@@ -83,4 +83,4 @@ struct ResumeInfo {
 // files even if the wall clock went back.
 ResumeInfo make_resume(const RecordingState&, WallTime now, SampleIndex audio_end = 0);
 
-}  // namespace sl
+}  // namespace spool

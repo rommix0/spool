@@ -6,7 +6,7 @@
 
 #include "core/clock.h"
 
-namespace sl {
+namespace spool {
 
 namespace {
 
@@ -90,4 +90,4 @@ std::wstring format_clock(WallTime t) {
   return buf;
 }
 
-}  // namespace sl
+}  // namespace spool

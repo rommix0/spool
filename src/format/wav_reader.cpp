@@ -6,7 +6,7 @@
 #include <cstring>
 #include <utility>
 
-namespace sl {
+namespace spool {
 
 namespace {
 
@@ -162,4 +162,4 @@ std::optional<WavInfo> read_wav_info(IFile& f) {
   return info;
 }
 
-}  // namespace sl
+}  // namespace spool

@@ -6,7 +6,7 @@
 #include "app/text_util.h"
 #include "session/naming.h"
 
-namespace sl {
+namespace spool {
 
 namespace {
 
@@ -120,4 +120,4 @@ std::wstring raw_rate_note(uint32_t rate) {
   return std::to_wstring(rate) + L" Hz, set in Windows sound settings";
 }
 
-}  // namespace sl
+}  // namespace spool

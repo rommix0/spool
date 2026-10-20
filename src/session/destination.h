@@ -19,7 +19,7 @@
 #include "session/config.h"
 #include "session/event_log.h"
 
-namespace sl {
+namespace spool {
 
 struct CmdMarker { SampleIndex at; std::wstring name; };
 struct CmdSplit { SampleIndex at; };
@@ -123,4 +123,4 @@ uint64_t data_rate(const DestinationConfig&, uint32_t rate, size_t channels);
 // stall_percent of the ring.
 bool is_stalled(SampleIndex write_index, SampleIndex progress, size_t capacity, uint32_t stall_percent);
 
-}  // namespace sl
+}  // namespace spool

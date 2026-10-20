@@ -22,7 +22,7 @@
 #include "session/recovery.h"
 #include "session/session_manager.h"
 
-namespace sl {
+namespace spool {
 
 class WasapiSource;
 
@@ -39,7 +39,7 @@ struct AppContext {
 
 class MainWindow {
  public:
-  static constexpr wchar_t kClassName[] = L"SLMainWindow";  // a second instance finds the window by it
+  static constexpr wchar_t kClassName[] = L"SpoolMainWindow";  // a second instance finds the window by it
 
   explicit MainWindow(AppContext);
   ~MainWindow();
@@ -140,4 +140,4 @@ class MainWindow {
   size_t meter_rows_ = 0;
 };
 
-}  // namespace sl
+}  // namespace spool

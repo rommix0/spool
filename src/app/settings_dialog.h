@@ -12,7 +12,7 @@
 #include "app/settings.h"
 #include "audio/wasapi_source.h"
 
-namespace sl {
+namespace spool {
 
 struct SettingsChoices {
   std::vector<DeviceInfo> devices;  // the input devices offered
@@ -25,4 +25,4 @@ struct SettingsChoices {
 // device, written to ini and stored in s, and the result is true. On Cancel s is unchanged.
 bool run_settings_dialog(HWND owner, HINSTANCE, const SettingsChoices&, const std::wstring& ini, AppSettings& s);
 
-}  // namespace sl
+}  // namespace spool

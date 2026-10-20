@@ -11,7 +11,7 @@
 #include "format/encoder.h"
 #include "io/file_system.h"
 
-namespace sl {
+namespace spool {
 
 struct OpusParams {
   uint32_t input_rate;
@@ -23,4 +23,4 @@ struct OpusParams {
 std::unique_ptr<IEncoderFile> open_opus(IFileSystem&, const std::wstring& path, const OpusParams&,
                                         std::wstring* err);
 
-}  // namespace sl
+}  // namespace spool

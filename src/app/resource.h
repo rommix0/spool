@@ -1,5 +1,5 @@
 #pragma once
-// Resource and command ids shared by sound_logger.rc and the window code.
+// Resource and command ids shared by spool.rc and the window code.
 
 #define IDR_ACCEL 101
 

@@ -10,7 +10,7 @@
 #pragma warning(push)
 #pragma warning(disable : 4324)  // padding from alignas is intentional
 
-namespace sl {
+namespace spool {
 
 class SampleRing {
  public:
@@ -64,5 +64,5 @@ class SampleRing {
   inline static std::atomic<int> live_{0};
 };
 
-}  // namespace sl
+}  // namespace spool
 #pragma warning(pop)

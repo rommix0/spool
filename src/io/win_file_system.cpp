@@ -10,7 +10,7 @@
 
 #include "io/file_system.h"
 
-namespace sl {
+namespace spool {
 namespace {
 
 // Paths this long or longer get the \\?\ prefix. Below MAX_PATH (260) for files
@@ -265,4 +265,4 @@ IFileSystem& real_fs() {
   return *fs;
 }
 
-}  // namespace sl
+}  // namespace spool

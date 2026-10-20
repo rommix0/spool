@@ -6,7 +6,7 @@
 #include <new>
 #include <system_error>
 
-namespace sl {
+namespace spool {
 
 namespace {
 
@@ -73,7 +73,7 @@ PreflightResult SessionManager::preflight(const SessionConfig& cfg) {
   const StreamFormat f = src_.format();
   if (f.sample_rate) p.rate = f.sample_rate;
   if (f.channels) p.input_channels = f.channels;
-  return sl::preflight(cfg.dests, p, fs_);
+  return spool::preflight(cfg.dests, p, fs_);
 }
 
 void SessionManager::set_state_store(StateStore* store) { store_ = store; }
@@ -641,4 +641,4 @@ void SessionManager::fill_to(Session& s, uint64_t steady_ms) {
                              L" min: files closed until it returns");
 }
 
-}  // namespace sl
+}  // namespace spool

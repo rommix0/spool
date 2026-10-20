@@ -8,7 +8,7 @@
 #pragma warning(push)
 #pragma warning(disable : 4324)  // padding from alignas is intentional
 
-namespace sl {
+namespace spool {
 
 template <class T, size_t N>
 class SpscQueue {
@@ -39,5 +39,5 @@ class SpscQueue {
   std::array<T, N> items_{};
 };
 
-}  // namespace sl
+}  // namespace spool
 #pragma warning(pop)

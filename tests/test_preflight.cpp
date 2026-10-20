@@ -8,7 +8,7 @@
 #include "session/preflight.h"
 #include "test.h"
 
-using namespace sl;
+using namespace spool;
 using Kind = FaultFileSystem::Kind;
 
 namespace {
@@ -143,8 +143,8 @@ TEST(preflight_probe_names_are_unique) {
   CHECK(folder_healthy(fs, L"D:\\shared", 0, L"main"));
   CHECK_EQ(fs.created.size(), size_t(3));
   if (fs.created.size() != 3) return;
-  CHECK(fs.created[0].rfind(L"D:\\shared\\.sl_probe_main_", 0) == 0);
-  CHECK(fs.created[1].rfind(L"D:\\shared\\.sl_probe_copy_ 2_", 0) == 0);  // sanitized
+  CHECK(fs.created[0].rfind(L"D:\\shared\\.spool_probe_main_", 0) == 0);
+  CHECK(fs.created[1].rfind(L"D:\\shared\\.spool_probe_copy_ 2_", 0) == 0);  // sanitized
   CHECK(fs.created[0] != fs.created[2]);
   for (const auto& p : fs.created) CHECK(p.size() > 4 && p.compare(p.size() - 4, 4, L".tmp") == 0);
 

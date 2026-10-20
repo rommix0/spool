@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace sl {
+namespace spool {
 
 class IFile {
  public:
@@ -45,4 +45,4 @@ class IFileSystem {
 // (hung) writers that may still be running while the process exits.
 IFileSystem& real_fs();
 
-}  // namespace sl
+}  // namespace spool

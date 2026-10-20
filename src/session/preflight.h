@@ -7,7 +7,7 @@
 #include "io/file_system.h"
 #include "session/config.h"
 
-namespace sl {
+namespace spool {
 
 struct PreflightResult {
   bool can_start;  // false only if no destination has a usable folder (see preflight)
@@ -22,7 +22,7 @@ struct PreflightResult {
 PreflightResult preflight(const std::vector<DestinationConfig>&, const SessionParams&, IFileSystem&);
 
 // ensure_dir + create, write, flush and remove a probe file + free space >= low_water_bytes.
-// The probe is ".sl_probe_<sanitized prober>_<pid>_<counter>.tmp", unique per call, so
+// The probe is ".spool_probe_<sanitized prober>_<pid>_<counter>.tmp", unique per call, so
 // concurrent probers of one folder never collide. A probe that cannot be removed does not
 // make the folder unhealthy.
 bool folder_healthy(IFileSystem&, const std::wstring& dir, uint64_t low_water_bytes,
@@ -31,4 +31,4 @@ bool folder_healthy(IFileSystem&, const std::wstring& dir, uint64_t low_water_by
 // max(low_water_minutes of audio at data_rate, low_water_min_bytes).
 uint64_t low_water_bytes(const SessionParams&, uint64_t data_rate);
 
-}  // namespace sl
+}  // namespace spool

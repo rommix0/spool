@@ -6,11 +6,11 @@
 #include <cmath>
 #include <string>
 
-namespace sl {
+namespace spool {
 
 namespace {
 
-constexpr wchar_t kClass[] = L"SLMeter";
+constexpr wchar_t kClass[] = L"SpoolMeter";
 constexpr float kFloorDb = -60.0f;
 constexpr float kClipDb = -0.1f;  // spec 10.2
 
@@ -227,4 +227,4 @@ void MeterControl::paint(HDC dc, const RECT& c) const {
   SelectObject(dc, old_font);
 }
 
-}  // namespace sl
+}  // namespace spool

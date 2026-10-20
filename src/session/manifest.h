@@ -13,7 +13,7 @@
 #include "core/types.h"
 #include "io/file_system.h"
 
-namespace sl {
+namespace spool {
 
 // UTF-16 -> UTF-8 (lone surrogates become U+FFFD).
 std::string utf8_from_wide(std::wstring_view w);
@@ -64,4 +64,4 @@ using ManifestRecord = std::map<std::string, std::string>;  // values unescaped;
 // Missing file -> empty.
 std::vector<ManifestRecord> read_manifest(IFileSystem&, const std::wstring& path);
 
-}  // namespace sl
+}  // namespace spool

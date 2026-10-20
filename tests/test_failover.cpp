@@ -16,7 +16,7 @@
 #include "session/manifest.h"
 #include "test.h"
 
-using namespace sl;
+using namespace spool;
 using namespace dest_test;
 using Kind = FaultFileSystem::Kind;
 

@@ -7,7 +7,7 @@
 
 #include "core/sample_convert.h"
 
-namespace sl {
+namespace spool {
 
 namespace {
 
@@ -316,4 +316,4 @@ std::unique_ptr<IEncoderFile> open_wav(IFileSystem& fs, const std::wstring& path
   return w;
 }
 
-}  // namespace sl
+}  // namespace spool

@@ -4,9 +4,9 @@
 
 #include <string>
 
-namespace sl {
+namespace spool {
 
 // The folder the user picked, or empty if cancelled or failed. Needs COM on the calling thread.
 std::wstring pick_folder(HWND owner);
 
-}  // namespace sl
+}  // namespace spool

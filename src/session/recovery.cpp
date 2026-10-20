@@ -14,7 +14,7 @@
 #include "io/ini_file.h"
 #include "session/manifest.h"
 
-namespace sl {
+namespace spool {
 
 namespace {
 
@@ -335,4 +335,4 @@ ResumeInfo make_resume(const RecordingState& st, WallTime now, SampleIndex audio
   return ResumeInfo{st, std::max(st.last_sample + down_ms * int64_t(st.rate) / 1000, audio_end)};
 }
 
-}  // namespace sl
+}  // namespace spool

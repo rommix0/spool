@@ -1,6 +1,8 @@
-# Sound Logger: Design
+# Spool: Design
 
 Date: 2026-10-16
+
+The program was called "Sound Logger" when this spec was written and was renamed Spool on 2026-10-20.
 Status: draft for review
 Builds on: `HANDOFF.md` (core ring/sink architecture). Where this document and the handoff disagree, this document wins. Note: the handoff's "switch output while recording" becomes, in v1, failover, rotation, and appending folders to a chain (§10.5). Destinations themselves are fixed once recording starts.
 
@@ -177,7 +179,7 @@ If a destination can't keep up and has nowhere to go, its cursor is moved forwar
 
 - **Per-destination manifest**: a JSON Lines file (`<session>_<dest>.jsonl`), one event per line, appended and flushed at each confirmation point. Stored in the folder the destination is currently writing to. After failover, a new manifest continues in the new folder, and its first line names the previous manifest's path.
 - Event types (my call): `session_start`, `file_open`, `file_close` (with sample range and byte length), `marker`, `gap_start`, `gap_end`, `failover`, `rotation`, `clock_pair`, `warning`, `session_end`. Every event has `sample`, `utc`, and `local_offset`.
-- **App event log**: a human-readable text log of all destinations' events plus app-level events, in `%LOCALAPPDATA%\SoundLogger\logs\`, one file per session. This is what the UI event list shows.
+- **App event log**: a human-readable text log of all destinations' events plus app-level events, in `%LOCALAPPDATA%\Spool\logs\`, one file per session. This is what the UI event list shows.
 
 ## 10. UI
 
@@ -205,7 +207,7 @@ Layout: **Option A, the dashboard** (decided). One main window:
 - Input: device, mode (raw shared / exclusive), sample rate (exclusive mode only), ring length.
 - Destinations: add, edit, and remove destinations. Each has format, bit depth (WAV) or bitrate (Opus), channel map, folder chain (add, remove, reorder), rotation period, and name template.
 - General: session name, flush interval, low-water mark, start-on-launch, marker hotkey.
-- Settings are stored in an INI file in `%APPDATA%\SoundLogger\` (my call; Win32 has `GetPrivateProfileString` and needs no JSON library).
+- Settings are stored in an INI file in `%APPDATA%\Spool\` (my call; Win32 has `GetPrivateProfileString` and needs no JSON library).
 - **While recording** (decided): the set of destinations is fixed once recording starts. The only live edits are **appending a folder to an existing destination's chain** (for example, a fresh USB drive) and renaming markers. A newly added folder gets a preflight (§8.3) before it joins the chain. If the destination is in `LastResort`, it switches to the new folder immediately (§4.3). Otherwise the folder waits as the last standby. Folders can't be removed or reordered while recording.
 
 ### 10.6 Keyboard

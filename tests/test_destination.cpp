@@ -17,7 +17,7 @@
 #include "dest_helpers.h"
 #include "test.h"
 
-using namespace sl;
+using namespace spool;
 using namespace dest_test;
 
 namespace {

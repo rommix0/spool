@@ -2,7 +2,7 @@
 
 #include <windows.h>
 
-namespace sl {
+namespace spool {
 
 std::wstring trim(const std::wstring& s) {
   const size_t a = s.find_first_not_of(L" \t");
@@ -20,4 +20,4 @@ std::wstring join_lines(const std::vector<std::wstring>& lines) {
   return out;
 }
 
-}  // namespace sl
+}  // namespace spool

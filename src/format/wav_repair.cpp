@@ -7,7 +7,7 @@
 #include "format/wav_reader.h"
 #include "format/wav_writer.h"
 
-namespace sl {
+namespace spool {
 
 namespace {
 
@@ -101,4 +101,4 @@ std::optional<uint64_t> repair_wav(IFileSystem& fs, const std::wstring& path, st
   return frames;
 }
 
-}  // namespace sl
+}  // namespace spool

@@ -13,12 +13,12 @@
 #include "app/text_util.h"
 #include "core/clock.h"
 
-namespace sl {
+namespace spool {
 
 namespace {
 
 constexpr wchar_t kCheckTitle[] = L"Check these settings";
-constexpr wchar_t kAppTitle[] = L"Sound logger";
+constexpr wchar_t kAppTitle[] = L"Spool";
 constexpr uint16_t kUnknownDeviceChannels = 8;  // spec limit; Record checks the real device
 
 // ---- small control helpers ----
@@ -555,4 +555,4 @@ bool run_settings_dialog(HWND owner, HINSTANCE inst, const SettingsChoices& choi
   return true;
 }
 
-}  // namespace sl
+}  // namespace spool

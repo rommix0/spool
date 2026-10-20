@@ -15,7 +15,7 @@
 #include "core/types.h"
 #include "session/destination.h"
 
-namespace sl {
+namespace spool {
 
 class DestPanel {
  public:
@@ -81,4 +81,4 @@ class DestPanel {
   SIZE mem_size_{};
 };
 
-}  // namespace sl
+}  // namespace spool

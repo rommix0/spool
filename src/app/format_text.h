@@ -8,7 +8,7 @@
 #include "core/types.h"
 #include "session/config.h"
 
-namespace sl {
+namespace spool {
 
 std::wstring format_elapsed(double seconds);    // "02:14:37"
 std::wstring format_time_left(double hours);    // "31 h left", "45 min left" (< 1 h)
@@ -25,4 +25,4 @@ std::wstring format_folder_time_left(std::optional<uint64_t> free_bytes, uint64_
 // Local time of day, "14:30:05".
 std::wstring format_clock(WallTime t);
 
-}  // namespace sl
+}  // namespace spool

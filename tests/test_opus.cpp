@@ -14,7 +14,7 @@
 #include "io/file_system.h"
 #include "test.h"
 
-using namespace sl;
+using namespace spool;
 
 namespace {
 
@@ -99,7 +99,7 @@ TEST(opus_valid_stream_and_size) {
   const auto b = fs.contents(kPath);
   CHECK(b.size() >= 4 && std::memcmp(b.data(), "OggS", 4) == 0);
   CHECK(contains(b, "OpusHead"));
-  CHECK(contains(b, "ENCODER=SoundLogger"));
+  CHECK(contains(b, "ENCODER=Spool"));
   CHECK(b.size() >= 120 * 1000);
   CHECK(b.size() <= 200 * 1000);
   CHECK(scan(b).ok);

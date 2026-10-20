@@ -7,7 +7,7 @@
 
 #include "core/types.h"
 
-namespace sl {
+namespace spool {
 
 enum class CaptureMode { Raw, Exclusive };
 
@@ -38,4 +38,4 @@ class ICaptureSource {
   virtual void stop() = 0;
 };
 
-}  // namespace sl
+}  // namespace spool

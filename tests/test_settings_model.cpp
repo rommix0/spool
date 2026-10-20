@@ -6,7 +6,7 @@
 #include "app/text_util.h"
 #include "test.h"
 
-using namespace sl;
+using namespace spool;
 
 namespace {
 // 2026-10-16 14:30:05 local, UTC+2.

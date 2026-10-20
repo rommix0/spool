@@ -6,7 +6,7 @@
 #include <atomic>
 #include <cstring>
 
-namespace sl {
+namespace spool {
 
 namespace {
 
@@ -153,7 +153,7 @@ std::unique_ptr<IEncoderFile> open_opus(IFileSystem& fs, const std::wstring& pat
 
   OggOpusComments* comments = ope_comments_create();
   if (!comments) return drop_file(L"out of memory");
-  ope_comments_add(comments, "ENCODER", "SoundLogger");
+  ope_comments_add(comments, "ENCODER", "Spool");
   int e = OPE_OK;
   s->enc = ope_encoder_create_callbacks(&kCallbacks, s.get(), comments, opus_int32(p.input_rate),
                                         p.channels, kFamily, &e);
@@ -174,4 +174,4 @@ std::unique_ptr<IEncoderFile> open_opus(IFileSystem& fs, const std::wstring& pat
   return std::make_unique<OpusFile>(std::move(s), p.input_rate, p.channels);
 }
 
-}  // namespace sl
+}  // namespace spool

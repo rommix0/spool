@@ -6,7 +6,7 @@
 
 #include "core/clock.h"
 
-namespace sl {
+namespace spool {
 
 std::string utf8_from_wide(std::wstring_view w) {
   if (w.empty()) return {};
@@ -281,4 +281,4 @@ std::vector<ManifestRecord> read_manifest(IFileSystem& fs, const std::wstring& p
   return out;
 }
 
-}  // namespace sl
+}  // namespace spool

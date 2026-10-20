@@ -6,7 +6,7 @@
 
 #include "audio/ramp.h"
 
-namespace sl {
+namespace spool {
 
 namespace {
 constexpr size_t kBlockFrames = 4096;  // pump() delivers in blocks of at most this
@@ -126,4 +126,4 @@ void SyntheticSource::simulate_return(StreamFormat fmt) {
   if (cb) cb->on_device_returned(fmt);
 }
 
-}  // namespace sl
+}  // namespace spool

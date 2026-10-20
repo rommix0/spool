@@ -14,7 +14,7 @@
 #include "session/session_manager.h"
 #include "test.h"
 
-using namespace sl;
+using namespace spool;
 using namespace dest_test;
 using Kind = FaultFileSystem::Kind;
 

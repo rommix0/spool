@@ -7,9 +7,9 @@
 #include "core/spsc_queue.h"
 #include "test.h"
 
-using sl::SampleIndex;
-using sl::SampleRing;
-using sl::SpscQueue;
+using spool::SampleIndex;
+using spool::SampleRing;
+using spool::SpscQueue;
 
 namespace {
 // Writes ramp frames [from, from + n) into the ring.
@@ -17,7 +17,7 @@ void write_ramp(SampleRing& r, SampleIndex from, size_t n) {
   const uint32_t ch = r.channels();
   std::vector<float> buf(n * ch);
   for (size_t i = 0; i < n; ++i)
-    for (uint32_t c = 0; c < ch; ++c) buf[i * ch + c] = sl::ramp_value(from + SampleIndex(i), c);
+    for (uint32_t c = 0; c < ch; ++c) buf[i * ch + c] = spool::ramp_value(from + SampleIndex(i), c);
   r.write(buf.data(), n);
 }
 
@@ -26,7 +26,7 @@ size_t count_bad(const std::vector<float>& buf, SampleIndex from, size_t frames,
   size_t bad = 0;
   for (size_t i = 0; i < frames; ++i)
     for (uint32_t c = 0; c < ch; ++c)
-      if (buf[i * ch + c] != sl::ramp_value(from + SampleIndex(i), c)) { ++bad; break; }
+      if (buf[i * ch + c] != spool::ramp_value(from + SampleIndex(i), c)) { ++bad; break; }
   return bad;
 }
 }  // namespace
@@ -137,7 +137,7 @@ TEST(ring_threaded_no_tearing) {
     std::vector<float> chunk(480 * kCh);
     for (SampleIndex f = 0; f < kTotal; f += 480) {
       for (size_t i = 0; i < 480; ++i)
-        for (uint32_t c = 0; c < kCh; ++c) chunk[i * kCh + c] = sl::ramp_value(f + SampleIndex(i), c);
+        for (uint32_t c = 0; c < kCh; ++c) chunk[i * kCh + c] = spool::ramp_value(f + SampleIndex(i), c);
       r.write(chunk.data(), 480);
     }
     done.store(true, std::memory_order_release);

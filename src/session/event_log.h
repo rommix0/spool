@@ -9,7 +9,7 @@
 #include "core/types.h"
 #include "io/file_system.h"
 
-namespace sl {
+namespace spool {
 
 enum class Severity { Info, Warning, Error };
 
@@ -46,4 +46,4 @@ class EventLog {
   std::deque<LogEntry> entries_;  // oldest first
 };
 
-}  // namespace sl
+}  // namespace spool

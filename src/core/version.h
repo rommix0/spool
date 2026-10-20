@@ -1,4 +1,4 @@
 #pragma once
-namespace sl {
+namespace spool {
 extern const char* const kVersion;
 }

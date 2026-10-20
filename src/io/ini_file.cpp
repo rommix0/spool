@@ -4,7 +4,7 @@
 
 #include <cstdlib>
 
-namespace sl::ini {
+namespace spool::ini {
 
 namespace {
 constexpr DWORD kValueChars = 32768;  // a long path plus quotes
@@ -47,4 +47,4 @@ int64_t get_i64(const std::wstring& path, const std::wstring& section, const wch
   return v ? std::wcstoll(v->c_str(), nullptr, 10) : 0;
 }
 
-}  // namespace sl::ini
+}  // namespace spool::ini

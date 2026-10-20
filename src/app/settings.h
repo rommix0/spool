@@ -1,5 +1,5 @@
 #pragma once
-// Persistent app settings (INI in %APPDATA%\SoundLogger) and their validation.
+// Persistent app settings (INI in %APPDATA%\Spool) and their validation.
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -7,7 +7,7 @@
 #include "audio/capture_source.h"
 #include "session/config.h"
 
-namespace sl {
+namespace spool {
 
 struct AppSettings {
   CaptureConfig input;
@@ -28,20 +28,20 @@ inline constexpr U32Range kFlushSecondsRange{1, 3600};
 inline constexpr U32Range kLowWaterMinutesRange{0, 100000};
 inline constexpr U32Range kStallPercentRange{1, 100};
 
-// %APPDATA%\SoundLogger\settings.ini. Creates nothing.
+// %APPDATA%\Spool\settings.ini. Creates nothing.
 std::wstring settings_path();
-// Creates %APPDATA%\SoundLogger if missing.
+// Creates %APPDATA%\Spool if missing.
 bool ensure_settings_dir();
-// %APPDATA%\SoundLogger\state.ini: the crash state (StateStore). A file of its own, since
+// %APPDATA%\Spool\state.ini: the crash state (StateStore). A file of its own, since
 // StateStore writes it as UTF-16 with a BOM. Creates nothing.
 std::wstring state_path();
-// %LOCALAPPDATA%\SoundLogger\logs ("" if LOCALAPPDATA is not set). Creates nothing.
+// %LOCALAPPDATA%\Spool\logs ("" if LOCALAPPDATA is not set). Creates nothing.
 std::wstring logs_dir();
 // <logs_dir>\<name>.log, "" without a logs dir. The app's event log is app.log outside a
 // session and <session_id>.log while one runs (a resumed session appends to its own).
 std::wstring log_file(const std::wstring& name);
 
-// One WAV destination "main", 16-bit, all channels, %USERPROFILE%\Music\SoundLogger, 30 min.
+// One WAV destination "main", 16-bit, all channels, %USERPROFILE%\Music\Spool, 30 min.
 AppSettings default_settings();
 
 // Missing file -> default_settings(); unreadable values fall back per field. Never throws.
@@ -52,4 +52,4 @@ bool save_settings(const std::wstring& ini, const AppSettings&);
 // User-facing problems that must be fixed before recording; empty if the settings are valid.
 std::vector<std::wstring> validate(const AppSettings&, uint16_t device_channels);
 
-}  // namespace sl
+}  // namespace spool

@@ -24,7 +24,7 @@
 #include "session/naming.h"
 #include "session/preflight.h"
 
-namespace sl {
+namespace spool {
 
 namespace {
 
@@ -1152,7 +1152,7 @@ Destination::Destination(DestinationConfig cfg, const SessionParams& sp, SampleR
   } else {
     k.map = cfg.channels;
   }
-  k.rate_bytes = sl::data_rate(cfg, sp.rate, k.map.size());
+  k.rate_bytes = spool::data_rate(cfg, sp.rate, k.map.size());
   k.low_water = low_water_bytes(sp, k.rate_bytes);
   k.st.name = cfg.name;
   k.st.state = DestState::Idle;
@@ -1354,4 +1354,4 @@ bool is_stalled(SampleIndex write_index, SampleIndex progress, size_t capacity, 
   return lag > 0 && uint64_t(lag) * 100 > uint64_t(capacity) * stall_percent;
 }
 
-}  // namespace sl
+}  // namespace spool

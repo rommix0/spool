@@ -6,7 +6,7 @@
 
 #include "io/file_system.h"
 
-namespace sl {
+namespace spool {
 
 struct FaultState;  // internal, defined in the .cpp
 
@@ -57,4 +57,4 @@ class FaultFileSystem : public IFileSystem {
   std::shared_ptr<FaultState> st_;  // shared with open handles so they may outlive *this
 };
 
-}  // namespace sl
+}  // namespace spool

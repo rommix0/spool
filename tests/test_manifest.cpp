@@ -9,7 +9,7 @@
 #include "session/manifest.h"
 #include "test.h"
 
-using namespace sl;
+using namespace spool;
 
 namespace {
 // 2026-10-16 14:30:00 UTC, local = UTC-4 (10:30:00 local).

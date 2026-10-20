@@ -6,7 +6,7 @@
 #include <utility>
 #include <vector>
 
-namespace sl::ini {
+namespace spool::ini {
 
 // GetPrivateProfileString strips one pair of surrounding quotes, so quoting keeps leading
 // and trailing spaces (and inner quotes) intact.
@@ -26,4 +26,4 @@ std::optional<std::wstring> get(const std::wstring& path, const std::wstring& se
 // 0 if missing or not a number.
 int64_t get_i64(const std::wstring& path, const std::wstring& section, const wchar_t* key);
 
-}  // namespace sl::ini
+}  // namespace spool::ini

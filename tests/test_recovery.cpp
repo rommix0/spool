@@ -18,7 +18,7 @@
 #include "session/session_manager.h"
 #include "test.h"
 
-using namespace sl;
+using namespace spool;
 using namespace dest_test;
 using Kind = FaultFileSystem::Kind;
 
@@ -37,7 +37,7 @@ struct TempDir {
     static int counter = 0;
     wchar_t tmp[MAX_PATH + 1];
     const DWORD n = GetTempPathW(MAX_PATH + 1, tmp);
-    path = std::wstring(tmp, n) + L"sl_test_\u00FC\u65E5_" + std::to_wstring(GetCurrentProcessId()) + L"_" +
+    path = std::wstring(tmp, n) + L"spool_test_\u00FC\u65E5_" + std::to_wstring(GetCurrentProcessId()) + L"_" +
            std::to_wstring(++counter);
     CreateDirectoryW(path.c_str(), nullptr);
   }

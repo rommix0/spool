@@ -10,7 +10,7 @@
 #include <set>
 #include <thread>
 
-namespace sl {
+namespace spool {
 
 namespace {
 
@@ -348,4 +348,4 @@ std::wstring FaultFileSystem::volume_id(const std::wstring& dir) {
   return value;
 }
 
-}  // namespace sl
+}  // namespace spool
