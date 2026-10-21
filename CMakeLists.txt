@@ -31,7 +31,8 @@ file(GLOB SPOOL_APP_CORE_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_SOURCE_DIR}/src/app/format_text.cpp
   ${CMAKE_SOURCE_DIR}/src/app/settings_model.cpp
   ${CMAKE_SOURCE_DIR}/src/app/text_util.cpp
-  ${CMAKE_SOURCE_DIR}/src/app/lifecycle.cpp)
+  ${CMAKE_SOURCE_DIR}/src/app/lifecycle.cpp
+  ${CMAKE_SOURCE_DIR}/src/app/window_place.cpp)
 list(APPEND SPOOL_CORE_SOURCES ${SPOOL_APP_CORE_SOURCES})
 
 add_library(spool_core STATIC ${SPOOL_CORE_SOURCES} src/core/types.h)
@@ -43,7 +44,7 @@ file(GLOB SPOOL_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/*.cpp)
 add_executable(spool_tests ${SPOOL_TEST_SOURCES})
 target_link_libraries(spool_tests PRIVATE spool_core)
 
-# ---- spool: the dashboard app (window code only; settings, format_text, settings_model, text_util and lifecycle are in spool_core) ----
+# ---- spool: the dashboard app (window code only; settings, format_text, settings_model, text_util, lifecycle and window_place are in spool_core) ----
 file(GLOB SPOOL_APP_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/app/*.cpp)
 list(REMOVE_ITEM SPOOL_APP_SOURCES ${SPOOL_APP_CORE_SOURCES})
 add_executable(spool WIN32 ${SPOOL_APP_SOURCES}

@@ -38,4 +38,8 @@ std::unique_ptr<IEncoderFile> open_wav(IFileSystem&, const std::wstring& path, c
 bool wav_patch_header(std::vector<uint8_t>& hdr, uint64_t data_bytes, uint64_t frames,
                       uint64_t file_bytes, bool rf64);
 
+// The cue and LIST/adtl chunks for markers (cue ids 1..n in order, a labl per non-empty
+// name); empty for no markers. Shared with rewrite_wav_markers.
+std::vector<uint8_t> wav_marker_chunks(const std::vector<Marker>& markers);
+
 }  // namespace spool

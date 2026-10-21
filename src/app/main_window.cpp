@@ -4,12 +4,16 @@
 
 #include <algorithm>
 #include <optional>
+#include <system_error>
+#include <thread>
+#include <tuple>
 
 #include "app/format_text.h"
 #include "app/lifecycle.h"
 #include "app/resource.h"
 #include "app/settings_dialog.h"
 #include "app/text_util.h"
+#include "app/window_place.h"
 #include "audio/wasapi_source.h"
 #include "core/clock.h"
 
@@ -21,6 +25,8 @@ constexpr wchar_t kTitle[] = L"Spool";
 constexpr wchar_t kCantStart[] = L"Can't start recording";
 constexpr wchar_t kAppLog[] = L"app";  // app.log: events outside a session
 constexpr UINT kLaunchMsg = WM_APP + 1;
+constexpr UINT kJobDoneMsg = WM_APP + 2;     // a Job's worker finished
+constexpr uint64_t kBusyBannerMs = 500;      // a Job this slow shows the Busy banner
 constexpr COLORREF kBannerBack = RGB(255, 233, 168);  // the destination panel's amber
 constexpr COLORREF kBannerLost = RGB(255, 204, 204);  // ... and its red
 constexpr COLORREF kBannerText = RGB(28, 28, 28);
@@ -71,10 +77,28 @@ int text_width(HWND h, HFONT f, const wchar_t* s) {
 
 }  // namespace
 
-MainWindow::MainWindow(AppContext ctx) : ctx_(std::move(ctx)) {}
+struct MainWindow::Job {
+  enum class Kind { Preflight, Repair } kind = Kind::Preflight;
+  // Preflight (start_recording)
+  SessionConfig cfg;
+  bool ask = false;
+  std::function<void(bool)> then;
+  PreflightResult pf;
+  // Repair (try_resume)
+  RecordingState st;
+  bool give_up = false;
+  RecoveryWork work;
+};
+
+MainWindow::MainWindow(AppContext ctx)
+    : ctx_(std::move(ctx)),
+      markers_win_([this] { return ctx_.mgr.markers(); },
+                   [this](uint32_t id, const std::wstring& name) { return ctx_.mgr.rename_marker(id, name); }) {}
 
 MainWindow::~MainWindow() {
   if (hwnd_) DestroyWindow(hwnd_);
+  for (HICON i : {icon_big_, icon_small_})
+    if (i) DestroyIcon(i);
   for (HFONT f : {font_, bold_, clock_font_})
     if (f) DeleteObject(f);
   if (amber_) DeleteObject(amber_);
@@ -83,12 +107,13 @@ MainWindow::~MainWindow() {
 
 bool MainWindow::create(HINSTANCE inst, int show) {
   inst_ = inst;
-  if (!MeterControl::register_class(inst) || !DestPanel::register_class(inst)) return false;
+  if (!MeterControl::register_class(inst) || !DestPanel::register_class(inst) || !MarkersWindow::register_class(inst))
+    return false;
   WNDCLASSEXW wc{sizeof(wc)};
   wc.lpfnWndProc = proc;
   wc.hInstance = inst;
   wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-  wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+  wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(IDI_APP));
   wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
   wc.lpszClassName = kClassName;
   if (!RegisterClassExW(&wc)) return false;
@@ -96,8 +121,7 @@ bool MainWindow::create(HINSTANCE inst, int show) {
   if (!CreateWindowExW(0, kClassName, kTitle, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                        CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr, inst, this))
     return false;
-  SetWindowPos(hwnd_, nullptr, 0, 0, px(940), px(760), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-  ShowWindow(hwnd_, show);
+  place_window(show);
   UpdateWindow(hwnd_);
   PostMessageW(hwnd_, kLaunchMsg, 0, 0);  // recovery runs once the window is up
   return true;
@@ -105,6 +129,8 @@ bool MainWindow::create(HINSTANCE inst, int show) {
 
 bool MainWindow::translate(MSG& m) {
   if (!hwnd_) return false;
+  // The Markers window's keys (its rename box) are its own: no M or S there.
+  if (GetAncestor(m.hwnd, GA_ROOT) != hwnd_) return false;
   // Auto-repeat of a held M or S would drop a marker or split per repeat: ignore it.
   if (m.message == WM_KEYDOWN && (m.wParam == 'M' || m.wParam == 'S') && (m.lParam & (1 << 30))) return true;
   if (accel_ && TranslateAcceleratorW(hwnd_, accel_, &m)) return true;
@@ -137,6 +163,7 @@ LRESULT MainWindow::handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DPICHANGED: {
       make_fonts();
       apply_fonts();
+      set_icons();
       const RECT* r = reinterpret_cast<const RECT*>(lp);
       SetWindowPos(hwnd_, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
                    SWP_NOZORDER | SWP_NOACTIVATE);
@@ -196,7 +223,11 @@ LRESULT MainWindow::handle(UINT msg, WPARAM wp, LPARAM lp) {
     case kLaunchMsg:
       on_launch();
       return 0;
+    case kJobDoneMsg:
+      on_job_done();
+      return 0;
     case WM_DESTROY:
+      save_place();
       KillTimer(hwnd_, kTimerId);
       if (hotkey_) UnregisterHotKey(hwnd_, kHotkeyId);
       hotkey_ = false;
@@ -221,7 +252,7 @@ void MainWindow::on_create() {
   device_ = child(hwnd_, inst_, WC_STATICW, L"", kLabel | SS_ENDELLIPSIS, IDC_DEVICE);
   marker_ = child(hwnd_, inst_, WC_BUTTONW, L"Marker", WS_TABSTOP | BS_SPLITBUTTON, IDC_MARKER);
   split_ = child(hwnd_, inst_, WC_BUTTONW, L"Split file", kButton, IDC_SPLIT);
-  settings_ = child(hwnd_, inst_, WC_BUTTONW, L"Settings…", kButton, IDC_SETTINGS);
+  settings_ = child(hwnd_, inst_, WC_BUTTONW, L"Settings\x2026", kButton, IDC_SETTINGS);
   levels_label_ = child(hwnd_, inst_, WC_STATICW, L"Levels", kLabel, IDC_LEVELS_LABEL);
   meters_.create(hwnd_, IDC_METERS, inst_);
   buffer_ = child(hwnd_, inst_, WC_STATICW, L"", kLabel, IDC_BUFFER);
@@ -236,6 +267,7 @@ void MainWindow::on_create() {
   ShowWindow(banner_ack_, SW_HIDE);
   dests_.create(hwnd_, IDC_DESTS, inst_);
   events_label_ = child(hwnd_, inst_, WC_STATICW, L"Events", kLabel, IDC_EVENTS_LABEL);
+  markers_btn_ = child(hwnd_, inst_, WC_BUTTONW, L"Markers\x2026", kButton, IDC_MARKERS);
   events_ = CreateWindowExW(0, WC_LISTVIEWW, L"",
                             WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_OWNERDATA |
                                 LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
@@ -259,6 +291,7 @@ void MainWindow::on_create() {
 
   make_fonts();
   apply_fonts();
+  set_icons();
   update_device_name();
 
   update_hotkey();
@@ -278,6 +311,8 @@ void MainWindow::on_command(int id) {
     case IDM_MARKER_5: marker(5); break;
     case IDM_MARKER_10: marker(10); break;
     case IDM_MARKER_30: marker(30); break;
+    case IDC_MARKERS: show_markers(false); break;
+    case IDM_RENAME_MARKER: show_markers(true); break;
     case IDC_SPLIT:
     case IDM_SPLIT: split(); break;
     case IDC_SETTINGS: settings(); break;
@@ -365,13 +400,14 @@ int MainWindow::box(const std::wstring& text, const wchar_t* title, UINT flags) 
 }
 
 void MainWindow::record() {
+  if (job_) return;  // a preflight or repair is running (Record is disabled meanwhile)
   if (!pending_) {
     start_recording(true);
     return;
   }
   // A crashed session is waiting for its input: Record retries that now.
   try_resume();
-  if (pending_)
+  if (pending_ && !job_)  // still waiting for the input (not repairing)
     box(L"Waiting for the input device to resume the crashed session.\n\n" + pending_err_, kCantStart,
         MB_OK | MB_ICONINFORMATION);
 }
@@ -395,20 +431,80 @@ void MainWindow::before_start() {
   raise_working_set(working_set_for_ring(ctx_.settings.ring_seconds, f.sample_rate, f.channels));
 }
 
-bool MainWindow::start_recording(bool ask) {
+void MainWindow::run_job(std::shared_ptr<Job> job) {
+  job_ = job;
+  job_since_ = GetTickCount64();
+  busy_text_ = job->kind == Job::Kind::Preflight ? L"Checking the destination folders\x2026"
+                                                 : L"Repairing the files of the crashed session\x2026";
+  refresh_slow();  // Record and Settings off
+  // The worker touches only the job and the file system (which is never destroyed), so it
+  // may outlive the window if a drive hangs and the app is closed meanwhile.
+  IFileSystem& fs = ctx_.fs;
+  const HWND to = hwnd_;
+  try {
+    std::thread([job, &fs, to] {
+      if (job->kind == Job::Kind::Preflight) {
+        job->pf = preflight(job->cfg.dests, job->cfg.params, fs);
+      } else {
+        job->work = repair_crashed_session(fs, job->st, job->give_up);
+      }
+      PostMessageW(to, kJobDoneMsg, 0, 0);
+    }).detach();
+  } catch (const std::system_error&) {  // no thread: do it here
+    if (job->kind == Job::Kind::Preflight) {
+      job->pf = preflight(job->cfg.dests, job->cfg.params, fs);
+    } else {
+      job->work = repair_crashed_session(fs, job->st, job->give_up);
+    }
+    PostMessageW(to, kJobDoneMsg, 0, 0);
+  }
+}
+
+void MainWindow::on_job_done() {
+  const std::shared_ptr<Job> job = std::move(job_);
+  if (!job) return;
+  if (busy_shown_) {
+    busy_shown_ = false;
+    update_banner();
+  }
+  if (job->kind == Job::Kind::Preflight) {
+    const bool ok = finish_start(job->cfg, job->pf, job->ask);
+    if (job->then) job->then(ok);
+  } else if (pending_) {
+    finish_resume(finish_launch_recovery(job->st, job->work, job->give_up, session_config(), ctx_.mgr, ctx_.store,
+                                         ctx_.fs, system_clock(), ctx_.log));
+  }
+  refresh_slow();
+}
+
+void MainWindow::start_recording(bool ask, std::function<void(bool)> then) {
+  const auto block = [&](const std::wstring& text) {
+    box(text, kCantStart, MB_OK | MB_ICONERROR);
+    if (then) then(false);
+  };
+  if (recording() || job_) {
+    if (then) then(false);
+    return;
+  }
+  std::wstring err;
+  if (!input_ready(&err)) return block(err);
+  const std::vector<std::wstring> problems = validate(ctx_.settings, ctx_.source.format().channels);
+  if (!problems.empty()) return block(join_lines(problems));
+  auto job = std::make_shared<Job>();
+  job->kind = Job::Kind::Preflight;
+  job->cfg = session_config();  // params carry the source's rate and channels
+  job->ask = ask;
+  job->then = std::move(then);
+  run_job(std::move(job));
+}
+
+bool MainWindow::finish_start(const SessionConfig& cfg, const PreflightResult& pf, bool ask) {
   if (recording()) return false;
   const auto block = [this](const std::wstring& text) {
     box(text, kCantStart, MB_OK | MB_ICONERROR);
     return false;
   };
   std::wstring err;
-  if (!input_ready(&err)) return block(err);
-  const std::vector<std::wstring> problems = validate(ctx_.settings, ctx_.source.format().channels);
-  if (!problems.empty()) return block(join_lines(problems));
-  const SessionConfig cfg = session_config();
-  HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-  const PreflightResult pf = ctx_.mgr.preflight(cfg);
-  SetCursor(old);
   if (!pf.can_start) return block(join_lines(pf.errors));
   // Destinations that will start in LastResort are not a block while another one works.
   std::vector<std::wstring> lines = pf.errors;
@@ -449,6 +545,7 @@ void MainWindow::on_launch() {
 
 // R18: at launch, then once a second from tick() while the input device is missing.
 void MainWindow::try_resume() {
+  if (job_) return;
   const uint64_t now = GetTickCount64();
   pending_try_ = now;
   pending_err_.clear();
@@ -461,18 +558,25 @@ void MainWindow::try_resume() {
   } else {
     ready = input_ready(&pending_err_);
   }
-  if (ready) before_start();
-  HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-  const LaunchRecoveryResult r = resume_when_input_ready(*pending_, ready, now - pending_since_, session_config(),
-                                                         ctx_.mgr, ctx_.store, ctx_.fs, system_clock(), ctx_.log);
-  SetCursor(old);
-  if (r.outcome == LaunchRecovery::Waiting) {
+  const bool give_up = !ready && now - pending_since_ >= kResumeWaitMs;
+  if (!ready && !give_up) {
     if (banner_mode_ != Banner::Waiting) {
       warn(L"Waiting for the input device to resume the crashed session. Can't open it: " + pending_err_);
       show_banner(Banner::Waiting);
     }
     return;
   }
+  if (ready) before_start();
+  // The repair reads and patches the crashed session's files: on a worker, then
+  // finish_resume() here.
+  auto job = std::make_shared<Job>();
+  job->kind = Job::Kind::Repair;
+  job->st = *pending_;
+  job->give_up = give_up;
+  run_job(std::move(job));
+}
+
+void MainWindow::finish_resume(const LaunchRecoveryResult& r) {
   pending_.reset();
   if (r.outcome == LaunchRecovery::Resumed) {
     show_banner(Banner::Recovered);
@@ -483,13 +587,22 @@ void MainWindow::try_resume() {
   const bool lost = r.outcome == LaunchRecovery::Failed || r.outcome == LaunchRecovery::GaveUp;
   // Unattended first: start_on_launch records before anything waits for a click. The
   // failure is already in the event log; the banner reports it.
-  if (auto_start_after(r.outcome, ctx_.settings.start_on_launch) && start_recording(false)) {
-    show_banner(lost ? Banner::NotResumedNewRecording : Banner::None);
+  const auto not_started = [this, r] {
+    show_banner(r.outcome == LaunchRecovery::GaveUp ? Banner::NotResumed : Banner::None);
+    if (r.outcome == LaunchRecovery::Failed)
+      box(L"The crashed session couldn't be resumed.\n\n" + r.error, kCantStart, MB_OK | MB_ICONERROR);
+  };
+  if (!auto_start_after(r.outcome, ctx_.settings.start_on_launch)) {
+    not_started();
     return;
   }
-  show_banner(r.outcome == LaunchRecovery::GaveUp ? Banner::NotResumed : Banner::None);
-  if (r.outcome == LaunchRecovery::Failed)
-    box(L"The crashed session couldn't be resumed.\n\n" + r.error, kCantStart, MB_OK | MB_ICONERROR);
+  start_recording(false, [this, lost, not_started](bool started) {
+    if (started) {
+      show_banner(lost ? Banner::NotResumedNewRecording : Banner::None);
+    } else {
+      not_started();
+    }
+  });
 }
 
 void MainWindow::use_log(const std::wstring& name) { ctx_.log.set_file(log_file(name)); }
@@ -501,11 +614,11 @@ void MainWindow::show_banner(Banner mode) {
 }
 
 void MainWindow::update_banner() {
-  const Banner mode = input_lost_ ? Banner::InputLost : banner_mode_;
+  const Banner mode = input_lost_ ? Banner::InputLost : busy_shown_ ? Banner::Busy : banner_mode_;
   if (mode == shown_) return;
   shown_ = mode;
   // Waiting and InputLost are statuses; the others are notices to acknowledge.
-  const bool ack = mode != Banner::None && mode != Banner::Waiting && mode != Banner::InputLost;
+  const bool ack = mode != Banner::None && mode != Banner::Waiting && mode != Banner::InputLost && mode != Banner::Busy;
   if (!ack && GetFocus() == banner_ack_) SetFocus(IsWindowEnabled(stop_) ? stop_ : record_);
   const wchar_t* text = L"";
   switch (mode) {
@@ -517,6 +630,7 @@ void MainWindow::update_banner() {
       text = L"The crashed session couldn't be resumed. A new recording started.";
       break;
     case Banner::InputLost: text = L"Input lost. Waiting for the device to come back."; break;
+    case Banner::Busy: text = busy_text_.c_str(); break;
   }
   SetWindowTextW(banner_, text);
   ShowWindow(banner_, mode != Banner::None ? SW_SHOWNA : SW_HIDE);
@@ -546,6 +660,7 @@ void MainWindow::split() {
 }
 
 void MainWindow::settings() {
+  if (job_) return;  // Settings is disabled while a preflight or repair runs
   if (recording()) {
     box(L"Stop recording to change settings.", kTitle, MB_OK | MB_ICONINFORMATION);
     return;
@@ -614,10 +729,62 @@ void MainWindow::marker_menu(const RECT& r) {
   AppendMenuW(m, MF_STRING, IDM_MARKER_5, L"5 s ago");
   AppendMenuW(m, MF_STRING, IDM_MARKER_10, L"10 s ago");
   AppendMenuW(m, MF_STRING, IDM_MARKER_30, L"30 s ago");
+  AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(m, MF_STRING, IDM_RENAME_MARKER, L"Rename markers\x2026\tF2");
   const int cmd = int(TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_NONOTIFY, r.left,
                                      r.bottom, 0, hwnd_, nullptr));
   DestroyMenu(m);
   if (cmd) on_command(cmd);
+}
+
+void MainWindow::show_markers(bool edit_last) { markers_win_.show(hwnd_, inst_, edit_last); }
+
+void MainWindow::place_window(int show) {
+  // The saved restored rectangle, else the default size where Windows put the window.
+  WINDOWPLACEMENT wp{sizeof(wp)};
+  GetWindowPlacement(hwnd_, &wp);
+  const std::optional<WindowPlace> saved = load_window_place(window_place_path());
+  if (saved) {
+    wp.rcNormalPosition = saved->rect;
+  } else {
+    wp.rcNormalPosition.right = wp.rcNormalPosition.left + px(940);
+    wp.rcNormalPosition.bottom = wp.rcNormalPosition.top + px(760);
+  }
+  wp.showCmd = SW_HIDE;  // placed, not shown yet
+  wp.flags = 0;
+  SetWindowPlacement(hwnd_, &wp);
+  // Fit it to the work area of the monitor it is on now (a resolution or scaling change,
+  // a monitor unplugged, or the default size taller than a small screen).
+  RECT r;
+  GetWindowRect(hwnd_, &r);
+  MONITORINFO mi{sizeof(mi)};
+  if (GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mi)) {
+    const RECT f = fit_rect(r, mi.rcWork, px(860), px(560));
+    SetWindowPos(hwnd_, nullptr, f.left, f.top, f.right - f.left, f.bottom - f.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+  }
+  const bool normal = show == SW_SHOWNORMAL || show == SW_SHOW || show == SW_SHOWDEFAULT;
+  ShowWindow(hwnd_, saved && saved->maximized && normal ? SW_SHOWMAXIMIZED : show);
+}
+
+void MainWindow::save_place() {
+  WINDOWPLACEMENT wp{sizeof(wp)};
+  if (!GetWindowPlacement(hwnd_, &wp)) return;
+  const bool maximized = wp.showCmd == SW_SHOWMAXIMIZED ||
+                         (wp.showCmd == SW_SHOWMINIMIZED && (wp.flags & WPF_RESTORETOMAXIMIZED));
+  save_window_place(window_place_path(), WindowPlace{wp.rcNormalPosition, maximized});  // best effort
+}
+
+void MainWindow::set_icons() {
+  const UINT dpi = GetDpiForWindow(hwnd_);
+  for (auto [which, metric, icon] : {std::tuple{ICON_BIG, SM_CXICON, &icon_big_}, std::tuple{ICON_SMALL, SM_CXSMICON, &icon_small_}}) {
+    HICON h = nullptr;
+    const int size = GetSystemMetricsForDpi(metric, dpi);
+    if (FAILED(LoadIconWithScaleDown(inst_, MAKEINTRESOURCEW(IDI_APP), size, size, &h)) || !h) continue;
+    SendMessageW(hwnd_, WM_SETICON, which, reinterpret_cast<LPARAM>(h));
+    if (*icon) DestroyIcon(*icon);
+    *icon = h;
+  }
 }
 
 void MainWindow::add_folder(size_t dest, std::wstring path) {
@@ -647,7 +814,11 @@ void MainWindow::tick() {
 
   const uint64_t now = GetTickCount64();
   // Not inside a modal loop (a message box or Settings): the resume would start under it.
-  if (pending_ && !modal_ && now - pending_try_ >= kResumeRetryMs) try_resume();
+  if (pending_ && !modal_ && !job_ && now - pending_try_ >= kResumeRetryMs) try_resume();
+  if (job_ && !busy_shown_ && now - job_since_ >= kBusyBannerMs) {  // a slow drive: say what we wait for
+    busy_shown_ = true;
+    update_banner();
+  }
   if (now - last_slow_ms_ >= kSlowMs) refresh_slow();
 }
 
@@ -677,10 +848,18 @@ void MainWindow::refresh_slow() {
            fmt.sample_rate ? format_input_line(device_name_, fmt, mode, raw) : L"No input device");
   set_text(buffer_, buffer_text_, format_buffer_line(st.ring_fill, st.gaps, st.discontinuities));
   // Enable the partner first and hand it the focus, so disabling never strands the keyboard.
+  // While a Job runs (idle) neither is enabled: the focus goes to the event list.
+  const bool busy = job_ != nullptr;
   HWND on = rec ? stop_ : record_, off = rec ? record_ : stop_;
-  enable(on, true);
-  if (GetFocus() == off) SetFocus(on);
+  if (busy && !rec) {
+    if (GetFocus() == record_ || GetFocus() == settings_) SetFocus(events_);
+    enable(record_, false);
+  } else {
+    enable(on, true);
+    if (GetFocus() == off) SetFocus(on);
+  }
   enable(off, false);
+  enable(settings_, !busy);
   enable(marker_, rec);
   enable(split_, rec);
 
@@ -761,7 +940,7 @@ void MainWindow::make_fonts() {
 
 void MainWindow::apply_fonts() {
   for (HWND h : {record_, stop_, device_, marker_, split_, settings_, meters_.hwnd(), buffer_, ack_,
-                 dests_.hwnd(), events_, banner_, banner_ack_})
+                 dests_.hwnd(), events_, markers_btn_, banner_, banner_ack_})
     SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
   for (HWND h : {levels_label_, dests_label_, events_label_})
     SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(bold_), TRUE);
@@ -830,9 +1009,10 @@ void MainWindow::layout() {
   place(dests_.hwnd(), m, y, width, dh);
   y += dh + px(12);
 
-  // Events fill the rest.
-  place(events_label_, m, y, width, line);
-  y += line + px(4);
+  // Events fill the rest, with Markers… at the right of the heading.
+  place(events_label_, m, y, width - px(120), head);
+  place(markers_btn_, c.right - m - px(116), y, px(116), head);
+  y += head + px(4);
   place(events_, m, y, width, c.bottom - m - y);
   const int time_w = px(80), dest_w = px(110);
   ListView_SetColumnWidth(events_, 0, time_w);

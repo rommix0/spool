@@ -16,6 +16,7 @@ constexpr uint64_t kClockPairMs = 5 * 60 * 1000;  // §8.6
 constexpr int kFillPollMs = 5;                    // silence filler poll (real sleep)
 constexpr uint32_t kDefaultCapMinutes = 30;       // silence cap with rotation off
 constexpr size_t kFillChunk = 4096;
+constexpr uint64_t kBookDrainMs = 2000;          // marker renames at exit
 
 uint64_t pack(StreamFormat f) { return uint64_t(f.sample_rate) << 16 | f.channels; }
 StreamFormat unpack(uint64_t v) { return StreamFormat{uint32_t(v >> 16), uint16_t(v & 0xFFFF)}; }
@@ -66,7 +67,16 @@ struct SessionManager::Session {
 SessionManager::SessionManager(ICaptureSource& src, IFileSystem& fs, IClock& clock, EventLog& log)
     : src_(src), fs_(fs), clock_(clock), log_(log) {}
 
-SessionManager::~SessionManager() { stop(); }
+SessionManager::~SessionManager() {
+  stop();
+  // Give marker renames still being written a moment, then no more logging: the log goes next.
+  old_books_.push_back(book_);
+  for (const auto& w : old_books_)
+    if (const auto b = w.lock()) {
+      b->wait_idle(kBookDrainMs);
+      b->shutdown();
+    }
+}
 
 PreflightResult SessionManager::preflight(const SessionConfig& cfg) {
   SessionParams p = cfg.params;
@@ -135,6 +145,12 @@ bool SessionManager::start(const SessionConfig& cfg, const ResumeInfo* resume, s
     prev.swap(cur_);
     old.swap(retired_);
   }
+  // A new recording: new marker ids and names. The last one's book may still be rewriting.
+  if (book_) old_books_.push_back(book_);
+  old_books_.erase(std::remove_if(old_books_.begin(), old_books_.end(), [](const auto& w) { return w.expired(); }),
+                   old_books_.end());
+  book_ = MarkerBook::create(fs_, clock_, log_);
+  markers_.clear();
   auto s = make_session(p, fmt, ring_start, std::move(seeds), err);
   if (!s) return false;
 
@@ -215,13 +231,47 @@ void SessionManager::abandon_for_test() {
   state_.store(SessionState::Idle);
 }
 
-void SessionManager::marker(uint32_t seconds_ago) {
+uint32_t SessionManager::marker(uint32_t seconds_ago) {
   const auto s = current();
-  if (!s || !thread_.joinable()) return;
+  if (!s || !thread_.joinable()) return 0;
   const SampleIndex back = SampleIndex(seconds_ago) * SampleIndex(s->fmt.sample_rate);
   // Review Focus 5; after a resume never inside the crash gap.
   const SampleIndex at = std::max(s->first, s->ring->write_index() - back);
-  push(UiCommand{UiCommand::Kind::Marker, s->seq, at, 0, L"Marker " + std::to_wstring(++marker_n_)});
+  const uint32_t id = ++marker_n_;
+  std::wstring name = L"Marker " + std::to_wstring(id);
+  book_->add(id, name);
+  markers_.push_back(MarkerInfo{id, at, double(at - s->params.start_sample) / double(s->fmt.sample_rate),
+                                wall_for(s->params, at), name});
+  push(UiCommand{UiCommand::Kind::Marker, s->seq, at, 0, std::move(name), id});
+  return id;
+}
+
+bool SessionManager::rename_marker(uint32_t id, std::wstring name) {
+  std::replace_if(name.begin(), name.end(), [](wchar_t c) { return c == L'\r' || c == L'\n' || c == L'\t'; }, L' ');
+  const size_t first = name.find_first_not_of(L' ');
+  if (first == std::wstring::npos) return false;
+  name = name.substr(first, name.find_last_not_of(L' ') - first + 1);
+  if (name.size() > kMaxMarkerName) name.resize(kMaxMarkerName);
+  const auto it = std::find_if(markers_.begin(), markers_.end(), [&](const MarkerInfo& m) { return m.id == id; });
+  if (it == markers_.end() || it->name == name || !book_) return false;
+  log(Severity::Info, L"Marker \"" + it->name + L"\" renamed to \"" + name + L"\"");
+  it->name = name;
+  book_->rename(id, name);  // the finished WAV files
+  const auto s = current();
+  if (s && thread_.joinable()) {  // the running destinations write the manifest record
+    push(UiCommand{UiCommand::Kind::RenameMarker, s->seq, it->at, 0, std::move(name), id});
+    return true;
+  }
+  // Stopped: append it to each destination's last manifest.
+  std::vector<std::wstring> manifests;
+  {
+    std::lock_guard<std::mutex> lk(sess_m_);
+    for (const DestStatus& d : last_dests_)
+      if (!d.manifest_path.empty()) manifests.push_back(d.manifest_path);
+  }
+  const JsonLine l = JsonLine("marker_rename", it->at, it->wall).num("id", id).str("name", it->name);
+  for (std::wstring& m : manifests) book_->append_to_manifest(std::move(m), l);
+  return true;
 }
 
 void SessionManager::split() {
@@ -360,7 +410,7 @@ std::shared_ptr<SessionManager::Session> SessionManager::make_session(const Sess
   // A destination whose channel map does not fit the input disables itself (logged as an error).
   for (size_t i = 0; i < cfg_.dests.size(); ++i)
     s->dests.push_back(
-        std::make_unique<Destination>(cfg_.dests[i], s->params, *s->ring, fs_, clock_, log_, s->seeds[i]));
+        std::make_unique<Destination>(cfg_.dests[i], s->params, *s->ring, fs_, clock_, log_, s->seeds[i], book_));
   return s;
 }
 
@@ -428,7 +478,8 @@ void SessionManager::drain_ui(Session& s) {
       continue;
     }
     switch (c->kind) {
-      case UiCommand::Kind::Marker: post_all(s, CmdMarker{c->at, c->text}); break;
+      case UiCommand::Kind::Marker: post_all(s, CmdMarker{c->at, c->text, c->id}); break;
+      case UiCommand::Kind::RenameMarker: post_all(s, CmdRenameMarker{c->at, c->id, c->text}); break;
       case UiCommand::Kind::Split: post_all(s, CmdSplit{c->at}); break;
       case UiCommand::Kind::AppendFolder:
         if (c->dest < s.dests.size()) {

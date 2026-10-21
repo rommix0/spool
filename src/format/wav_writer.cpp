@@ -112,37 +112,8 @@ std::vector<uint8_t> build_header(const WavParams& p) {
 std::vector<uint8_t> build_tail(uint64_t data_bytes, const std::vector<Marker>& markers) {
   std::vector<uint8_t> t;
   if (data_bytes & 1) t.push_back(0);
-  if (markers.empty()) return t;
-
-  put_id(t, "cue ");
-  put32(t, uint32_t(4 + 24 * markers.size()));
-  put32(t, uint32_t(markers.size()));
-  for (size_t i = 0; i < markers.size(); ++i) {
-    put32(t, uint32_t(i + 1));  // cue point id
-    put32(t, uint32_t(i));      // play order position
-    put_id(t, "data");
-    put32(t, 0);  // chunk start
-    put32(t, 0);  // block start
-    put32(t, uint32_t(std::min<uint64_t>(markers[i].frame_in_file, kMax32)));
-  }
-
-  std::vector<uint8_t> labels;
-  for (size_t i = 0; i < markers.size(); ++i) {
-    const std::string name = to_utf8(markers[i].name);
-    if (name.empty()) continue;
-    put_id(labels, "labl");
-    put32(labels, uint32_t(4 + name.size() + 1));
-    put32(labels, uint32_t(i + 1));
-    labels.insert(labels.end(), name.begin(), name.end());
-    labels.push_back(0);
-    if ((name.size() + 1) & 1) labels.push_back(0);
-  }
-  if (!labels.empty()) {
-    put_id(t, "LIST");
-    put32(t, uint32_t(4 + labels.size()));
-    put_id(t, "adtl");
-    t.insert(t.end(), labels.begin(), labels.end());
-  }
+  const std::vector<uint8_t> m = wav_marker_chunks(markers);
+  t.insert(t.end(), m.begin(), m.end());
   return t;
 }
 
@@ -292,6 +263,41 @@ bool wav_patch_header(std::vector<uint8_t>& hdr, uint64_t data_bytes, uint64_t f
   }
   if (fact) set32(h + fact, uint32_t(std::min<uint64_t>(frames, kMax32)));
   return true;
+}
+
+std::vector<uint8_t> wav_marker_chunks(const std::vector<Marker>& markers) {
+  std::vector<uint8_t> t;
+  if (markers.empty()) return t;
+  put_id(t, "cue ");
+  put32(t, uint32_t(4 + 24 * markers.size()));
+  put32(t, uint32_t(markers.size()));
+  for (size_t i = 0; i < markers.size(); ++i) {
+    put32(t, uint32_t(i + 1));  // cue point id
+    put32(t, uint32_t(i));      // play order position
+    put_id(t, "data");
+    put32(t, 0);  // chunk start
+    put32(t, 0);  // block start
+    put32(t, uint32_t(std::min<uint64_t>(markers[i].frame_in_file, kMax32)));
+  }
+
+  std::vector<uint8_t> labels;
+  for (size_t i = 0; i < markers.size(); ++i) {
+    const std::string name = to_utf8(markers[i].name);
+    if (name.empty()) continue;
+    put_id(labels, "labl");
+    put32(labels, uint32_t(4 + name.size() + 1));
+    put32(labels, uint32_t(i + 1));
+    labels.insert(labels.end(), name.begin(), name.end());
+    labels.push_back(0);
+    if ((name.size() + 1) & 1) labels.push_back(0);
+  }
+  if (!labels.empty()) {
+    put_id(t, "LIST");
+    put32(t, uint32_t(4 + labels.size()));
+    put_id(t, "adtl");
+    t.insert(t.end(), labels.begin(), labels.end());
+  }
+  return t;
 }
 
 std::unique_ptr<IEncoderFile> open_wav(IFileSystem& fs, const std::wstring& path, const WavParams& p,

@@ -5,16 +5,23 @@
 // stray click or key does stops a recording: Stop has no shortcut and always asks.
 // At launch it resumes a crashed session (amber banner until acknowledged) or, with
 // start_on_launch, starts recording. While the input is lost a red banner shows over any
-// other. While recording the system is kept from sleeping.
+// other. While recording the system is kept from sleeping. The Markers window renames
+// markers (Markers… by the event list, the Marker dropdown, F2). The preflight before a
+// start and the crash repair at launch run on a worker thread, so a hung drive never
+// freezes the window. The window opens where it was last closed, fitted to the screen.
 // Event log files: app.log outside sessions, <session_id>.log while one runs.
 #include <windows.h>
 
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "app/dest_panel.h"
+#include "app/lifecycle.h"
+#include "app/markers_window.h"
 #include "app/meter_control.h"
 #include "app/settings.h"
 #include "io/file_system.h"
@@ -66,18 +73,28 @@ class MainWindow {
   void on_close();
   void on_launch();   // posted by create(): crash recovery, else start_on_launch
   void try_resume();  // the pending crashed session: resume, keep waiting for the input, or give up
+  void finish_resume(const LaunchRecoveryResult&);  // banners, auto-start, message
+
+  // File checks that can hang on a stuck drive run on a worker thread (Job) while the
+  // window stays live: the preflight before a start and the crash repair at launch. One
+  // at a time; Record and Settings wait for it, and a banner shows it after kBusyBannerMs.
+  struct Job;
+  void run_job(std::shared_ptr<Job>);
+  void on_job_done();  // the worker posted kJobDoneMsg
 
   // Record (ask = true: preflight problems ask "Start anyway?") and auto-start (ask =
-  // false: they are logged and recording starts). Blocking problems show a message.
-  bool start_recording(bool ask);
+  // false: they are logged and recording starts). Blocking problems show a message. The
+  // preflight runs as a Job; `then` gets whether recording started.
+  void start_recording(bool ask, std::function<void(bool started)> then = {});
+  bool finish_start(const SessionConfig&, const PreflightResult&, bool ask);  // after the preflight
   bool input_ready(std::wstring* err);  // reopens the input if it failed to open earlier
   void before_start();                  // raises the working set for the ring
   void after_start();                   // warnings about the started session; refresh
   void use_log(const std::wstring& name);  // log_file(name)
   int box(const std::wstring& text, const wchar_t* title, UINT flags);  // MessageBox, counted in modal_
-  enum class Banner { None, Waiting, Recovered, NotResumed, NotResumedNewRecording, InputLost };
+  enum class Banner { None, Waiting, Recovered, NotResumed, NotResumedNewRecording, InputLost, Busy };
   void show_banner(Banner);  // the notice (not InputLost); shown unless the input is lost
-  void update_banner();      // shows InputLost while input_lost_, else the notice
+  void update_banner();      // InputLost while input_lost_, else Busy (a slow Job), else the notice
 
   void record();
   void confirm_stop();
@@ -87,6 +104,10 @@ class MainWindow {
   void marker_menu(const RECT& button_screen);
   void add_folder(size_t dest, std::wstring path);
   void update_hotkey();  // registers or releases Ctrl+Alt+M to match the settings
+  void show_markers(bool edit_last);
+  void place_window(int show);  // the saved size and position (or the default), fitted to the screen
+  void save_place();
+  void set_icons();            // sized for the window's DPI
 
   void tick();          // 33 ms
   void refresh_slow();  // 4 Hz
@@ -126,10 +147,16 @@ class MainWindow {
   HWND record_ = nullptr, stop_ = nullptr, clock_ = nullptr, device_ = nullptr;
   HWND marker_ = nullptr, split_ = nullptr, settings_ = nullptr;
   HWND levels_label_ = nullptr, buffer_ = nullptr, dests_label_ = nullptr, ack_ = nullptr;
-  HWND events_label_ = nullptr, events_ = nullptr;
+  HWND events_label_ = nullptr, events_ = nullptr, markers_btn_ = nullptr;
   HWND banner_ = nullptr, banner_ack_ = nullptr;
   MeterControl meters_;
   DestPanel dests_;
+  MarkersWindow markers_win_;
+  HICON icon_big_ = nullptr, icon_small_ = nullptr;  // owned
+  std::shared_ptr<Job> job_;  // in flight
+  uint64_t job_since_ = 0;    // GetTickCount64
+  bool busy_shown_ = false;   // the Busy banner is up
+  std::wstring busy_text_;
 
   HFONT font_ = nullptr, bold_ = nullptr, clock_font_ = nullptr;  // owned
   std::wstring clock_text_, device_text_, buffer_text_;

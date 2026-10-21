@@ -4,11 +4,15 @@
 
 #include "resource.h"
 
-// In-window shortcuts (spec 10.6): M = marker now, S = split. Stop has none on purpose.
+IDI_APP ICON "../../assets/spool_icon_final.ico"
+
+// In-window shortcuts (spec 10.6): M = marker now, S = split, F2 = rename the newest marker.
+// Stop has none on purpose.
 IDR_ACCEL ACCELERATORS
 BEGIN
   "M", IDM_MARKER_NOW, VIRTKEY
   "S", IDM_SPLIT, VIRTKEY
+  VK_F2, IDM_RENAME_MARKER, VIRTKEY
 END
 
 // Settings (spec 10.5). Dialog units scale with the font and the monitor DPI. Tab order is the

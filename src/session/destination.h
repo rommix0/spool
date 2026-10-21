@@ -18,10 +18,12 @@
 #include "io/file_system.h"
 #include "session/config.h"
 #include "session/event_log.h"
+#include "session/marker_book.h"
 
 namespace spool {
 
-struct CmdMarker { SampleIndex at; std::wstring name; };
+struct CmdMarker { SampleIndex at; std::wstring name; uint32_t id = 0; };  // id: MarkerBook (0: none)
+struct CmdRenameMarker { SampleIndex at; uint32_t id; std::wstring name; };  // a marker_rename record
 struct CmdSplit { SampleIndex at; };
 struct CmdAppendFolder { std::wstring path; };  // in LastResort it is tried at once
 struct CmdGapStart { SampleIndex at; std::string reason; };
@@ -30,7 +32,7 @@ struct CmdCloseForGap { SampleIndex at; };  // write through `at`, close, no fil
 struct CmdResumeAt { SampleIndex at; };     // open the next file at `at` and resume writing
 struct CmdClockPair { SampleIndex at; WallTime wall; };
 struct CmdAcknowledge {};                   // clears needs_ack
-using DestCommand = std::variant<CmdMarker, CmdSplit, CmdAppendFolder, CmdGapStart, CmdGapEnd,
+using DestCommand = std::variant<CmdMarker, CmdRenameMarker, CmdSplit, CmdAppendFolder, CmdGapStart, CmdGapEnd,
                                  CmdCloseForGap, CmdResumeAt, CmdClockPair, CmdAcknowledge>;
 
 enum class DestState { Idle, Writing, FailingOver, LastResort, GapClosed, Stopped, Disabled };
@@ -67,7 +69,7 @@ struct DestResumeSeed {
 class Destination {
  public:
   Destination(DestinationConfig, const SessionParams&, SampleRing&, IFileSystem&, IClock&, EventLog&,
-              DestResumeSeed = {});
+              DestResumeSeed = {}, std::shared_ptr<MarkerBook> = nullptr);
   ~Destination();  // stops at the current progress if still running
   Destination(const Destination&) = delete;
   Destination& operator=(const Destination&) = delete;

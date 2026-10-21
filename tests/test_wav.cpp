@@ -6,6 +6,7 @@
 
 #include "audio/ramp.h"
 #include "format/encoder.h"
+#include "format/wav_markers.h"
 #include "format/wav_reader.h"
 #include "format/wav_repair.h"
 #include "format/wav_writer.h"
@@ -431,4 +432,127 @@ TEST(wav_repair_cap_pads_odd_data) {
   CHECK(bytes.size() >= junk + 8 && std::memcmp(bytes.data() + junk, "JUNK", 4) == 0);
   CHECK_EQ(le32(bytes, 4), uint32_t(bytes.size() - 8));
   CHECK(bytes.size() % 2 == 0);
+}
+
+// ---- rewrite_wav_markers (a marker renamed after its file was finalized) ----
+
+namespace {
+
+// A finalized 1000-frame stereo file with markers {100 "intro"} and {600 "set 2"}.
+std::vector<uint8_t> finalized_with_markers(FaultFileSystem& fs, const WavParams& p = WavParams{48000, 2}) {
+  auto w = open(fs, p);
+  if (!w) return {};
+  const auto in = ramp(0, 1000, p.channels);
+  CHECK(w->write(in.data(), 1000));
+  CHECK(w->finalize({{100, L"intro"}, {600, L"set 2"}}, std::nullopt));
+  return fs.contents(kPath);
+}
+
+// The file agrees with itself: RIFF (or ds64) size = length - 8, audio unchanged.
+void check_consistent(FaultFileSystem& fs, const std::vector<uint8_t>& before) {
+  const auto b = fs.contents(kPath);
+  const auto info = info_of(fs);
+  CHECK(info.has_value());
+  if (!info) return;
+  if (info->riff_id == "RF64") {
+    uint64_t riff;
+    std::memcpy(&riff, b.data() + 20, 8);
+    CHECK_EQ(riff, uint64_t(b.size() - 8));
+  } else {
+    CHECK_EQ(le32(b, 4), uint32_t(b.size() - 8));
+  }
+  CHECK_EQ(b.size() % 2, size_t(0));
+  CHECK_EQ(info->frames, 1000u);
+  CHECK(b.size() >= info->data_offset + info->data_bytes && before.size() >= info->data_offset + info->data_bytes);
+  if (b.size() < info->data_offset + info->data_bytes || before.size() < info->data_offset + info->data_bytes) return;
+  CHECK(std::memcmp(b.data() + info->data_offset, before.data() + info->data_offset, size_t(info->data_bytes)) == 0);
+}
+
+std::vector<std::wstring> names_of(FaultFileSystem& fs) {
+  std::vector<std::wstring> v;
+  if (const auto info = info_of(fs))
+    for (const auto& m : info->markers) v.push_back(std::to_wstring(m.frame_in_file) + L":" + m.name);
+  return v;
+}
+
+}  // namespace
+
+TEST(wav_rewrite_markers_longer_and_shorter_names) {
+  FaultFileSystem fs;
+  const auto before = finalized_with_markers(fs);
+  std::wstring err;
+  CHECK(rewrite_wav_markers(fs, kPath, {{100, L"intro"}, {600, L"second set, after the break"}}, &err));
+  CHECK(names_of(fs) == (std::vector<std::wstring>{L"100:intro", L"600:second set, after the break"}));
+  check_consistent(fs, before);
+  const size_t grown = fs.contents(kPath).size();
+  CHECK(grown > before.size());
+  // Shorter again: the file keeps its length, the rest is a JUNK chunk.
+  CHECK(rewrite_wav_markers(fs, kPath, {{100, L"A"}, {600, L"B \u00e9"}}, &err));
+  CHECK(names_of(fs) == (std::vector<std::wstring>{L"100:A", L"600:B \u00e9"}));
+  check_consistent(fs, before);
+  CHECK_EQ(fs.contents(kPath).size(), grown);
+}
+
+TEST(wav_rewrite_markers_leftover_under_8_bytes) {
+  FaultFileSystem fs;
+  const auto before = finalized_with_markers(fs);
+  std::wstring err;
+  // "set 2" (6 bytes with NUL) -> "set" (4): the tail shrinks by 2, too little for a JUNK
+  // header, so the file grows by 6 to hold one.
+  CHECK(rewrite_wav_markers(fs, kPath, {{100, L"intro"}, {600, L"set"}}, &err));
+  CHECK(names_of(fs) == (std::vector<std::wstring>{L"100:intro", L"600:set"}));
+  check_consistent(fs, before);
+  CHECK_EQ(fs.contents(kPath).size(), before.size() + 6);
+}
+
+TEST(wav_rewrite_markers_after_truncate_junk) {
+  FaultFileSystem fs;
+  auto w = open(fs, WavParams{48000, 2});
+  if (!w) return;
+  const auto a = ramp(0, 1000, 2), b = ramp(1000, 500, 2);
+  CHECK(w->write(a.data(), 1000));
+  CHECK(w->flush());
+  CHECK(w->write(b.data(), 500));
+  CHECK(w->finalize({{10, L"x"}}, 1000));  // the discarded 500 frames are a JUNK chunk
+  const auto before = fs.contents(kPath);
+  std::wstring err;
+  CHECK(rewrite_wav_markers(fs, kPath, {{10, L"a much longer name than before"}}, &err));
+  CHECK(names_of(fs) == (std::vector<std::wstring>{L"10:a much longer name than before"}));
+  check_consistent(fs, before);
+  CHECK_EQ(fs.contents(kPath).size(), before.size());  // fits in the old JUNK
+  std::wstring rerr;
+  const auto r = repair_wav(fs, kPath, &rerr);  // still a clean file: repair leaves it alone
+  CHECK(r.has_value());
+}
+
+TEST(wav_rewrite_markers_rf64) {
+  FaultFileSystem fs;
+  WavParams p{48000, 2};
+  p.rf64_threshold = 1000;
+  const auto before = finalized_with_markers(fs, p);
+  std::wstring err;
+  CHECK(rewrite_wav_markers(fs, kPath, {{100, L"intro"}, {600, L"renamed in an RF64 file"}}, &err));
+  const auto info = info_of(fs);
+  CHECK(info.has_value());
+  if (info) CHECK_EQ(info->riff_id, std::string("RF64"));
+  CHECK(names_of(fs) == (std::vector<std::wstring>{L"100:intro", L"600:renamed in an RF64 file"}));
+  check_consistent(fs, before);
+}
+
+TEST(wav_rewrite_markers_refuses_foreign_files) {
+  FaultFileSystem fs;
+  std::wstring err;
+  CHECK(!rewrite_wav_markers(fs, L"D:\\rec\\missing.wav", {{1, L"x"}}, &err));
+  auto before = finalized_with_markers(fs);
+  // An unknown chunk after the audio: not ours to rewrite.
+  auto f = fs.open_existing(kPath, &err);
+  CHECK(f != nullptr);
+  if (!f) return;
+  const uint8_t extra[12] = {'i', 'X', 'M', 'L', 4, 0, 0, 0, 'a', 'b', 'c', 'd'};
+  CHECK(f->write(extra, sizeof extra));
+  f->close();
+  before = fs.contents(kPath);
+  CHECK(!rewrite_wav_markers(fs, kPath, {{100, L"y"}}, &err));
+  CHECK(!err.empty());
+  CHECK(fs.contents(kPath) == before);
 }

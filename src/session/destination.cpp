@@ -150,6 +150,18 @@ class TappingFs final : public IFileSystem {
 
 enum class Mode { Writing, GapClosed, LastResort };
 
+struct PendingMarker {
+  SampleIndex at;
+  uint32_t id;  // MarkerBook id, 0 if none
+  std::wstring name;
+};
+
+// A marker on its way into a file being finalized.
+struct FileMarker {
+  uint32_t id;
+  Marker m;
+};
+
 // Writer state that a new generation takes over after a stall. The writer publishes it
 // with every status change, under the status mutex.
 struct Carry {
@@ -161,7 +173,7 @@ struct Carry {
   SampleIndex session_start = 0, file_start = 0;
   SampleIndex next_boundary = kNoRotation;
   std::set<SampleIndex> splits;
-  std::vector<std::pair<SampleIndex, std::wstring>> markers;  // not yet in a finalized file
+  std::vector<PendingMarker> markers;  // not yet in a finalized file
   std::wstring manifest_path;     // the current (or last) manifest: the next one's prev_manifest
   std::vector<JsonLine> backlog;  // events waiting for a manifest
   SampleIndex gap_from = 0;       // LastResort: where the gap started
@@ -176,7 +188,8 @@ struct Retired {
   std::wstring path;
   SampleIndex start = 0;
   std::optional<uint64_t> truncate_to;
-  std::vector<Marker> markers;
+  std::vector<FileMarker> markers;
+  bool wav = false;
   SizeTap bytes;
   std::vector<JsonLine> after;  // appended to `man` after the file_close
 };
@@ -187,7 +200,7 @@ struct Retired {
 // Writers hold it by shared_ptr, so an abandoned one never touches freed memory.
 struct Destination::Core {
   Core(const SessionParams& p, SampleRing& r, IFileSystem& f, IClock& c, EventLog& l, DestResumeSeed s,
-       std::wstring n)
+       std::wstring n, std::shared_ptr<MarkerBook> b)
       : sp(p),
         ring(r),
         fs(f),
@@ -195,6 +208,7 @@ struct Destination::Core {
         log(l),
         seed(std::move(s)),
         name(std::move(n)),
+        book(std::move(b)),
         ring_channels(r.channels()),
         ring_capacity(r.capacity()) {}
 
@@ -202,6 +216,20 @@ struct Destination::Core {
     if (st.state != DestState::Disabled) st.state = s;  // Disabled is sticky
   }
   void finish(Retired r);  // runs on a detached thread
+  // The names to write: the book's current ones (a marker may have been renamed).
+  std::vector<Marker> resolve(const std::vector<FileMarker>& ms) const {
+    std::vector<Marker> out;
+    for (const FileMarker& f : ms) out.push_back(Marker{f.m.frame_in_file, book ? book->name(f.id, f.m.name) : f.m.name});
+    return out;
+  }
+  // A finished WAV file now holds `written`: from here on a rename rewrites it. Every marker
+  // is listed (a rewrite replaces the whole cue list), those without an id too.
+  void placed(const std::wstring& path, const std::vector<FileMarker>& ms, const std::vector<Marker>& written) {
+    if (!book || std::none_of(ms.begin(), ms.end(), [](const FileMarker& f) { return f.id != 0; })) return;
+    std::vector<PlacedMarker> p;
+    for (size_t i = 0; i < ms.size(); ++i) p.push_back(PlacedMarker{ms[i].id, written[i].frame_in_file, written[i].name});
+    book->placed(name, path, std::move(p));
+  }
 
   const SessionParams sp;
   SampleRing& ring;
@@ -210,6 +238,7 @@ struct Destination::Core {
   EventLog& log;
   const DestResumeSeed seed;
   const std::wstring name;
+  const std::shared_ptr<MarkerBook> book;  // may be null
   const uint32_t ring_channels;
   const size_t ring_capacity;
   std::vector<uint16_t> map;               // ring channel per destination channel; fixed before start
@@ -246,7 +275,9 @@ struct Destination::Core {
 // then record the close and the failover in the old manifest. Touches only `r` and `sp`.
 void Destination::Core::finish(Retired r) {
   if (r.enc) {
-    const bool ok = r.enc->finalize(r.markers, r.truncate_to);
+    const std::vector<Marker> names = resolve(r.markers);
+    const bool ok = r.enc->finalize(names, r.truncate_to);
+    if (ok && r.wav) placed(r.path, r.markers, names);
     const SampleIndex end = r.start + SampleIndex(r.enc->confirmed_frames());
     delete r.enc;
     if (r.man) {
@@ -707,7 +738,7 @@ class Destination::Writer {
     c_.folder = folder;
     // Markers that fell before this file (a gap) stay in the manifest only.
     c_.markers.erase(std::remove_if(c_.markers.begin(), c_.markers.end(),
-                                    [&](const auto& m) { return m.first < at; }),
+                                    [&](const PendingMarker& m) { return m.at < at; }),
                      c_.markers.end());
     event(line("file_open", at).str("path", path).num("n", n).num("seg", seg).num("folder", int64_t(folder)));
     if (!commit([&](DestStatus& st) {
@@ -755,12 +786,12 @@ class Destination::Writer {
 
   // The open file's markers in [file_start, end), relative to the file; every marker
   // before `end` leaves the pending list.
-  std::vector<Marker> take_markers(SampleIndex end) {
-    std::vector<Marker> ms;
-    for (const auto& [s, name] : c_.markers)
-      if (s >= c_.file_start && s < end) ms.push_back(Marker{uint64_t(s - c_.file_start), name});
+  std::vector<FileMarker> take_markers(SampleIndex end) {
+    std::vector<FileMarker> ms;
+    for (const PendingMarker& p : c_.markers)
+      if (p.at >= c_.file_start && p.at < end) ms.push_back(FileMarker{p.id, Marker{uint64_t(p.at - c_.file_start), p.name}});
     c_.markers.erase(std::remove_if(c_.markers.begin(), c_.markers.end(),
-                                    [&](const auto& m) { return m.first < end; }),
+                                    [&](const PendingMarker& m) { return m.at < end; }),
                      c_.markers.end());
     return ms;
   }
@@ -776,13 +807,15 @@ class Destination::Writer {
     } else {
       end = cursor_;
     }
-    const std::vector<Marker> ms = take_markers(end);
+    const std::vector<FileMarker> ms = take_markers(end);
+    const std::vector<Marker> names = k_.resolve(ms);
     bool ok;
     {
       IoScope io(*this, c_.folder);
-      ok = enc_->finalize(ms, truncate_to);
+      ok = enc_->finalize(names, truncate_to);
     }
     if (gone()) return end;
+    if (ok && cfg_.format == OutFormat::Wav) k_.placed(c_.path, ms, names);
     delete enc_;
     enc_ = nullptr;
     JsonLine l = line("file_close", end);
@@ -870,6 +903,7 @@ class Destination::Writer {
     old.bytes = bytes_;
     if (cfg_.format == OutFormat::Wav) old.truncate_to = uint64_t(confirmed - c_.file_start);
     old.markers = take_markers(confirmed);
+    old.wav = cfg_.format == OutFormat::Wav;
     cursor_ = confirmed;
     publish_cursor();
 
@@ -1064,9 +1098,18 @@ class Destination::Writer {
   }
 
   void on(const CmdMarker& c) {
-    event(line("marker", c.at).str("name", c.name));
+    JsonLine l = line("marker", c.at);
+    if (c.id) l.num("id", c.id);
+    event(l.str("name", c.name));
     log(Severity::Info, L"Marker \"" + c.name + L"\" at " + hms(wall(c.at)));
-    if (!enc_ || c.at >= c_.file_start) c_.markers.emplace_back(c.at, c.name);  // else manifest only
+    if (!enc_ || c.at >= c_.file_start) c_.markers.push_back(PendingMarker{c.at, c.id, c.name});  // else manifest only
+  }
+  // The manifest record; the files get the name from the book (a pending marker here too,
+  // for a destination without one).
+  void on(const CmdRenameMarker& c) {
+    event(line("marker_rename", c.at).num("id", c.id).str("name", c.name));
+    for (PendingMarker& p : c_.markers)
+      if (p.id == c.id && p.at == c.at) p.name = c.name;
   }
   void on(const CmdSplit& c) {
     if (!enc_) return;
@@ -1144,8 +1187,8 @@ class Destination::Writer {
 };
 
 Destination::Destination(DestinationConfig cfg, const SessionParams& sp, SampleRing& ring, IFileSystem& fs,
-                         IClock& clock, EventLog& log, DestResumeSeed seed)
-    : core_(std::make_shared<Core>(sp, ring, fs, clock, log, std::move(seed), cfg.name)) {
+                         IClock& clock, EventLog& log, DestResumeSeed seed, std::shared_ptr<MarkerBook> book)
+    : core_(std::make_shared<Core>(sp, ring, fs, clock, log, std::move(seed), cfg.name, std::move(book))) {
   Core& k = *core_;
   if (cfg.channels.empty()) {
     for (uint32_t c = 0; c < ring.channels(); ++c) k.map.push_back(uint16_t(c));

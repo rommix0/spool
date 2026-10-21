@@ -27,52 +27,62 @@ bool raise_working_set(const WorkingSetSize& w) {
 
 namespace {
 
-struct Recovery {
-  const RecordingState& st;
-  StateStore& store;
-  IFileSystem& fs;
-  IClock& clock;
-  EventLog& log;
+void add(EventLog& log, IClock& clock, Severity sev, std::wstring text) {
+  log.add(sev, clock.now(), L"", std::move(text));
+}
 
-  void add(Severity sev, std::wstring text) { log.add(sev, clock.now(), L"", std::move(text)); }
-  void clear() {
-    if (!store.clear())
-      add(Severity::Error, L"Cannot clear the recording state: the next launch checks the manifests again");
-  }
-  RepairReport repair() {
-    RepairReport rep = repair_open_files(fs, st);
-    for (const std::wstring& p : rep.repaired) add(Severity::Info, L"Repaired after the crash: " + p);
-    for (const std::wstring& p : rep.failed) add(Severity::Error, L"Couldn't repair after the crash: " + p);
-    return rep;
-  }
-  // Nothing will resume the session: close it in its manifests (best effort).
-  void end_session(const RepairReport& rep) {
-    if (rep.session_ended) return;
-    for (const std::wstring& p : end_crashed_session(fs, st, rep, L"resume_failed"))
-      add(Severity::Error, L"Couldn't close the crashed session in " + p);
-  }
-};
+void clear_state(StateStore& store, EventLog& log, IClock& clock) {
+  if (!store.clear())
+    add(log, clock, Severity::Error, L"Cannot clear the recording state: the next launch checks the manifests again");
+}
+
+void log_not_closed(const std::vector<std::wstring>& paths, EventLog& log, IClock& clock) {
+  for (const std::wstring& p : paths) add(log, clock, Severity::Error, L"Couldn't close the crashed session in " + p);
+}
 
 }  // namespace
 
-LaunchRecoveryResult recover_crashed_session(const RecordingState& st, const SessionConfig& cfg, SessionManager& mgr,
-                                             StateStore& store, IFileSystem& fs, IClock& clock, EventLog& log) {
-  Recovery r{st, store, fs, clock, log};
-  const RepairReport rep = r.repair();
-  if (rep.session_ended) {
-    r.clear();
-    r.add(Severity::Info, L"The last session (" + st.session_id + L") had ended cleanly: nothing to resume");
+RecoveryWork repair_crashed_session(IFileSystem& fs, const RecordingState& st, bool give_up) {
+  RecoveryWork w;
+  w.rep = repair_open_files(fs, st);
+  if (give_up && !w.rep.session_ended) w.not_closed = end_crashed_session(fs, st, w.rep, L"resume_failed");
+  return w;
+}
+
+LaunchRecoveryResult finish_launch_recovery(const RecordingState& st, const RecoveryWork& w, bool give_up,
+                                            const SessionConfig& cfg, SessionManager& mgr, StateStore& store,
+                                            IFileSystem& fs, IClock& clock, EventLog& log) {
+  for (const std::wstring& p : w.rep.repaired) add(log, clock, Severity::Info, L"Repaired after the crash: " + p);
+  for (const std::wstring& p : w.rep.failed) add(log, clock, Severity::Error, L"Couldn't repair after the crash: " + p);
+  if (give_up) {
+    log_not_closed(w.not_closed, log, clock);
+    clear_state(store, log, clock);
+    add(log, clock, Severity::Error,
+        L"The input device didn't return within " + std::to_wstring(kResumeWaitMs / 60000) +
+            L" min: the crashed session " + st.session_id + L" was not resumed");
+    return {LaunchRecovery::GaveUp, {}};
+  }
+  if (w.rep.session_ended) {
+    clear_state(store, log, clock);
+    add(log, clock, Severity::Info, L"The last session (" + st.session_id + L") had ended cleanly: nothing to resume");
     return {LaunchRecovery::EndedCleanly, {}};
   }
-  const ResumeInfo resume = make_resume(st, clock.now(), rep.audio_end);
+  const ResumeInfo resume = make_resume(st, clock.now(), w.rep.audio_end);
   std::wstring err;
   if (!mgr.start(cfg, &resume, &err)) {
-    r.end_session(rep);
-    r.clear();
-    r.add(Severity::Error, L"Couldn't resume the crashed session: " + err);
+    // Nothing will resume the session: close it in its manifests (best effort; these
+    // drives were just read, so this rarely waits).
+    log_not_closed(end_crashed_session(fs, st, w.rep, L"resume_failed"), log, clock);
+    clear_state(store, log, clock);
+    add(log, clock, Severity::Error, L"Couldn't resume the crashed session: " + err);
     return {LaunchRecovery::Failed, err};
   }
   return {LaunchRecovery::Resumed, {}};
+}
+
+LaunchRecoveryResult recover_crashed_session(const RecordingState& st, const SessionConfig& cfg, SessionManager& mgr,
+                                             StateStore& store, IFileSystem& fs, IClock& clock, EventLog& log) {
+  return finish_launch_recovery(st, repair_crashed_session(fs, st, false), false, cfg, mgr, store, fs, clock, log);
 }
 
 LaunchRecoveryResult resume_when_input_ready(const RecordingState& st, bool input_ready, uint64_t waited_ms,
@@ -80,13 +90,7 @@ LaunchRecoveryResult resume_when_input_ready(const RecordingState& st, bool inpu
                                              IFileSystem& fs, IClock& clock, EventLog& log) {
   if (input_ready) return recover_crashed_session(st, cfg, mgr, store, fs, clock, log);
   if (waited_ms < kResumeWaitMs) return {LaunchRecovery::Waiting, {}};
-  Recovery r{st, store, fs, clock, log};
-  const RepairReport rep = r.repair();
-  r.end_session(rep);
-  r.clear();
-  r.add(Severity::Error, L"The input device didn't return within " + std::to_wstring(kResumeWaitMs / 60000) +
-                             L" min: the crashed session " + st.session_id + L" was not resumed");
-  return {LaunchRecovery::GaveUp, {}};
+  return finish_launch_recovery(st, repair_crashed_session(fs, st, true), true, cfg, mgr, store, fs, clock, log);
 }
 
 CaptureConfig resume_input(const CaptureConfig& settings_input, const RecordingState& st) {

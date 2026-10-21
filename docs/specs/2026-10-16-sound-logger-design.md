@@ -178,7 +178,7 @@ If a destination can't keep up and has nowhere to go, its cursor is moved forwar
 ## 9. Manifest and event log
 
 - **Per-destination manifest**: a JSON Lines file (`<session>_<dest>.jsonl`), one event per line, appended and flushed at each confirmation point. Stored in the folder the destination is currently writing to. After failover, a new manifest continues in the new folder, and its first line names the previous manifest's path.
-- Event types (my call): `session_start`, `file_open`, `file_close` (with sample range and byte length), `marker`, `gap_start`, `gap_end`, `failover`, `rotation`, `clock_pair`, `warning`, `session_end`. Every event has `sample`, `utc`, and `local_offset`.
+- Event types (my call): `session_start`, `file_open`, `file_close` (with sample range and byte length), `marker` (with an `id`), `marker_rename` (`id` and the new `name`), `gap_start`, `gap_end`, `failover`, `rotation`, `clock_pair`, `warning`, `session_end`. Every event has `sample`, `utc`, and `local_offset`.
 - **App event log**: a human-readable text log of all destinations' events plus app-level events, in `%LOCALAPPDATA%\Spool\logs\`, one file per session. This is what the UI event list shows.
 
 ## 10. UI
@@ -188,7 +188,7 @@ Layout: **Option A, the dashboard** (decided). One main window:
 ### 10.1 Top bar
 - **Record** / **Stop**. Stop asks for confirmation ("Stop recording?"). Closing the window while recording also asks. Record arms the preflight first (§8.3).
 - Large elapsed-time clock (HH:MM:SS) and a line with the device name, rate, channel count, and mode.
-- **Marker**: drops a marker at the current sample, with an auto-numbered name. An optional dropdown places it N seconds ago (5, 10, or 30 s, within the ring). The name can be edited afterward in the event list.
+- **Marker**: drops a marker at the current sample, with an auto-numbered name. An optional dropdown places it N seconds ago (5, 10, or 30 s, within the ring). The name can be edited afterward in the **Markers** window (the "Markers…" button by the event list, the Marker dropdown, or `F2` for the newest marker), while recording or after Stop until the next Record. A file still being written gets the new name when it is finalized; a finished WAV file has its `cue `/`LIST/adtl` chunks rewritten in place (the audio is never touched); every manifest gets a `marker_rename` record (added 2026-10-20).
 - **Split file**: manual rotation (§7).
 
 ### 10.2 Levels panel
@@ -211,7 +211,7 @@ Layout: **Option A, the dashboard** (decided). One main window:
 - **While recording** (decided): the set of destinations is fixed once recording starts. The only live edits are **appending a folder to an existing destination's chain** (for example, a fresh USB drive) and renaming markers. A newly added folder gets a preflight (§8.3) before it joins the chain. If the destination is in `LastResort`, it switches to the new folder immediately (§4.3). Otherwise the folder waits as the last standby. Folders can't be removed or reordered while recording.
 
 ### 10.6 Keyboard
-- In-window shortcuts: `M` marker, `S` split. Stop has no single-key shortcut, so it can't be pressed by accident.
+- In-window shortcuts: `M` marker, `S` split, `F2` rename the newest marker. Stop has no single-key shortcut, so it can't be pressed by accident.
 - Optional **global** marker hotkey via `RegisterHotKey` (default `Ctrl+Alt+M`, off by default), so markers can be dropped while another app has focus (my call).
 
 ## 11. Testing

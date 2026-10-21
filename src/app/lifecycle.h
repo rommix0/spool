@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "audio/capture_source.h"
 #include "core/clock.h"
@@ -62,6 +63,21 @@ LaunchRecoveryResult recover_crashed_session(const RecordingState&, const Sessio
 LaunchRecoveryResult resume_when_input_ready(const RecordingState&, bool input_ready, uint64_t waited_ms,
                                              const SessionConfig&, SessionManager&, StateStore& store, IFileSystem&,
                                              IClock&, EventLog&);
+
+// The two halves of the above, so the app can repair on a worker thread (a hung drive
+// must not freeze the window) and resume on the UI thread.
+// The file work only (no manager, store or log): repair_open_files and, with give_up,
+// end_crashed_session(resume_failed) unless the session had ended.
+struct RecoveryWork {
+  RepairReport rep;
+  std::vector<std::wstring> not_closed;  // give_up: manifests the session_end couldn't be written to
+};
+RecoveryWork repair_crashed_session(IFileSystem&, const RecordingState&, bool give_up);
+// Logs what the repair did, then ends as recover_crashed_session (give_up false) or the
+// timed-out resume_when_input_ready (give_up true) does.
+LaunchRecoveryResult finish_launch_recovery(const RecordingState&, const RecoveryWork&, bool give_up,
+                                            const SessionConfig&, SessionManager&, StateStore& store, IFileSystem&,
+                                            IClock&, EventLog&);
 
 // Whether start_on_launch applies after the crash recovery ended this way (nothing resumed).
 bool auto_start_after(LaunchRecovery, bool start_on_launch);

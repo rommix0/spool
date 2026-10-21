@@ -22,6 +22,7 @@
 #include "session/config.h"
 #include "session/destination.h"
 #include "session/event_log.h"
+#include "session/marker_book.h"
 #include "session/meter.h"
 #include "session/preflight.h"
 #include "session/recovery.h"
@@ -36,6 +37,14 @@ struct SessionConfig {
 };
 
 enum class SessionState { Idle, Recording, InputLost };
+
+struct MarkerInfo {
+  uint32_t id;
+  SampleIndex at;
+  double elapsed_s;  // (at - start_sample) / rate
+  WallTime wall;
+  std::wstring name;
+};
 
 struct SessionStats {
   SessionState state;
@@ -83,9 +92,19 @@ class SessionManager : CaptureCallbacks {
   // Test hook (crash simulation): stops every thread without finalizing, flushing or
   // clearing anything; encoders and manifests are leaked unclosed.
   void abandon_for_test();
-  // At max(first sample, write_index - s*rate), named "Marker N". The first sample is
-  // start_sample, or resume_sample after a resume (never inside the crash gap).
-  void marker(uint32_t seconds_ago);
+  // At max(first sample, write_index - s*rate), named "Marker N" with id N (counted from 1
+  // at each start()). The first sample is start_sample, or resume_sample after a resume
+  // (never inside the crash gap). Returns the id, 0 when not recording.
+  uint32_t marker(uint32_t seconds_ago);
+  // The markers of this recording, or of the last one until the next start().
+  const std::vector<MarkerInfo>& markers() const { return markers_; }
+  // Renames a marker of markers(), while recording or after: the manifests get a
+  // marker_rename record, a file being written gets the name when it is finalized, and
+  // finished WAV files get their cue labels rewritten in the background. The name is
+  // trimmed, line breaks become spaces, at most kMaxMarkerName characters. False if the
+  // id is unknown or the name is empty or unchanged.
+  bool rename_marker(uint32_t id, std::wstring name);
+  static constexpr size_t kMaxMarkerName = 200;
   void split();                       // at write_index
   void append_folder(size_t dest, std::wstring path);  // also kept for a linked session
   void acknowledge();
@@ -101,11 +120,12 @@ class SessionManager : CaptureCallbacks {
  private:
   struct Session;
   struct UiCommand {
-    enum class Kind { Marker, Split, AppendFolder, Acknowledge } kind = Kind::Marker;
+    enum class Kind { Marker, RenameMarker, Split, AppendFolder, Acknowledge } kind = Kind::Marker;
     uint64_t session = 0;  // Session::seq it was stamped in
     SampleIndex at = 0;
     size_t dest = 0;
     std::wstring text;  // marker name or folder path
+    uint32_t id = 0;    // marker id
   };
 
   // CaptureCallbacks. on_frames runs on the capture thread; the device events only record
@@ -156,6 +176,12 @@ class SessionManager : CaptureCallbacks {
   std::set<std::wstring> used_ids_;
   uint64_t next_seq_ = 1;
   uint32_t marker_n_ = 0;                // UI thread
+  std::vector<MarkerInfo> markers_;      // UI thread
+  // This recording's marker names (start() to start(); a linked session keeps it). Earlier
+  // ones may still be rewriting files: the destructor waits for them a little, then ends
+  // their logging.
+  std::shared_ptr<MarkerBook> book_;
+  std::vector<std::weak_ptr<MarkerBook>> old_books_;
 
   std::atomic<SampleRing*> cap_ring_{nullptr};  // the ring on_frames writes into
   std::atomic<SessionState> state_{SessionState::Idle};

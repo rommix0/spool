@@ -1,6 +1,7 @@
 #pragma once
 // Resource and command ids shared by spool.rc and the window code.
 
+#define IDI_APP 100  // the app icon; the first icon, so Explorer shows it for spool.exe
 #define IDR_ACCEL 101
 
 // Commands (menus and accelerators).
@@ -10,6 +11,7 @@
 #define IDM_MARKER_30 204
 #define IDM_SPLIT 205
 #define IDM_ADD_FOLDER 206
+#define IDM_RENAME_MARKER 207  // the Markers window, renaming the newest marker
 
 // Child controls of the main window.
 #define IDC_RECORD 301
@@ -29,6 +31,7 @@
 #define IDC_EVENTS 315
 #define IDC_BANNER 316
 #define IDC_BANNER_ACK 317
+#define IDC_MARKERS 318
 
 // Dialogs.
 #define IDD_SETTINGS 401
