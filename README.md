@@ -7,6 +7,8 @@ Spool is a Windows sound logger for long, unattended recordings such as live sho
 - Files are confirmed to disk every few seconds.
 - A crashed session resumes when the app restarts.
 
+This is an early release, so please raise an issue or do a pull request if you notice any bugs that need fixing.
+
 ## Features
 
 - **Destinations:** several at once, each with its own format, channels, folder chain, file rotation (wall-clock aligned) and file-name template.
